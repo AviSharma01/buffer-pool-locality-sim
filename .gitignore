@@ -1,0 +1,11 @@
+/outputs/
+/sim/target/
+
+# Python virtual env
+/.venv/
+
+# Generated visualization frames
+/**/_frames/
+
+# OS junk
+.DS_Store
