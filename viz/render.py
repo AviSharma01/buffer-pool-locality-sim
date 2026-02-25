@@ -32,7 +32,6 @@ def load_snaps(run_dir: str):
             yield json.load(fh)
 
 
-# ── per-frame renderer ────────────────────────────────────────────────────────
 
 def render_frame(snap: dict, history: dict, out_png: str) -> None:
     frames   = snap["frames"]
@@ -48,7 +47,6 @@ def render_frame(snap: dict, history: dict, out_png: str) -> None:
     history["avg_cost"].append(metrics["avg_cost"])
     history["locality_score"].append(metrics["locality_score"])
 
-    # ── layout ────────────────────────────────────────────────────────────────
     fig = plt.figure(figsize=(12, 6), facecolor=BG_COLOR)
     gs  = gridspec.GridSpec(
         1, 2,
@@ -61,7 +59,6 @@ def render_frame(snap: dict, history: dict, out_png: str) -> None:
     ax_grid  = fig.add_subplot(gs[0])
     ax_plots = fig.add_subplot(gs[1])
 
-    # ── buffer-pool grid ──────────────────────────────────────────────────────
     cell = 1.0
     for idx, fr in enumerate(frames):
         row = idx // side
@@ -126,7 +123,6 @@ def render_frame(snap: dict, history: dict, out_png: str) -> None:
         fontsize=7, color=TEXT_COLOR, va="top", ha="left",
     )
 
-    # ── time-series plots ─────────────────────────────────────────────────────
     ticks_arr  = history["ticks"]
     plot_specs = [
         ("hit_rate",       "Hit rate",       "#4E79A7", (0.0, 1.0)),
@@ -158,7 +154,6 @@ def render_frame(snap: dict, history: dict, out_png: str) -> None:
         for rt in history["recluster_ticks"]:
             ax.axvline(rt, color="#FFD700", linewidth=0.8, alpha=0.6)
 
-    # ── title ─────────────────────────────────────────────────────────────────
     title = f"tick {tick}"
     if recluster:
         title += "   ★ RECLUSTER"
@@ -171,11 +166,11 @@ def render_frame(snap: dict, history: dict, out_png: str) -> None:
         y=0.97,
     )
 
-    order = snap.get("table_order", [])
-    order_str = " → ".join(f"T{t}" for t in order)
+    disk_layout = snap.get("disk_layout", snap.get("table_order", []))
+    order_str = " → ".join(f"T{t}" for t in disk_layout)
     fig.text(
         0.5, 0.91,
-        f"layout: {order_str}",
+        f"disk layout: {order_str}",
         fontsize=7.5, color="#aaaaaa", ha="center", va="top",
     )
 

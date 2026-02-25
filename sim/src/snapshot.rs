@@ -25,4 +25,5 @@ pub struct Snapshot {
     pub frames: Vec<FrameSnap>,
     pub metrics: MetricsSnap,
     pub table_order: Vec<u16>,
+    pub disk_layout: Vec<u16>,
 }

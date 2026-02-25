@@ -20,4 +20,7 @@ pub struct Cli {
 
     #[arg(long, default_value = "../outputs/runs")]
     pub out: String,
+
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub recluster: bool,
 }

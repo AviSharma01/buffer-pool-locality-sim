@@ -14,7 +14,8 @@ fn main() -> std::io::Result<()> {
     let args = Cli::parse();
 
     let ts = Local::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-    let run_dir = PathBuf::from(format!("{}/{}", args.out, ts));
+    let mode = if args.recluster { "recluster" } else { "no_recluster" };
+    let run_dir = PathBuf::from(format!("{}/{}/{}", args.out, mode, ts));
     let snap_dir = run_dir.join("snapshots");
 
     fs::create_dir_all(&snap_dir)?;
@@ -30,7 +31,7 @@ fn main() -> std::io::Result<()> {
     );
 
     for t in 1..=args.ticks {
-        let recluster = t % args.recluster_every == 0;
+        let recluster = args.recluster && t % args.recluster_every == 0;
 
         let snap = sim.tick(t, recluster);
 

@@ -37,6 +37,11 @@ pub struct Simulator {
 
     co_access: HashMap<(TableId, TableId), u64>,
     pub table_order: Vec<TableId>,
+
+    // Physical layout of tables on disk (slot index → TableId).
+    // Updated on every recluster event; stays sequential otherwise.
+    disk_layout: Vec<TableId>,
+    last_disk_pos: u64,
 }
 
 impl Simulator {
@@ -70,6 +75,8 @@ impl Simulator {
             locality_score_ema: 0.0,
             co_access: HashMap::new(),
             table_order,
+            disk_layout: (0..num_tables).collect(),
+            last_disk_pos: 0,
         }
     }
 
@@ -79,6 +86,14 @@ impl Simulator {
 
     fn table_of(&self, page_id: PageId) -> TableId {
         (page_id / self.pages_per_table) as TableId
+    }
+
+    /// Physical disk address of a page under the current disk_layout.
+    fn disk_pos_of(&self, page_id: PageId) -> u64 {
+        let table = self.table_of(page_id);
+        let page_within = (page_id % self.pages_per_table) as u64;
+        let slot = self.disk_layout.iter().position(|&t| t == table).unwrap_or(0) as u64;
+        slot * self.pages_per_table as u64 + page_within
     }
 
     fn sample_query_pages(&mut self) -> Vec<PageId> {
@@ -160,8 +175,15 @@ impl Simulator {
 
         self.misses += 1;
 
+        // Seek cost: proportional to disk distance from last fetched page.
+        let disk_pos = self.disk_pos_of(page_id);
+        let seek_dist = (disk_pos as i64 - self.last_disk_pos as i64).unsigned_abs();
+        let total_disk = self.num_tables as u64 * self.pages_per_table as u64;
+        let seek_cost = (seek_dist as f64 / total_disk as f64) * 30.0;
+        self.last_disk_pos = disk_pos;
+
         let victim = self.pick_victim_clock();
-        let mut cost = 10.0;
+        let mut cost = 10.0 + seek_cost;
 
         if let Some(old_pid) = self.frames[victim].page_id {
             self.evictions += 1;
@@ -207,8 +229,6 @@ impl Simulator {
         order.push(hottest);
         remaining.retain(|&t| t != hottest);
 
-        // Greedy chain: always append the remaining table most co-accessed
-        // with the current tail of the chain.
         while !remaining.is_empty() {
             let last = *order.last().unwrap();
             let next = remaining
@@ -224,13 +244,13 @@ impl Simulator {
             remaining.retain(|&t| t != next);
         }
 
+        self.disk_layout = order.clone();
         self.table_order = order;
     }
 
     pub fn tick(&mut self, t: u64, recluster: bool) -> Snapshot {
         let pages = self.sample_query_pages();
 
-        // Track which tables were touched this query, then update co-access counts.
         let touched: Vec<TableId> = pages
             .iter()
             .map(|&pid| self.table_of(pid))
@@ -314,6 +334,7 @@ impl Simulator {
                 locality_score: self.locality_score_ema,
             },
             table_order: self.table_order.clone(),
+            disk_layout: self.disk_layout.clone(),
         }
     }
 }
