@@ -46,7 +46,7 @@ pub struct Simulator {
 
 impl Simulator {
     pub fn new(seed: u64, num_frames: usize, num_tables: u16, pages_per_table: u32) -> Self {
-        let rng = StdRng::seed_from_u64(seed);
+        let mut rng = StdRng::seed_from_u64(seed);
 
         let frames = (0..num_frames)
             .map(|_| Frame {
@@ -58,7 +58,15 @@ impl Simulator {
             })
             .collect();
 
-        let table_order = (0..num_tables).collect();
+        // Fisher-Yates shuffle for a realistic non-optimal starting layout.
+        // Both recluster and no-recluster runs use the same seed → same initial
+        // scramble, so the A/B comparison stays fair.
+        let mut disk_layout: Vec<TableId> = (0..num_tables).collect();
+        for i in (1..num_tables as usize).rev() {
+            let j = rng.gen_range(0..=i);
+            disk_layout.swap(i, j);
+        }
+        let table_order = disk_layout.clone();
 
         Self {
             rng,
@@ -75,7 +83,7 @@ impl Simulator {
             locality_score_ema: 0.0,
             co_access: HashMap::new(),
             table_order,
-            disk_layout: (0..num_tables).collect(),
+            disk_layout,
             last_disk_pos: 0,
         }
     }
@@ -207,45 +215,66 @@ impl Simulator {
     }
 
     fn recompute_table_order(&mut self) {
-        let mut remaining: Vec<TableId> = (0..self.num_tables).collect();
-        let mut order: Vec<TableId> = Vec::with_capacity(self.num_tables as usize);
+        let n = self.num_tables as usize;
 
-        // Start from the table with the highest total co-access weight.
-        let hottest = remaining
+        // Snapshot co-access pairs so the closure doesn't borrow self.
+        let pairs: Vec<(usize, usize, u64)> = self
+            .co_access
             .iter()
-            .copied()
-            .max_by_key(|&t| {
-                (0..self.num_tables)
-                    .filter(|&o| o != t)
-                    .map(|o| {
-                        let a = t.min(o);
-                        let b = t.max(o);
-                        self.co_access.get(&(a, b)).copied().unwrap_or(0)
-                    })
-                    .sum::<u64>()
-            })
-            .unwrap();
+            .map(|(&(a, b), &w)| (a as usize, b as usize, w))
+            .collect();
 
-        order.push(hottest);
-        remaining.retain(|&t| t != hottest);
-
-        while !remaining.is_empty() {
-            let last = *order.last().unwrap();
-            let next = remaining
+        // MLA objective: Σ weight(a,b) × |slot(a) − slot(b)|
+        // Lower = co-accessed tables are physically closer on disk.
+        let mla_cost = |perm: &[TableId]| -> u64 {
+            let mut pos = vec![0usize; n];
+            for (slot, &t) in perm.iter().enumerate() {
+                pos[t as usize] = slot;
+            }
+            pairs
                 .iter()
-                .copied()
-                .max_by_key(|&t| {
-                    let a = last.min(t);
-                    let b = last.max(t);
-                    self.co_access.get(&(a, b)).copied().unwrap_or(0)
-                })
-                .unwrap();
-            order.push(next);
-            remaining.retain(|&t| t != next);
+                .map(|&(a, b, w)| w * (pos[a] as i64 - pos[b] as i64).unsigned_abs())
+                .sum()
+        };
+
+        // Brute-force all n! permutations (n = 6 → 720 iterations).
+        let mut perm: Vec<TableId> = (0..self.num_tables).collect();
+        let mut best = perm.clone();
+        let mut best_cost = mla_cost(&perm);
+
+        while Self::next_permutation(&mut perm) {
+            let c = mla_cost(&perm);
+            if c < best_cost {
+                best_cost = c;
+                best = perm.clone();
+            }
         }
 
-        self.disk_layout = order.clone();
-        self.table_order = order;
+        self.disk_layout = best.clone();
+        self.table_order = best;
+    }
+
+    /// Advances `arr` to the next lexicographic permutation in place.
+    /// Returns false when the sequence wraps back to sorted ascending order.
+    fn next_permutation(arr: &mut Vec<TableId>) -> bool {
+        let n = arr.len();
+        if n < 2 {
+            return false;
+        }
+        let mut i = n - 1;
+        while i > 0 && arr[i - 1] >= arr[i] {
+            i -= 1;
+        }
+        if i == 0 {
+            return false;
+        }
+        let mut j = n - 1;
+        while arr[j] <= arr[i - 1] {
+            j -= 1;
+        }
+        arr.swap(i - 1, j);
+        arr[i..].reverse();
+        true
     }
 
     pub fn tick(&mut self, t: u64, recluster: bool) -> Snapshot {
