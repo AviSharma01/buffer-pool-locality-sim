@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
@@ -33,6 +33,9 @@ pub struct Simulator {
     dirty_evictions: u64,
 
     avg_cost_ema: f64,
+
+    co_access: HashMap<(TableId, TableId), u64>,
+    pub table_order: Vec<TableId>,
 }
 
 impl Simulator {
@@ -49,6 +52,8 @@ impl Simulator {
             })
             .collect();
 
+        let table_order = (0..num_tables).collect();
+
         Self {
             rng,
             num_tables,
@@ -61,6 +66,8 @@ impl Simulator {
             evictions: 0,
             dirty_evictions: 0,
             avg_cost_ema: 0.0,
+            co_access: HashMap::new(),
+            table_order,
         }
     }
 
@@ -175,12 +182,75 @@ impl Simulator {
         cost
     }
 
+    fn recompute_table_order(&mut self) {
+        let mut remaining: Vec<TableId> = (0..self.num_tables).collect();
+        let mut order: Vec<TableId> = Vec::with_capacity(self.num_tables as usize);
+
+        // Start from the table with the highest total co-access weight.
+        let hottest = remaining
+            .iter()
+            .copied()
+            .max_by_key(|&t| {
+                (0..self.num_tables)
+                    .filter(|&o| o != t)
+                    .map(|o| {
+                        let a = t.min(o);
+                        let b = t.max(o);
+                        self.co_access.get(&(a, b)).copied().unwrap_or(0)
+                    })
+                    .sum::<u64>()
+            })
+            .unwrap();
+
+        order.push(hottest);
+        remaining.retain(|&t| t != hottest);
+
+        // Greedy chain: always append the remaining table most co-accessed
+        // with the current tail of the chain.
+        while !remaining.is_empty() {
+            let last = *order.last().unwrap();
+            let next = remaining
+                .iter()
+                .copied()
+                .max_by_key(|&t| {
+                    let a = last.min(t);
+                    let b = last.max(t);
+                    self.co_access.get(&(a, b)).copied().unwrap_or(0)
+                })
+                .unwrap();
+            order.push(next);
+            remaining.retain(|&t| t != next);
+        }
+
+        self.table_order = order;
+    }
+
     pub fn tick(&mut self, t: u64, recluster: bool) -> Snapshot {
         let pages = self.sample_query_pages();
+
+        // Track which tables were touched this query, then update co-access counts.
+        let touched: Vec<TableId> = pages
+            .iter()
+            .map(|&pid| self.table_of(pid))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        for i in 0..touched.len() {
+            for j in (i + 1)..touched.len() {
+                let a = touched[i].min(touched[j]);
+                let b = touched[i].max(touched[j]);
+                *self.co_access.entry((a, b)).or_insert(0) += 1;
+            }
+        }
 
         let mut cost_sum = 0.0;
         for pid in pages {
             cost_sum += self.access_page(pid);
+        }
+
+        if recluster {
+            self.recompute_table_order();
+            println!("tick {t}: recluster → order: {:?}", self.table_order);
         }
 
         let alpha = 0.02;

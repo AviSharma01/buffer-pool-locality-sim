@@ -24,4 +24,5 @@ pub struct Snapshot {
     pub recluster: bool,
     pub frames: Vec<FrameSnap>,
     pub metrics: MetricsSnap,
+    pub table_order: Vec<u16>,
 }
