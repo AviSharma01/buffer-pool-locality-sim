@@ -1,34 +1,43 @@
-mod config;
+mod config;  
 mod snapshot;
 mod sim;
+mod cli;
 
 use std::{fs, path::PathBuf};
 use chrono::Local;
+use clap::Parser;
 
-use config::Config;
+use cli::Cli;
 use sim::Simulator;
 
 fn main() -> std::io::Result<()> {
-    let cfg = Config::default();
+    let args = Cli::parse();
 
     let ts = Local::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-    let run_dir = PathBuf::from(format!("../outputs/runs/{ts}"));
+    let run_dir = PathBuf::from(format!("{}/{}", args.out, ts));
     let snap_dir = run_dir.join("snapshots");
 
     fs::create_dir_all(&snap_dir)?;
 
-    let mut sim = Simulator::new(cfg.seed, cfg.frames);
+    let num_tables: u16 = 6;
+    let pages_per_table: u32 = 200;
 
-    for t in 1..=cfg.ticks {
-        let (mut snap, _cost) = sim.tick(t);
+    let mut sim = Simulator::new(
+        args.seed,
+        args.frames,
+        num_tables,
+        pages_per_table,
+    );
 
-        // later you’ll set this when reclustering happens:
-        if t % cfg.recluster_every == 0 { snap.recluster = true; }
+    for t in 1..=args.ticks {
+        let recluster = t % args.recluster_every == 0;
 
-        if t % cfg.snapshot_every == 0 {
+        let snap = sim.tick(t, recluster);
+
+        if t % args.snapshot_every == 0 {
             let fname = format!("{:06}.json", t);
             let path = snap_dir.join(fname);
-            
+
             let mut s = serde_json::to_string(&snap).unwrap();
             s.push('\n');
             fs::write(path, s)?;

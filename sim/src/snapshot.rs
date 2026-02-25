@@ -2,9 +2,11 @@ use serde::Serialize;
 
 #[derive(Serialize)]
 pub struct FrameSnap {
-    pub table_id: i32,   // -1 if empty
+    pub page_id: i32,
+    pub table_id: i32,
     pub dirty: bool,
     pub ref_bit: bool,
+    pub pin_count: u16,
 }
 
 #[derive(Serialize)]
