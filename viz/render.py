@@ -54,7 +54,7 @@ def render_frame(snap: dict, history: dict, out_png: str) -> None:
         1, 2,
         width_ratios=[1.1, 1],
         left=0.04, right=0.97,
-        top=0.88, bottom=0.06,
+        top=0.84, bottom=0.06,
         wspace=0.12,
     )
 
@@ -131,7 +131,7 @@ def render_frame(snap: dict, history: dict, out_png: str) -> None:
     plot_specs = [
         ("hit_rate",       "Hit rate",       "#4E79A7", (0.0, 1.0)),
         ("avg_cost",       "Avg cost (EMA)", "#E15759", None),
-        ("locality_score", "Locality score", "#59A14F", None),
+        ("locality_score", "Locality (↓ better)", "#59A14F", None),
     ]
 
     inner_gs = gridspec.GridSpecFromSubplotSpec(
@@ -169,6 +169,14 @@ def render_frame(snap: dict, history: dict, out_png: str) -> None:
         fontsize=11, color="#FFD700" if recluster else TEXT_COLOR,
         fontweight="bold" if recluster else "normal",
         y=0.97,
+    )
+
+    order = snap.get("table_order", [])
+    order_str = " → ".join(f"T{t}" for t in order)
+    fig.text(
+        0.5, 0.91,
+        f"layout: {order_str}",
+        fontsize=7.5, color="#aaaaaa", ha="center", va="top",
     )
 
     plt.savefig(out_png, dpi=110, facecolor=BG_COLOR)

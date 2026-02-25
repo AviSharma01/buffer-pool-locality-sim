@@ -33,6 +33,7 @@ pub struct Simulator {
     dirty_evictions: u64,
 
     avg_cost_ema: f64,
+    locality_score_ema: f64,
 
     co_access: HashMap<(TableId, TableId), u64>,
     pub table_order: Vec<TableId>,
@@ -66,6 +67,7 @@ impl Simulator {
             evictions: 0,
             dirty_evictions: 0,
             avg_cost_ema: 0.0,
+            locality_score_ema: 0.0,
             co_access: HashMap::new(),
             table_order,
         }
@@ -253,11 +255,34 @@ impl Simulator {
             println!("tick {t}: recluster → order: {:?}", self.table_order);
         }
 
+        // Locality score: average pairwise distance between touched tables in
+        // the current table_order. Lower means co-accessed tables sit closer
+        // together → better locality.
+        let pos: HashMap<TableId, usize> = self
+            .table_order
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| (t, i))
+            .collect();
+        let locality_tick = if touched.len() >= 2 {
+            let pairs = (touched.len() * (touched.len() - 1) / 2) as f64;
+            let dist_sum: f64 = (0..touched.len())
+                .flat_map(|i| (i + 1..touched.len()).map(move |j| (i, j)))
+                .map(|(i, j)| (pos[&touched[i]] as f64 - pos[&touched[j]] as f64).abs())
+                .sum();
+            dist_sum / pairs
+        } else {
+            0.0
+        };
+
         let alpha = 0.02;
         if t == 1 {
             self.avg_cost_ema = cost_sum;
+            self.locality_score_ema = locality_tick;
         } else {
             self.avg_cost_ema = alpha * cost_sum + (1.0 - alpha) * self.avg_cost_ema;
+            self.locality_score_ema =
+                alpha * locality_tick + (1.0 - alpha) * self.locality_score_ema;
         }
 
         let total = self.hits + self.misses;
@@ -286,8 +311,9 @@ impl Simulator {
                 avg_cost: self.avg_cost_ema,
                 evictions: self.evictions,
                 dirty_evictions: self.dirty_evictions,
-                locality_score: 0.0,
+                locality_score: self.locality_score_ema,
             },
+            table_order: self.table_order.clone(),
         }
     }
 }
