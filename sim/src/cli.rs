@@ -23,4 +23,10 @@ pub struct Cli {
 
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub recluster: bool,
+
+    #[arg(long, default_value_t = 6)]
+    pub num_tables: u16,
+
+    #[arg(long, default_value_t = 200)]
+    pub pages_per_table: u32,
 }
