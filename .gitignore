@@ -1,5 +1,6 @@
 /outputs/
 /sim/target/
+/media/
 
 # Python virtual env
 /.venv/
@@ -9,3 +10,9 @@
 
 # OS junk
 .DS_Store
+
+# Local Claude Code guide (not committed)
+/CLAUDE.md
+
+# Python bytecode
+__pycache__/
