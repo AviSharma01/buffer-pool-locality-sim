@@ -1,369 +1,440 @@
-use std::collections::{HashMap, HashSet};
+//! The buffer pool and the simulation loop.
 
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use std::collections::{BTreeSet, HashMap};
 
-use crate::snapshot::{FrameSnap, MetricsSnap, Snapshot};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 
-type PageId = u32;
-type TableId = u16;
-type FrameIdx = usize;
+use crate::layout::{self, CoAccess, Layout};
+use crate::policy::{Policy, PolicyKind};
+use crate::snapshot::{FrameSnap, MetricsSnap, RunSummary, Snapshot};
+use crate::trace::{Access, Trace};
+use crate::workload::{CostModel, Workload};
+use crate::{FrameIdx, PageId, TableId};
 
-#[derive(Clone)]
-struct Frame {
-    page_id: Option<PageId>,
-    table_id: Option<TableId>,
-    dirty: bool,
-    ref_bit: bool,
-    pin_count: u16,
+/// Smoothing factor for the cost and locality moving averages.
+const EMA_ALPHA: f64 = 0.02;
+
+/// Build the trace and initial (scrambled) disk layout for a seeded run.
+/// Everything random about a run comes from here.
+pub fn build_scenario(w: &Workload, seed: u64, ticks: u64) -> (Trace, Vec<TableId>) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let initial_layout = layout::shuffled(w.num_tables, &mut rng);
+    let trace = Trace::generate(w, &mut rng, ticks);
+    (trace, initial_layout)
 }
 
-pub struct Simulator {
-    rng: StdRng,
+#[derive(Clone, Debug)]
+struct Frame {
+    page: Option<PageId>,
+    dirty: bool,
+}
 
-    num_tables: u16,
-    pages_per_table: u32,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Hit,
+    Miss { evicted: bool, evicted_dirty: bool },
+}
 
+/// Fixed-size page cache. Owns frames and the page table; delegates victim
+/// choice to a [`Policy`].
+pub struct BufferPool {
     frames: Vec<Frame>,
     page_table: HashMap<PageId, FrameIdx>,
-    clock_hand: FrameIdx,
-
-    hits: u64,
-    misses: u64,
-    evictions: u64,
-    dirty_evictions: u64,
-
-    avg_cost_ema: f64,
-    locality_score_ema: f64,
-
-    co_access: HashMap<(TableId, TableId), u64>,
-    pub table_order: Vec<TableId>,
-
-    // Physical layout of tables on disk (slot index → TableId).
-    // Updated on every recluster event; stays sequential otherwise.
-    disk_layout: Vec<TableId>,
-    last_disk_pos: u64,
+    next_free: usize,
+    policy: Box<dyn Policy>,
 }
 
-impl Simulator {
-    pub fn new(seed: u64, num_frames: usize, num_tables: u16, pages_per_table: u32) -> Self {
-        let mut rng = StdRng::seed_from_u64(seed);
-
-        let frames = (0..num_frames)
-            .map(|_| Frame {
-                page_id: None,
-                table_id: None,
-                dirty: false,
-                ref_bit: false,
-                pin_count: 0,
-            })
-            .collect();
-
-        // Fisher-Yates shuffle for a realistic non-optimal starting layout.
-        // Both recluster and no-recluster runs use the same seed → same initial
-        // scramble, so the A/B comparison stays fair.
-        let mut disk_layout: Vec<TableId> = (0..num_tables).collect();
-        for i in (1..num_tables as usize).rev() {
-            let j = rng.gen_range(0..=i);
-            disk_layout.swap(i, j);
-        }
-        let table_order = disk_layout.clone();
-
+impl BufferPool {
+    pub fn new(num_frames: usize, policy: Box<dyn Policy>) -> Self {
         Self {
-            rng,
-            num_tables,
-            pages_per_table,
-            frames,
+            frames: vec![
+                Frame {
+                    page: None,
+                    dirty: false
+                };
+                num_frames
+            ],
             page_table: HashMap::new(),
-            clock_hand: 0,
-            hits: 0,
-            misses: 0,
-            evictions: 0,
-            dirty_evictions: 0,
-            avg_cost_ema: 0.0,
-            locality_score_ema: 0.0,
-            co_access: HashMap::new(),
-            table_order,
-            disk_layout,
-            last_disk_pos: 0,
+            next_free: 0,
+            policy,
         }
     }
 
-    fn make_page_id(&self, table: TableId, page_idx: u32) -> PageId {
-        (table as u32) * self.pages_per_table + page_idx
-    }
+    pub fn access(&mut self, page: PageId, write: bool, pos: usize) -> Outcome {
+        if let Some(&f) = self.page_table.get(&page) {
+            if write {
+                self.frames[f].dirty = true;
+            }
+            self.policy.on_hit(f, page, pos);
+            return Outcome::Hit;
+        }
 
-    fn table_of(&self, page_id: PageId) -> TableId {
-        (page_id / self.pages_per_table) as TableId
-    }
-
-    /// Physical disk address of a page under the current disk_layout.
-    fn disk_pos_of(&self, page_id: PageId) -> u64 {
-        let table = self.table_of(page_id);
-        let page_within = (page_id % self.pages_per_table) as u64;
-        let slot = self.disk_layout.iter().position(|&t| t == table).unwrap_or(0) as u64;
-        slot * self.pages_per_table as u64 + page_within
-    }
-
-    fn sample_query_pages(&mut self) -> Vec<PageId> {
-        let roll: f64 = self.rng.gen_range(0.0..1.0);
-        let (a, b): (TableId, TableId) = if roll < 0.40 {
-            (0, 1)
-        } else if roll < 0.70 {
-            (0, 2)
-        } else if roll < 0.90 {
-            (3, 4)
+        let f = if self.next_free < self.frames.len() {
+            self.next_free += 1;
+            self.next_free - 1
         } else {
-            (5, 0)
+            self.policy.victim()
         };
 
-        let hot = self.rng.gen_bool(0.70);
-        let max_idx = if hot {
-            (self.pages_per_table / 10).max(1)
-        } else {
-            self.pages_per_table
+        let old = std::mem::replace(
+            &mut self.frames[f],
+            Frame {
+                page: Some(page),
+                dirty: write,
+            },
+        );
+        let (evicted, evicted_dirty) = match old.page {
+            Some(old_page) => {
+                self.page_table.remove(&old_page);
+                (true, old.dirty)
+            }
+            None => (false, false),
         };
-
-        let a_n = self.rng.gen_range(2..6);
-        let b_n = self.rng.gen_range(2..6);
-
-        let mut pages = Vec::with_capacity((a_n + b_n + 8) as usize);
-
-        for _ in 0..a_n {
-            let idx = self.rng.gen_range(0..max_idx);
-            pages.push(self.make_page_id(a, idx));
-        }
-        for _ in 0..b_n {
-            let idx = self.rng.gen_range(0..max_idx);
-            pages.push(self.make_page_id(b, idx));
-        }
-
-        if self.rng.gen_bool(0.15) {
-            let t = self.rng.gen_range(0..self.num_tables) as TableId;
-            let start = self
-                .rng
-                .gen_range(0..self.pages_per_table.saturating_sub(8).max(1));
-            for i in 0..8 {
-                pages.push(self.make_page_id(t, start + i));
-            }
-        }
-
-        pages
-    }
-
-    fn pick_victim_clock(&mut self) -> FrameIdx {
-        let n = self.frames.len();
-        loop {
-            let idx = self.clock_hand;
-            self.clock_hand = (self.clock_hand + 1) % n;
-
-            if self.frames[idx].page_id.is_none() {
-                return idx;
-            }
-            if self.frames[idx].pin_count > 0 {
-                continue;
-            }
-            if self.frames[idx].ref_bit {
-                self.frames[idx].ref_bit = false;
-                continue;
-            }
-            return idx;
+        self.page_table.insert(page, f);
+        self.policy.on_load(f, page, pos);
+        Outcome::Miss {
+            evicted,
+            evicted_dirty,
         }
     }
 
-    fn access_page(&mut self, page_id: PageId) -> f64 {
-        if let Some(&frame_idx) = self.page_table.get(&page_id) {
-            self.hits += 1;
-            let f = &mut self.frames[frame_idx];
-            f.ref_bit = true;
-            if self.rng.gen_bool(0.05) {
-                f.dirty = true;
-            }
-            return 1.0;
-        }
-
-        self.misses += 1;
-
-        // Seek cost: proportional to disk distance from last fetched page.
-        let disk_pos = self.disk_pos_of(page_id);
-        let seek_dist = (disk_pos as i64 - self.last_disk_pos as i64).unsigned_abs();
-        let total_disk = self.num_tables as u64 * self.pages_per_table as u64;
-        let seek_cost = (seek_dist as f64 / total_disk as f64) * 30.0;
-        self.last_disk_pos = disk_pos;
-
-        let victim = self.pick_victim_clock();
-        let mut cost = 10.0 + seek_cost;
-
-        if let Some(old_pid) = self.frames[victim].page_id {
-            self.evictions += 1;
-            self.page_table.remove(&old_pid);
-            if self.frames[victim].dirty {
-                self.dirty_evictions += 1;
-                cost += 20.0;
-            }
-        }
-
-        self.frames[victim] = Frame {
-            page_id: Some(page_id),
-            table_id: Some(self.table_of(page_id)),
-            dirty: self.rng.gen_bool(0.05),
-            ref_bit: true,
-            pin_count: 0,
-        };
-        self.page_table.insert(page_id, victim);
-
-        cost
+    pub fn resident(&self, frame: FrameIdx) -> Option<(PageId, bool)> {
+        let f = &self.frames[frame];
+        f.page.map(|p| (p, f.dirty))
     }
 
-    fn recompute_table_order(&mut self) {
-        let n = self.num_tables as usize;
-
-        // Snapshot co-access pairs so the closure doesn't borrow self.
-        let pairs: Vec<(usize, usize, u64)> = self
-            .co_access
-            .iter()
-            .map(|(&(a, b), &w)| (a as usize, b as usize, w))
-            .collect();
-
-        // MLA objective: Σ weight(a,b) × |slot(a) − slot(b)|
-        // Lower = co-accessed tables are physically closer on disk.
-        let mla_cost = |perm: &[TableId]| -> u64 {
-            let mut pos = vec![0usize; n];
-            for (slot, &t) in perm.iter().enumerate() {
-                pos[t as usize] = slot;
-            }
-            pairs
-                .iter()
-                .map(|&(a, b, w)| w * (pos[a] as i64 - pos[b] as i64).unsigned_abs())
-                .sum()
-        };
-
-        // Brute-force all n! permutations (n = 6 → 720 iterations).
-        let mut perm: Vec<TableId> = (0..self.num_tables).collect();
-        let mut best = perm.clone();
-        let mut best_cost = mla_cost(&perm);
-
-        while Self::next_permutation(&mut perm) {
-            let c = mla_cost(&perm);
-            if c < best_cost {
-                best_cost = c;
-                best = perm.clone();
-            }
-        }
-
-        self.disk_layout = best.clone();
-        self.table_order = best;
+    pub fn policy(&self) -> &dyn Policy {
+        self.policy.as_ref()
     }
 
-    /// Advances `arr` to the next lexicographic permutation in place.
-    /// Returns false when the sequence wraps back to sorted ascending order.
-    fn next_permutation(arr: &mut Vec<TableId>) -> bool {
-        let n = arr.len();
-        if n < 2 {
-            return false;
-        }
-        let mut i = n - 1;
-        while i > 0 && arr[i - 1] >= arr[i] {
-            i -= 1;
-        }
-        if i == 0 {
-            return false;
-        }
-        let mut j = n - 1;
-        while arr[j] <= arr[i - 1] {
-            j -= 1;
-        }
-        arr.swap(i - 1, j);
-        arr[i..].reverse();
-        true
-    }
-
-    pub fn tick(&mut self, t: u64, recluster: bool) -> Snapshot {
-        let pages = self.sample_query_pages();
-
-        let touched: Vec<TableId> = pages
-            .iter()
-            .map(|&pid| self.table_of(pid))
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        for i in 0..touched.len() {
-            for j in (i + 1)..touched.len() {
-                let a = touched[i].min(touched[j]);
-                let b = touched[i].max(touched[j]);
-                *self.co_access.entry((a, b)).or_insert(0) += 1;
+    /// Check that frames and the page table agree. For tests.
+    pub fn check_consistency(&self) -> Result<(), String> {
+        let mut seen = HashMap::new();
+        for (i, f) in self.frames.iter().enumerate() {
+            if let Some(p) = f.page {
+                if let Some(j) = seen.insert(p, i) {
+                    return Err(format!("page {p} in frames {j} and {i}"));
+                }
+                if self.page_table.get(&p) != Some(&i) {
+                    return Err(format!("page table disagrees for page {p}"));
+                }
             }
         }
-
-        let mut cost_sum = 0.0;
-        for pid in pages {
-            cost_sum += self.access_page(pid);
+        if seen.len() != self.page_table.len() {
+            return Err("page table has entries for non-resident pages".into());
         }
+        Ok(())
+    }
+}
 
-        if recluster {
-            self.recompute_table_order();
-            println!("tick {t}: recluster → order: {:?}", self.table_order);
+#[derive(Clone, Debug)]
+pub struct SimConfig {
+    pub frames: usize,
+    pub policy: PolicyKind,
+    /// Recluster every N ticks; None disables reclustering.
+    pub recluster_every: Option<u64>,
+    /// Multiply co-access counts by this after each recluster (1.0 = never
+    /// forget). Lower values adapt faster to workload drift.
+    pub co_access_decay: f64,
+}
+
+impl Default for SimConfig {
+    fn default() -> Self {
+        Self {
+            frames: 64,
+            policy: PolicyKind::Clock,
+            recluster_every: Some(500),
+            co_access_decay: 1.0,
         }
+    }
+}
 
-        // Locality score: average pairwise distance between touched tables in
-        // the current table_order. Lower means co-accessed tables sit closer
-        // together → better locality.
-        let pos: HashMap<TableId, usize> = self
-            .table_order
-            .iter()
-            .enumerate()
-            .map(|(i, &t)| (t, i))
-            .collect();
-        let locality_tick = if touched.len() >= 2 {
-            let pairs = (touched.len() * (touched.len() - 1) / 2) as f64;
-            let dist_sum: f64 = (0..touched.len())
-                .flat_map(|i| (i + 1..touched.len()).map(move |j| (i, j)))
-                .map(|(i, j)| (pos[&touched[i]] as f64 - pos[&touched[j]] as f64).abs())
-                .sum();
-            dist_sum / pairs
-        } else {
-            0.0
-        };
+#[derive(Clone, Debug, Default)]
+pub struct Metrics {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub dirty_evictions: u64,
+    pub total_cost: f64,
+    pub last_query_cost: f64,
+    pub avg_cost_ema: f64,
+    pub locality_ema: f64,
+    pub reclusters: u64,
+}
 
-        let alpha = 0.02;
-        if t == 1 {
-            self.avg_cost_ema = cost_sum;
-            self.locality_score_ema = locality_tick;
-        } else {
-            self.avg_cost_ema = alpha * cost_sum + (1.0 - alpha) * self.avg_cost_ema;
-            self.locality_score_ema =
-                alpha * locality_tick + (1.0 - alpha) * self.locality_score_ema;
-        }
-
+impl Metrics {
+    pub fn hit_rate(&self) -> f64 {
         let total = self.hits + self.misses;
-        let hit_rate = if total == 0 {
+        if total == 0 {
             0.0
         } else {
             self.hits as f64 / total as f64
+        }
+    }
+}
+
+/// What happened on one tick.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StepEvent {
+    pub tick: u64,
+    pub reclustered: bool,
+}
+
+pub struct Simulator {
+    trace: Trace,
+    cost: CostModel,
+    cfg: SimConfig,
+    pool: BufferPool,
+    layout: Layout,
+    co_access: CoAccess,
+    next_query: usize,
+    last_disk_pos: u64,
+    last_reclustered: bool,
+    metrics: Metrics,
+}
+
+impl Simulator {
+    pub fn new(
+        trace: Trace,
+        initial_layout: Vec<TableId>,
+        cost: CostModel,
+        cfg: SimConfig,
+    ) -> Self {
+        assert!(cfg.frames > 0, "buffer pool needs at least one frame");
+        let policy = cfg.policy.build(cfg.frames, &trace);
+        let layout = Layout::new(initial_layout, trace.pages_per_table);
+        Self {
+            pool: BufferPool::new(cfg.frames, policy),
+            trace,
+            cost,
+            cfg,
+            layout,
+            co_access: CoAccess::default(),
+            next_query: 0,
+            last_disk_pos: 0,
+            last_reclustered: false,
+            metrics: Metrics::default(),
+        }
+    }
+
+    /// Convenience: build the scenario for `w`/`seed` and run it to the end.
+    pub fn run(w: &Workload, seed: u64, ticks: u64, cfg: SimConfig) -> Self {
+        let (trace, layout) = build_scenario(w, seed, ticks);
+        let mut sim = Self::new(trace, layout, w.cost.clone(), cfg);
+        while sim.step().is_some() {}
+        sim
+    }
+
+    /// Ticks completed so far.
+    pub fn tick(&self) -> u64 {
+        self.next_query as u64
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.next_query >= self.trace.num_queries()
+    }
+
+    pub fn metrics(&self) -> &Metrics {
+        &self.metrics
+    }
+
+    pub fn layout(&self) -> &[TableId] {
+        self.layout.order()
+    }
+
+    pub fn pool(&self) -> &BufferPool {
+        &self.pool
+    }
+
+    /// Run the next query. Returns None when the trace is exhausted.
+    pub fn step(&mut self) -> Option<StepEvent> {
+        if self.is_done() {
+            return None;
+        }
+        let q = self.next_query;
+        self.next_query += 1;
+        let t = q as u64 + 1;
+        let range = self.trace.query_bounds(q);
+
+        let touched: Vec<TableId> = self.trace.accesses()[range.clone()]
+            .iter()
+            .map(|a| self.trace.table_of(a.page))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        self.co_access.record(&touched);
+
+        let mut query_cost = 0.0;
+        for pos in range {
+            let a = self.trace.accesses()[pos];
+            query_cost += self.access(a, pos);
+        }
+
+        let reclustered = matches!(self.cfg.recluster_every, Some(k) if t % k == 0);
+        if reclustered {
+            let order = layout::optimal_order(self.trace.num_tables, &self.co_access);
+            self.layout = Layout::new(order, self.trace.pages_per_table);
+            self.co_access.decay(self.cfg.co_access_decay);
+            self.metrics.reclusters += 1;
+        }
+        self.last_reclustered = reclustered;
+
+        // Locality: mean slot distance between the tables this query touched.
+        let locality = if touched.len() >= 2 {
+            let mut sum = 0.0;
+            let mut pairs = 0.0;
+            for i in 0..touched.len() {
+                for j in (i + 1)..touched.len() {
+                    sum += self
+                        .layout
+                        .slot(touched[i])
+                        .abs_diff(self.layout.slot(touched[j])) as f64;
+                    pairs += 1.0;
+                }
+            }
+            sum / pairs
+        } else {
+            0.0
         };
 
-        Snapshot {
+        let m = &mut self.metrics;
+        if t == 1 {
+            m.avg_cost_ema = query_cost;
+            m.locality_ema = locality;
+        } else {
+            m.avg_cost_ema = EMA_ALPHA * query_cost + (1.0 - EMA_ALPHA) * m.avg_cost_ema;
+            m.locality_ema = EMA_ALPHA * locality + (1.0 - EMA_ALPHA) * m.locality_ema;
+        }
+        m.last_query_cost = query_cost;
+        m.total_cost += query_cost;
+
+        Some(StepEvent {
             tick: t,
-            recluster,
-            frames: self
-                .frames
-                .iter()
-                .map(|f| FrameSnap {
-                    page_id: f.page_id.map(|x| x as i32).unwrap_or(-1),
-                    table_id: f.table_id.map(|x| x as i32).unwrap_or(-1),
-                    dirty: f.dirty,
-                    ref_bit: f.ref_bit,
-                    pin_count: f.pin_count,
+            reclustered,
+        })
+    }
+
+    /// Serve one access; returns its cost.
+    fn access(&mut self, a: Access, pos: usize) -> f64 {
+        match self.pool.access(a.page, a.write, pos) {
+            Outcome::Hit => {
+                self.metrics.hits += 1;
+                self.cost.hit
+            }
+            Outcome::Miss {
+                evicted,
+                evicted_dirty,
+            } => {
+                self.metrics.misses += 1;
+                let disk_pos = self.layout.disk_pos(a.page);
+                let seek_dist = disk_pos.abs_diff(self.last_disk_pos);
+                let total_disk = self.trace.num_tables as u64 * self.trace.pages_per_table as u64;
+                let seek_cost = (seek_dist as f64 / total_disk as f64) * self.cost.seek_max;
+                self.last_disk_pos = disk_pos;
+
+                let mut cost = self.cost.miss + seek_cost;
+                if evicted {
+                    self.metrics.evictions += 1;
+                }
+                if evicted_dirty {
+                    self.metrics.dirty_evictions += 1;
+                    cost += self.cost.dirty_writeback;
+                }
+                cost
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        let m = &self.metrics;
+        let policy = self.pool.policy();
+        Snapshot {
+            tick: self.tick(),
+            recluster: self.last_reclustered,
+            policy: self.cfg.policy.name().to_string(),
+            frames: (0..self.pool.frames.len())
+                .map(|i| match self.pool.resident(i) {
+                    Some((page, dirty)) => FrameSnap {
+                        page_id: page as i64,
+                        table_id: self.trace.table_of(page) as i32,
+                        dirty,
+                        ref_bit: policy.ref_bit(i),
+                    },
+                    None => FrameSnap {
+                        page_id: -1,
+                        table_id: -1,
+                        dirty: false,
+                        ref_bit: false,
+                    },
                 })
                 .collect(),
             metrics: MetricsSnap {
-                hit_rate,
-                avg_cost: self.avg_cost_ema,
-                evictions: self.evictions,
-                dirty_evictions: self.dirty_evictions,
-                locality_score: self.locality_score_ema,
+                hit_rate: m.hit_rate(),
+                avg_cost: m.avg_cost_ema,
+                query_cost: m.last_query_cost,
+                total_cost: m.total_cost,
+                hits: m.hits,
+                misses: m.misses,
+                evictions: m.evictions,
+                dirty_evictions: m.dirty_evictions,
+                locality_score: m.locality_ema,
             },
-            table_order: self.table_order.clone(),
-            disk_layout: self.disk_layout.clone(),
+            disk_layout: self.layout.order().to_vec(),
+        }
+    }
+
+    pub fn summary(&self) -> RunSummary {
+        let m = &self.metrics;
+        let queries = self.tick();
+        RunSummary {
+            policy: self.cfg.policy.name().to_string(),
+            frames: self.cfg.frames,
+            recluster_every: self.cfg.recluster_every,
+            co_access_decay: self.cfg.co_access_decay,
+            queries,
+            accesses: m.hits + m.misses,
+            hits: m.hits,
+            misses: m.misses,
+            hit_rate: m.hit_rate(),
+            evictions: m.evictions,
+            dirty_evictions: m.dirty_evictions,
+            total_cost: m.total_cost,
+            mean_cost_per_query: if queries == 0 {
+                0.0
+            } else {
+                m.total_cost / queries as f64
+            },
+            final_avg_cost_ema: m.avg_cost_ema,
+            final_locality_ema: m.locality_ema,
+            reclusters: m.reclusters,
+            final_layout: self.layout.order().to_vec(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_stays_consistent_for_every_policy() {
+        let w = Workload::builtin_default();
+        for kind in PolicyKind::ALL {
+            for frames in [1, 7, 64] {
+                let (trace, layout) = build_scenario(&w, 3, 400);
+                let cfg = SimConfig {
+                    frames,
+                    policy: kind,
+                    ..SimConfig::default()
+                };
+                let mut sim = Simulator::new(trace, layout, w.cost.clone(), cfg);
+                while sim.step().is_some() {
+                    sim.pool()
+                        .check_consistency()
+                        .unwrap_or_else(|e| panic!("{kind} f={frames}: {e}"));
+                }
+            }
         }
     }
 }

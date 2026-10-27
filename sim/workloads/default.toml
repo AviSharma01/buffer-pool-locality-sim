@@ -1,0 +1,42 @@
+# The original v0.1 workload. Running it with --policy clock and seed 42
+# reproduces the v0.1 results exactly (see tests/regression.rs).
+#
+# Six tables, 200 pages each. Table 0 is a hub joined with 1, 2 and 5;
+# 3 and 4 form their own pair. 70% of queries only touch each table's hot
+# first 10%, and 15% of queries also scan 8 consecutive pages of a random table.
+
+name = "default"
+description = "Hub-and-spoke join mix over six tables with a small hot set."
+num_tables = 6
+pages_per_table = 200
+write_prob = 0.05
+
+[cost]
+hit = 1.0
+miss = 10.0
+seek_max = 30.0
+dirty_writeback = 20.0
+
+[[phase]]
+start_tick = 1
+hot_prob = 0.7
+hot_fraction = 0.1
+pages_per_query = [2, 5]
+scan_prob = 0.15
+scan_len = 8
+
+[[phase.query]]
+tables = [0, 1]
+weight = 0.40
+
+[[phase.query]]
+tables = [0, 2]
+weight = 0.30
+
+[[phase.query]]
+tables = [3, 4]
+weight = 0.20
+
+[[phase.query]]
+tables = [5, 0]
+weight = 0.10

@@ -1,0 +1,53 @@
+# Workload drift. Phase 1 is the default join mix (table 0 is the hub).
+# At tick 2501 the mix changes so table 3 becomes the hub, and the layout
+# that was optimal for phase 1 is now poor. Compare (score phase 2 from the
+# per-tick query_cost in snapshots, e.g. --snapshot-every 1):
+#   --recluster=false                 static layout
+#   (default)                         recluster, never forget history
+#   --co-access-decay 0.5             recluster, forget old co-access faster
+
+name = "drift"
+description = "Join mix shifts at tick 2501; tests how fast reclustering adapts."
+num_tables = 6
+pages_per_table = 200
+write_prob = 0.05
+
+[[phase]]
+start_tick = 1
+scan_prob = 0.15
+
+[[phase.query]]
+tables = [0, 1]
+weight = 0.4
+
+[[phase.query]]
+tables = [0, 2]
+weight = 0.3
+
+[[phase.query]]
+tables = [3, 4]
+weight = 0.2
+
+[[phase.query]]
+tables = [5, 0]
+weight = 0.1
+
+[[phase]]
+start_tick = 2501
+scan_prob = 0.15
+
+[[phase.query]]
+tables = [3, 5]
+weight = 0.4
+
+[[phase.query]]
+tables = [3, 1]
+weight = 0.3
+
+[[phase.query]]
+tables = [2, 4]
+weight = 0.2
+
+[[phase.query]]
+tables = [4, 0]
+weight = 0.1

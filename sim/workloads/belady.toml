@@ -1,0 +1,10 @@
+# Belady's anomaly: the classic reference string 1,2,3,4,1,2,5,1,2,3,4,5
+# (zero-based here). Under FIFO, 3 frames give 9 misses but 4 frames give 10.
+#   sim --workload workloads/belady.toml --policy fifo --frames 3 --recluster=false --snapshot-every 1
+#   sim --workload workloads/belady.toml --policy fifo --frames 4 --recluster=false --snapshot-every 1
+
+name = "belady"
+description = "Classic reference string where FIFO gets worse with more memory."
+num_tables = 1
+pages_per_table = 5
+explicit_pages = [0, 1, 2, 3, 0, 1, 4, 0, 1, 2, 3, 4]

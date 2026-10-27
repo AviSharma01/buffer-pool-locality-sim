@@ -1,0 +1,56 @@
+# Scan pollution. The hot set (8 pages x 6 tables = 48 pages) fits in a
+# 64-frame pool. For the first 2000 ticks there are no big scans and every
+# policy does well. From tick 2001, 5% of queries also scan 100 consecutive
+# pages, which flushes the hot set out of FIFO/LRU/Clock. Scan-resistant 2Q
+# keeps most of it. Compare policies with --recluster=false.
+
+name = "scan"
+description = "Small hot set; long sequential scans start at tick 2001."
+num_tables = 6
+pages_per_table = 200
+write_prob = 0.05
+
+[[phase]]
+start_tick = 1
+hot_prob = 0.95
+hot_fraction = 0.04
+scan_prob = 0.0
+
+[[phase.query]]
+tables = [0, 1]
+weight = 0.4
+
+[[phase.query]]
+tables = [0, 2]
+weight = 0.3
+
+[[phase.query]]
+tables = [3, 4]
+weight = 0.2
+
+[[phase.query]]
+tables = [5, 0]
+weight = 0.1
+
+[[phase]]
+start_tick = 2001
+hot_prob = 0.95
+hot_fraction = 0.04
+scan_prob = 0.05
+scan_len = 100
+
+[[phase.query]]
+tables = [0, 1]
+weight = 0.4
+
+[[phase.query]]
+tables = [0, 2]
+weight = 0.3
+
+[[phase.query]]
+tables = [3, 4]
+weight = 0.2
+
+[[phase.query]]
+tables = [5, 0]
+weight = 0.1
