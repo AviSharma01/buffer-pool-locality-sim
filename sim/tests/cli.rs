@@ -86,7 +86,7 @@ fn normal_run_writes_snapshots() {
         "--ticks",
         "100",
         "--policy",
-        "2q",
+        "innodb",
         "--out",
         dir.to_str().unwrap(),
     ]);
@@ -95,7 +95,7 @@ fn normal_run_writes_snapshots() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let run = std::fs::read_dir(dir.join("default/2q/recluster"))
+    let run = std::fs::read_dir(dir.join("default/innodb/recluster"))
         .unwrap()
         .next()
         .unwrap()
@@ -107,7 +107,7 @@ fn normal_run_writes_snapshots() {
     );
     let summary: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(run.join("summary.json")).unwrap()).unwrap();
-    assert_eq!(summary["policy"], "2q");
+    assert_eq!(summary["policy"], "innodb");
     assert_eq!(summary["queries"], 100);
 }
 

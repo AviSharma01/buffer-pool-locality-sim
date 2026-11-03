@@ -16,7 +16,8 @@ pub struct Cli {
     #[arg(long, conflicts_with = "workload")]
     pub trace: Option<PathBuf>,
 
-    /// Page replacement policy: fifo, lru, clock, 2q or opt.
+    /// Page replacement policy: fifo, lru, clock, pg (PostgreSQL-style),
+    /// innodb (InnoDB-style) or opt.
     #[arg(long, default_value = "clock")]
     pub policy: PolicyKind,
 

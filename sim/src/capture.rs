@@ -12,6 +12,13 @@
 //! never happened. So each write is folded into the same query's latest read of
 //! that page ("read, then modify", like synthetic workloads); a write to a page
 //! the query never read stays a write access.
+//!
+//! A query whose plan has `SCAN <table>` reads that table's b-tree in order, so
+//! its accesses to that table's pages are marked as a scan of a relation that
+//! many pages long. With `USING [COVERING] INDEX <index>` the index is what is
+//! read in order, so its pages are marked instead.
+
+use std::collections::HashMap;
 
 use serde::Deserialize;
 
@@ -30,7 +37,15 @@ pub struct CapturedTrace {
     pub sqlite_version: String,
     pub page_size: u32,
     pub page_count: u32,
+    /// Which table or index owns each page.
+    pub pages: Vec<PageInfo>,
     pub queries: Vec<CapturedQuery>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PageInfo {
+    pub page: u32,
+    pub object: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -94,9 +109,30 @@ impl CapturedTrace {
         Ok(())
     }
 
-    /// One query per tick, with writes folded into reads (see the module docs).
+    /// One query per tick, with writes folded into reads and scans marked
+    /// (see the module docs).
     pub fn to_trace(&self) -> Trace {
-        let queries = self.queries.iter().map(fold_writes).collect();
+        let owner: HashMap<u32, &str> = self
+            .pages
+            .iter()
+            .map(|p| (p.page, p.object.as_str()))
+            .collect();
+        let mut size: HashMap<&str, u32> = HashMap::new();
+        for p in &self.pages {
+            *size.entry(p.object.as_str()).or_default() += 1;
+        }
+        let queries = self
+            .queries
+            .iter()
+            .map(|q| {
+                let scanned: Vec<&str> = q.plan.iter().filter_map(|l| scanned_object(l)).collect();
+                let scan_of = |page: u32| {
+                    let object = *owner.get(&page)?;
+                    scanned.contains(&object).then(|| size[object])
+                };
+                fold_writes(q, scan_of)
+            })
+            .collect();
         // Page 0 does not exist in SQLite; reserving it keeps ids equal to page numbers.
         Trace::from_queries(1, self.page_count + 1, queries)
     }
@@ -111,7 +147,19 @@ impl CapturedTrace {
     }
 }
 
-fn fold_writes(q: &CapturedQuery) -> Vec<Access> {
+/// The table or index a `SCAN` plan line reads in order, if any.
+fn scanned_object(plan_line: &str) -> Option<&str> {
+    let rest = plan_line.strip_prefix("SCAN ")?;
+    let mut words = rest.split_whitespace();
+    let table = words.next()?;
+    let index = rest
+        .split_once("USING COVERING INDEX ")
+        .or_else(|| rest.split_once("USING INDEX "))
+        .and_then(|(_, after)| after.split_whitespace().next());
+    Some(index.unwrap_or(table))
+}
+
+fn fold_writes(q: &CapturedQuery, scan_of: impl Fn(u32) -> Option<u32>) -> Vec<Access> {
     let mut accesses: Vec<Access> = Vec::with_capacity(q.io.len());
     for &(op, page) in &q.io {
         let earlier = accesses.iter_mut().rev().find(|a| a.page == page);
@@ -120,6 +168,7 @@ fn fold_writes(q: &CapturedQuery) -> Vec<Access> {
             (op, _) => accesses.push(Access {
                 page,
                 write: op == IoOp::Write,
+                scan: scan_of(page),
             }),
         }
     }
@@ -133,7 +182,10 @@ mod tests {
     fn trace_json(format: &str, version: u32, io: &str) -> String {
         format!(
             r#"{{"format":"{format}","version":{version},"scenario":"tiny","sqlite_version":"3.54.1",
-               "page_size":4096,"page_count":3,"pages":[],"rows":{{}},"notes":[],
+               "page_size":4096,"page_count":3,"rows":{{}},"notes":[],
+               "pages":[{{"page":1,"object":"sqlite_schema","kind":"leaf"}},
+                        {{"page":2,"object":"t","kind":"leaf"}},
+                        {{"page":3,"object":"t","kind":"leaf"}}],
                "queries":[{{"title":"q","sql":"SELECT 1;","plan":["SCAN t"],"io":{io}}}]}}"#
         )
     }
@@ -144,6 +196,31 @@ mod tests {
         assert_eq!(trace.num_queries(), 1);
         assert_eq!(trace.table_of(3), 0);
         trace.accesses().iter().map(|a| (a.page, a.write)).collect()
+    }
+
+    #[test]
+    fn scan_marks_only_the_scanned_objects_pages() {
+        let t = CapturedTrace::from_json(&trace_json(FORMAT, 1, r#"[["r",1],["r",2],["r",3]]"#))
+            .unwrap();
+        let scans: Vec<_> = t.to_trace().accesses().iter().map(|a| a.scan).collect();
+        assert_eq!(scans, [None, Some(2), Some(2)]);
+    }
+
+    #[test]
+    fn plan_lines_name_the_object_read_in_order() {
+        assert_eq!(scanned_object("SCAN orders"), Some("orders"));
+        assert_eq!(
+            scanned_object("SCAN users USING COVERING INDEX users_email"),
+            Some("users_email")
+        );
+        assert_eq!(
+            scanned_object("SCAN users USING INDEX users_email"),
+            Some("users_email")
+        );
+        assert_eq!(
+            scanned_object("SEARCH users USING INTEGER PRIMARY KEY (rowid=?)"),
+            None
+        );
     }
 
     #[test]

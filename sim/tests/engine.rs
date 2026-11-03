@@ -118,17 +118,22 @@ fn belady_anomaly_under_fifo() {
     assert_eq!(misses(&w, 0, 1, PolicyKind::Lru, 4), 8);
 }
 
-/// 2Q exists to survive sequential scans; it should clearly beat LRU once the
+/// PostgreSQL's scan ring and InnoDB's midpoint insertion exist to keep a
+/// big scan from flushing the hot set; both should clearly beat LRU once the
 /// scan phase of the scan workload starts.
 #[test]
-fn two_q_resists_scans() {
+fn real_world_policies_resist_scans() {
     let w = workload("scan.toml");
-    let lru = misses(&w, 1, 5000, PolicyKind::Lru, 64);
-    let two_q = misses(&w, 1, 5000, PolicyKind::TwoQ, 64);
-    assert!(
-        (two_q as f64) < 0.85 * lru as f64,
-        "2q {two_q} vs lru {lru}"
-    );
+    for seed in 1..=4 {
+        let lru = misses(&w, seed, 5000, PolicyKind::Lru, 64);
+        for kind in [PolicyKind::Pg, PolicyKind::InnoDb] {
+            let m = misses(&w, seed, 5000, kind, 64);
+            assert!(
+                (m as f64) < 0.85 * lru as f64,
+                "seed {seed}: {kind} {m} vs lru {lru}"
+            );
+        }
+    }
 }
 
 #[test]

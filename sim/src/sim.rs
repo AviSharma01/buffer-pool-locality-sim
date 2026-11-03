@@ -6,7 +6,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 use crate::layout::{self, CoAccess, Layout};
-use crate::policy::{Policy, PolicyKind};
+use crate::policy::{Ctx, FrameState, Log, Note, Policy, PolicyKind};
 use crate::snapshot::{FrameSnap, MetricsSnap, RunSummary, Snapshot};
 use crate::trace::{Access, Trace};
 use crate::workload::{CostModel, Workload};
@@ -33,7 +33,14 @@ struct Frame {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Hit,
-    Miss { evicted: bool, evicted_dirty: bool },
+    Miss { evicted: Option<Evicted> },
+}
+
+/// The page a miss pushed out of its frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Evicted {
+    pub page: PageId,
+    pub dirty: bool,
 }
 
 /// Fixed-size page cache. Owns frames and the page table; delegates victim
@@ -61,42 +68,40 @@ impl BufferPool {
         }
     }
 
-    pub fn access(&mut self, page: PageId, write: bool, pos: usize) -> Outcome {
-        if let Some(&f) = self.page_table.get(&page) {
-            if write {
+    /// Serve one access; returns the frame that now holds the page.
+    pub fn access(&mut self, a: Access, ctx: Ctx, log: &mut Log) -> (FrameIdx, Outcome) {
+        if let Some(&f) = self.page_table.get(&a.page) {
+            if a.write {
                 self.frames[f].dirty = true;
             }
-            self.policy.on_hit(f, page, pos);
-            return Outcome::Hit;
+            self.policy.on_hit(f, ctx, log);
+            return (f, Outcome::Hit);
         }
 
         let f = if self.next_free < self.frames.len() {
             self.next_free += 1;
             self.next_free - 1
         } else {
-            self.policy.victim()
+            self.policy.victim(ctx, log)
         };
 
         let old = std::mem::replace(
             &mut self.frames[f],
             Frame {
-                page: Some(page),
-                dirty: write,
+                page: Some(a.page),
+                dirty: a.write,
             },
         );
-        let (evicted, evicted_dirty) = match old.page {
-            Some(old_page) => {
-                self.page_table.remove(&old_page);
-                (true, old.dirty)
+        let evicted = old.page.map(|page| {
+            self.page_table.remove(&page);
+            Evicted {
+                page,
+                dirty: old.dirty,
             }
-            None => (false, false),
-        };
-        self.page_table.insert(page, f);
-        self.policy.on_load(f, page, pos);
-        Outcome::Miss {
-            evicted,
-            evicted_dirty,
-        }
+        });
+        self.page_table.insert(a.page, f);
+        self.policy.on_load(f, ctx, log);
+        (f, Outcome::Miss { evicted })
     }
 
     pub fn resident(&self, frame: FrameIdx) -> Option<(PageId, bool)> {
@@ -106,6 +111,16 @@ impl BufferPool {
 
     pub fn policy(&self) -> &dyn Policy {
         self.policy.as_ref()
+    }
+
+    /// The policy's view of every frame.
+    pub fn frame_states(&self) -> Vec<FrameState> {
+        (0..self.frames.len())
+            .map(|i| match self.frames[i].page {
+                Some(_) => self.policy.state(i),
+                None => FrameState::Empty,
+            })
+            .collect()
     }
 
     /// Check that frames and the page table agree. For tests.
@@ -181,6 +196,22 @@ pub struct StepEvent {
     pub reclustered: bool,
 }
 
+/// One access, explained: what the pool did and what the policy looked at.
+/// Recorded only after [`Simulator::record_events`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Event {
+    pub access: Access,
+    pub ctx: Ctx,
+    /// Frame now holding the page.
+    pub frame: FrameIdx,
+    pub outcome: Outcome,
+    /// In the order the policy did them.
+    pub notes: Vec<Note>,
+    /// Every frame's state after the access.
+    pub frames: Vec<FrameState>,
+    pub hand: Option<FrameIdx>,
+}
+
 pub struct Simulator {
     trace: Trace,
     cost: CostModel,
@@ -192,6 +223,8 @@ pub struct Simulator {
     last_disk_pos: u64,
     last_reclustered: bool,
     metrics: Metrics,
+    log: Log,
+    events: Option<Vec<Event>>,
 }
 
 impl Simulator {
@@ -215,7 +248,21 @@ impl Simulator {
             last_disk_pos: 0,
             last_reclustered: false,
             metrics: Metrics::default(),
+            log: Log::default(),
+            events: None,
         }
+    }
+
+    /// Record an [`Event`] for every access from now on. Costs memory per
+    /// access (all frame states), so it is meant for short captured traces.
+    pub fn record_events(&mut self) {
+        self.log = Log::on();
+        self.events.get_or_insert_with(Vec::new);
+    }
+
+    /// Events recorded so far (empty unless recording).
+    pub fn events(&self) -> &[Event] {
+        self.events.as_deref().unwrap_or_default()
     }
 
     /// Convenience: build the scenario for `w`/`seed` and run it to the end.
@@ -268,7 +315,12 @@ impl Simulator {
         let mut query_cost = 0.0;
         for pos in range {
             let a = self.trace.accesses()[pos];
-            query_cost += self.access(a, pos);
+            let ctx = Ctx {
+                pos,
+                query: q,
+                scan: a.scan,
+            };
+            query_cost += self.access(a, ctx);
         }
 
         let reclustered = matches!(self.cfg.recluster_every, Some(k) if t % k == 0);
@@ -316,16 +368,25 @@ impl Simulator {
     }
 
     /// Serve one access; returns its cost.
-    fn access(&mut self, a: Access, pos: usize) -> f64 {
-        match self.pool.access(a.page, a.write, pos) {
+    fn access(&mut self, a: Access, ctx: Ctx) -> f64 {
+        let (frame, outcome) = self.pool.access(a, ctx, &mut self.log);
+        if let Some(events) = &mut self.events {
+            events.push(Event {
+                access: a,
+                ctx,
+                frame,
+                outcome,
+                notes: self.log.take(),
+                frames: self.pool.frame_states(),
+                hand: self.pool.policy().hand(),
+            });
+        }
+        match outcome {
             Outcome::Hit => {
                 self.metrics.hits += 1;
                 self.cost.hit
             }
-            Outcome::Miss {
-                evicted,
-                evicted_dirty,
-            } => {
+            Outcome::Miss { evicted } => {
                 self.metrics.misses += 1;
                 let disk_pos = self.layout.disk_pos(a.page);
                 let seek_dist = disk_pos.abs_diff(self.last_disk_pos);
@@ -334,12 +395,12 @@ impl Simulator {
                 self.last_disk_pos = disk_pos;
 
                 let mut cost = self.cost.miss + seek_cost;
-                if evicted {
+                if let Some(e) = evicted {
                     self.metrics.evictions += 1;
-                }
-                if evicted_dirty {
-                    self.metrics.dirty_evictions += 1;
-                    cost += self.cost.dirty_writeback;
+                    if e.dirty {
+                        self.metrics.dirty_evictions += 1;
+                        cost += self.cost.dirty_writeback;
+                    }
                 }
                 cost
             }
@@ -348,7 +409,7 @@ impl Simulator {
 
     pub fn snapshot(&self) -> Snapshot {
         let m = &self.metrics;
-        let policy = self.pool.policy();
+        let states = self.pool.frame_states();
         Snapshot {
             tick: self.tick(),
             recluster: self.last_reclustered,
@@ -359,7 +420,7 @@ impl Simulator {
                         page_id: page as i64,
                         table_id: self.trace.table_of(page) as i32,
                         dirty,
-                        ref_bit: policy.ref_bit(i),
+                        ref_bit: states[i] == FrameState::Clock { referenced: true },
                     },
                     None => FrameSnap {
                         page_id: -1,

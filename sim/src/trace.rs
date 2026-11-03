@@ -15,6 +15,9 @@ use crate::{PageId, TableId};
 pub struct Access {
     pub page: PageId,
     pub write: bool,
+    /// Part of a sequential scan of a relation this many pages long. Policies
+    /// may treat big scans differently (PostgreSQL's scan ring).
+    pub scan: Option<u32>,
 }
 
 /// A sequence of queries, each a run of page accesses. One query = one tick.
@@ -50,7 +53,13 @@ impl Trace {
         let queries = match &w.explicit_pages {
             Some(pages) => pages
                 .iter()
-                .map(|&page| vec![Access { page, write: false }])
+                .map(|&page| {
+                    vec![Access {
+                        page,
+                        write: false,
+                        scan: None,
+                    }]
+                })
                 .collect(),
             None => (1..=ticks)
                 .map(|t| sample_query(w, w.phase_at(t), rng))
@@ -128,7 +137,7 @@ fn sample_query<R: Rng>(w: &Workload, phase: &Phase, rng: &mut R) -> Vec<Access>
     let mut pages = Vec::new();
     for (&table, &n) in chosen.tables.iter().zip(&counts) {
         for _ in 0..n {
-            pages.push(page_id(w, table, rng.gen_range(0..max_idx)));
+            pages.push((page_id(w, table, rng.gen_range(0..max_idx)), None));
         }
     }
 
@@ -137,15 +146,16 @@ fn sample_query<R: Rng>(w: &Workload, phase: &Phase, rng: &mut R) -> Vec<Access>
         // Exclusive upper bound kept from v0.1 so seeded runs reproduce.
         let start = rng.gen_range(0..w.pages_per_table.saturating_sub(phase.scan_len).max(1));
         for i in 0..phase.scan_len {
-            pages.push(page_id(w, table, start + i));
+            pages.push((page_id(w, table, start + i), Some(w.pages_per_table)));
         }
     }
 
     pages
         .into_iter()
-        .map(|page| Access {
+        .map(|(page, scan)| Access {
             page,
             write: rng.gen_bool(w.write_prob),
+            scan,
         })
         .collect()
 }
@@ -156,7 +166,11 @@ mod tests {
 
     #[test]
     fn next_use_links_repeated_pages() {
-        let a = |page| Access { page, write: false };
+        let a = |page| Access {
+            page,
+            write: false,
+            scan: None,
+        };
         let t = Trace::from_queries(1, 10, vec![vec![a(1), a(2)], vec![a(1)], vec![a(3), a(2)]]);
         assert_eq!(t.next_use(), vec![2, 4, usize::MAX, usize::MAX, usize::MAX]);
         assert_eq!(t.num_queries(), 3);
