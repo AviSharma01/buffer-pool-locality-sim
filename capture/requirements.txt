@@ -1,0 +1,5 @@
+apsw==3.54.1.0
+
+# development
+pytest==9.1.1
+ruff==0.16.9

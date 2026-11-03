@@ -1,0 +1,16 @@
+[project]
+name = "bpsim-capture"
+version = "0.1.0"
+description = "Capture the page I/O SQLite performs for a scenario of queries"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

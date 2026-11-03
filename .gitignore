@@ -3,7 +3,7 @@
 /media/
 
 # Python virtual env
-/.venv/
+.venv/
 
 # Generated visualization frames
 /**/_frames/
@@ -16,3 +16,7 @@
 
 # Python bytecode
 __pycache__/
+
+# Python tool caches
+.pytest_cache/
+.ruff_cache/
