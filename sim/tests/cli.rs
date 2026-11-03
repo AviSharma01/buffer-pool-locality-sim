@@ -110,3 +110,53 @@ fn normal_run_writes_snapshots() {
     assert_eq!(summary["policy"], "2q");
     assert_eq!(summary["queries"], 100);
 }
+
+fn shop_trace() -> String {
+    format!("{}/../traces/shop.trace.json", env!("CARGO_MANIFEST_DIR"))
+}
+
+#[test]
+fn replays_a_captured_trace() {
+    let dir = out_dir("replay");
+    let trace = shop_trace();
+    let out = sim(&[
+        "--trace",
+        &trace,
+        "--policy",
+        "lru",
+        "--frames",
+        "8",
+        "--out",
+        dir.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = std::fs::read_dir(dir.join("shop/lru/replay"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(summary["trace"], "shop");
+    assert_eq!(summary["hits"], 15);
+    assert_eq!(std::fs::read_dir(run.join("snapshots")).unwrap().count(), 9);
+    assert!(summary.get("seed").is_none() && summary.get("workload").is_none());
+}
+
+#[test]
+fn rejects_bad_trace_arguments() {
+    let trace = shop_trace();
+    assert_rejected(
+        &["--trace", &trace, "--workload", "x.toml"],
+        "cannot be used with",
+    );
+    assert_rejected(
+        &["--trace", &trace, "--frames", "500"],
+        "exceeds the trace's total pages",
+    );
+}

@@ -11,6 +11,11 @@ pub struct Cli {
     #[arg(long)]
     pub workload: Option<PathBuf>,
 
+    /// Replay a trace captured from SQLite (traces/*.trace.json) instead of a
+    /// workload. `--ticks`, `--seed` and the recluster flags do not apply.
+    #[arg(long, conflicts_with = "workload")]
+    pub trace: Option<PathBuf>,
+
     /// Page replacement policy: fifo, lru, clock, 2q or opt.
     #[arg(long, default_value = "clock")]
     pub policy: PolicyKind,
@@ -40,9 +45,10 @@ pub struct Cli {
     #[arg(long, default_value_t = 1.0, value_parser = unit_interval)]
     pub co_access_decay: f64,
 
-    /// Ticks between snapshot files. 0 disables snapshots (summary only).
-    #[arg(long, default_value_t = 10)]
-    pub snapshot_every: u64,
+    /// Ticks between snapshot files; 0 disables them (summary only).
+    /// Defaults to every tick for `--trace` and every 10 ticks for workloads.
+    #[arg(long)]
+    pub snapshot_every: Option<u64>,
 
     /// Output root. Runs go to <out>/<workload>/<policy>/<recluster|no_recluster>/<timestamp>/.
     #[arg(long, default_value = "../outputs/runs")]

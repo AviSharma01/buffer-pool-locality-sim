@@ -11,6 +11,7 @@
 //!
 //! This crate does no file I/O so it can be compiled to WebAssembly.
 
+pub mod capture;
 pub mod layout;
 pub mod policy;
 pub mod sim;
@@ -22,6 +23,7 @@ pub type PageId = u32;
 pub type TableId = u16;
 pub type FrameIdx = usize;
 
+pub use capture::CapturedTrace;
 pub use policy::PolicyKind;
 pub use sim::{SimConfig, Simulator, build_scenario};
 pub use workload::{CostModel, Workload};
