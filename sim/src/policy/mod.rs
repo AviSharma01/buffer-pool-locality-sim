@@ -22,6 +22,8 @@ mod pg;
 use std::fmt;
 use std::str::FromStr;
 
+use serde::Serialize;
+
 pub use clock::Clock;
 pub use fifo::Fifo;
 pub use innodb::InnoDb;
@@ -33,7 +35,7 @@ use crate::FrameIdx;
 use crate::trace::Trace;
 
 /// What a policy may know about the access being served.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Ctx {
     /// Index of the access in the trace.
     pub pos: usize,
@@ -44,7 +46,8 @@ pub struct Ctx {
 }
 
 /// One thing a policy looked at or changed while serving an access.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Note {
     /// A clock hand passed `frame` and lowered its count (Clock's reference
     /// bit, PostgreSQL's usage count).
@@ -69,7 +72,8 @@ pub enum Note {
 }
 
 /// Why a frame was chosen for eviction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Why {
     /// FIFO: loaded before every other resident page.
     LoadedFirst { loaded_at: usize },
@@ -86,7 +90,8 @@ pub enum Why {
 }
 
 /// InnoDB's two LRU sublists.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Region {
     Young,
     Old,
@@ -94,15 +99,31 @@ pub enum Region {
 
 /// A policy's view of one frame, for overlays in the viewer. `rank` counts
 /// from the next victim (0 = evicted next).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FrameState {
     Empty,
-    Fifo { rank: usize },
-    Lru { rank: usize },
-    Clock { referenced: bool },
-    Pg { usage: u8, in_ring: bool },
-    InnoDb { region: Region, rank: usize },
-    Opt { next_use: Option<usize> },
+    Fifo {
+        rank: usize,
+    },
+    Lru {
+        rank: usize,
+    },
+    Clock {
+        referenced: bool,
+    },
+    Pg {
+        usage: u8,
+        in_ring: bool,
+    },
+    #[serde(rename = "innodb")]
+    InnoDb {
+        region: Region,
+        rank: usize,
+    },
+    Opt {
+        next_use: Option<usize>,
+    },
 }
 
 /// Collects [`Note`]s when on; costs one branch per push when off.

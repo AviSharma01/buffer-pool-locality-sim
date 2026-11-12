@@ -1,0 +1,184 @@
+<!doctype html>
+<!--
+  bpsim viewer. `sim --trace ...` writes a copy of this page with the run file
+  built in (viewer.html). Opened as is, it waits for a run.json to be dropped
+  on it, which is the quick loop while working on the viewer.
+
+  2.4 placeholder: shows that the data loads and that the per-access events add
+  up to each policy's summary. The real viewer comes in 2.5.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bpsim viewer</title>
+<style>
+  :root {
+    --bg: #fbfaf7;
+    --fg: #1d1c1a;
+    --muted: #6b675f;
+    --line: #e2ded5;
+    --ok: #2f7d4f;
+    --bad: #b3261e;
+    --code-bg: #f1eee7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161513;
+      --fg: #ece9e2;
+      --muted: #a39f96;
+      --line: #34322e;
+      --ok: #6cc28f;
+      --bad: #f2867d;
+      --code-bg: #22201d;
+    }
+  }
+  body {
+    margin: 0 auto;
+    max-width: 960px;
+    padding: 24px 16px 64px;
+    background: var(--bg);
+    color: var(--fg);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 32px 0 8px; }
+  .meta, .muted { color: var(--muted); }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-weight: 600; }
+  td.num { text-align: right; }
+  code, pre { font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre { margin: 4px 0 0; padding: 6px 8px; background: var(--code-bg); border-radius: 4px; white-space: pre-wrap; }
+  .ok { color: var(--ok); }
+  .bad { color: var(--bad); }
+  .scroll { overflow-x: auto; }
+  #drop { border: 2px dashed var(--line); border-radius: 8px; padding: 32px; text-align: center; }
+  body.dragging #drop, body.dragging main { outline: 2px dashed var(--muted); }
+</style>
+</head>
+<body>
+<div id="drop" hidden>No run data in this page. Drop a <code>run.json</code> here.</div>
+<p id="error" class="bad" hidden></p>
+<main hidden>
+  <h1 id="title"></h1>
+  <div id="meta" class="meta"></div>
+
+  <h2>Policies</h2>
+  <div class="scroll"><table id="policies"></table></div>
+
+  <h2>Hits per query</h2>
+  <div class="scroll"><table id="queries"></table></div>
+
+  <h2>Notes</h2>
+  <ul id="notes"></ul>
+</main>
+
+<script id="run" type="application/json">__BPSIM_RUN__</script>
+<script>
+"use strict";
+
+const FORMAT = "bpsim-run";
+const VERSION = 1;
+
+function el(tag, text, cls) {
+  const e = document.createElement(tag);
+  if (text !== undefined) e.textContent = text;
+  if (cls) e.className = cls;
+  return e;
+}
+
+function row(table, cells, header) {
+  const tr = el("tr");
+  for (const c of cells) {
+    const cell = el(header ? "th" : "td");
+    if (c instanceof Node) cell.append(c);
+    else cell.textContent = c;
+    if (typeof c === "number") cell.className = "num";
+    tr.append(cell);
+  }
+  table.append(tr);
+}
+
+// Recount each policy from its events; the totals must equal its summary.
+function tally(run) {
+  const t = { hits: 0, misses: 0, dirty: 0, cost: 0 };
+  for (const e of run.events) {
+    if (e.kind === "hit") t.hits++;
+    else t.misses++;
+    if (e.evicted && e.evicted.dirty) t.dirty++;
+    t.cost += e.cost.access + e.cost.seek + e.cost.writeback;
+  }
+  const s = run.summary;
+  t.ok = t.hits === s.hits && t.misses === s.misses && t.dirty === s.dirty_evictions &&
+    Math.abs(t.cost - s.total_cost) < 1e-6 * Math.max(1, s.total_cost);
+  return t;
+}
+
+function show(data) {
+  if (data.format !== FORMAT || data.version !== VERSION) {
+    throw new Error(`expected ${FORMAT} v${VERSION}, got ${data.format} v${data.version}`);
+  }
+  document.getElementById("drop").hidden = true;
+  document.getElementById("error").hidden = true;
+  document.querySelector("main").hidden = false;
+
+  document.getElementById("title").textContent = `${data.scenario}: ${data.frames} frames`;
+  const c = data.cost;
+  document.getElementById("meta").textContent =
+    `SQLite ${data.sqlite_version} · ${data.page_count} pages of ${data.page_size} bytes · ` +
+    `cost: hit ${c.hit}, read ${c.miss}, seek up to ${c.seek_max}, write-back ${c.dirty_writeback}`;
+
+  const policies = document.getElementById("policies");
+  policies.replaceChildren();
+  row(policies, ["Policy", "Hits", "Misses", "Hit rate", "Dirty write-backs", "Total cost", "Matches summary"], true);
+  for (const run of data.runs) {
+    const t = tally(run);
+    row(policies, [
+      run.policy, t.hits, t.misses, (t.hits / run.events.length).toFixed(3), t.dirty,
+      Number(t.cost.toFixed(2)), el("span", t.ok ? "yes" : "no", t.ok ? "ok" : "bad"),
+    ]);
+    policies.lastChild.dataset.policy = run.policy;
+    policies.lastChild.dataset.ok = t.ok;
+  }
+
+  const queries = document.getElementById("queries");
+  queries.replaceChildren();
+  row(queries, ["#", "Query", "Accesses", ...data.runs.map((r) => r.policy)], true);
+  data.queries.forEach((q, i) => {
+    const [start, end] = q.accesses;
+    const what = el("div");
+    what.append(el("div", q.title), el("pre", q.sql), el("div", q.plan.join(" · "), "muted"));
+    const hits = data.runs.map((r) => r.events.slice(start, end).filter((e) => e.kind === "hit").length);
+    row(queries, [i + 1, what, end - start, ...hits]);
+  });
+
+  const notes = document.getElementById("notes");
+  notes.replaceChildren(...data.notes.map((n) => el("li", n)));
+}
+
+function fail(err) {
+  const p = document.getElementById("error");
+  p.textContent = `Could not show this run: ${err.message}`;
+  p.hidden = false;
+}
+
+const embedded = document.getElementById("run").textContent.trim();
+if (embedded === "__BPSIM" + "_RUN__") {
+  document.getElementById("drop").hidden = false;
+} else {
+  try { show(JSON.parse(embedded)); } catch (err) { fail(err); }
+}
+
+document.addEventListener("dragover", (e) => { e.preventDefault(); document.body.classList.add("dragging"); });
+document.addEventListener("dragleave", () => document.body.classList.remove("dragging"));
+document.addEventListener("drop", async (e) => {
+  e.preventDefault();
+  document.body.classList.remove("dragging");
+  const file = e.dataTransfer.files[0];
+  if (!file) return;
+  try { show(JSON.parse(await file.text())); } catch (err) { fail(err); }
+});
+</script>
+</body>
+</html>

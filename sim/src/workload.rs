@@ -4,7 +4,7 @@
 //! a query mix, sampled with a seeded RNG) or *explicit* (a fixed reference
 //! string in `explicit_pages`, one page per query).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::TableId;
 
@@ -69,7 +69,7 @@ pub struct QueryTemplate {
 }
 
 /// I/O cost model. Units are arbitrary; only ratios matter.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CostModel {
     /// Cost of a buffer pool hit.

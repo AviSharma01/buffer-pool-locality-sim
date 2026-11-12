@@ -132,7 +132,7 @@ fn events_explain_every_access() {
                 let at = format!("{kind}/{frames} access {pos}: {e:?}");
                 assert_eq!(e.ctx.pos, pos, "{at}");
                 assert_eq!(e.frames.len(), frames, "{at}");
-                assert_ne!(e.frames[e.frame], FrameState::Empty, "{at}");
+                assert_ne!(e.frames[e.frame].state, FrameState::Empty, "{at}");
                 let evicts: Vec<_> = e
                     .notes
                     .iter()

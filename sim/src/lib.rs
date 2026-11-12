@@ -14,6 +14,7 @@
 pub mod capture;
 pub mod layout;
 pub mod policy;
+pub mod run;
 pub mod sim;
 pub mod snapshot;
 pub mod trace;

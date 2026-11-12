@@ -4,6 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use serde::Serialize;
 
 use crate::layout::{self, CoAccess, Layout};
 use crate::policy::{Ctx, FrameState, Log, Note, Policy, PolicyKind};
@@ -30,14 +31,15 @@ struct Frame {
     dirty: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Outcome {
     Hit,
     Miss { evicted: Option<Evicted> },
 }
 
 /// The page a miss pushed out of its frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Evicted {
     pub page: PageId,
     pub dirty: bool,
@@ -104,21 +106,22 @@ impl BufferPool {
         (f, Outcome::Miss { evicted })
     }
 
-    pub fn resident(&self, frame: FrameIdx) -> Option<(PageId, bool)> {
-        let f = &self.frames[frame];
-        f.page.map(|p| (p, f.dirty))
-    }
-
     pub fn policy(&self) -> &dyn Policy {
         self.policy.as_ref()
     }
 
-    /// The policy's view of every frame.
-    pub fn frame_states(&self) -> Vec<FrameState> {
-        (0..self.frames.len())
-            .map(|i| match self.frames[i].page {
-                Some(_) => self.policy.state(i),
-                None => FrameState::Empty,
+    /// Every frame: its page, and the policy's view of it.
+    pub fn frame_views(&self) -> Vec<FrameView> {
+        self.frames
+            .iter()
+            .enumerate()
+            .map(|(i, f)| FrameView {
+                page: f.page,
+                dirty: f.dirty,
+                state: match f.page {
+                    Some(_) => self.policy.state(i),
+                    None => FrameState::Empty,
+                },
             })
             .collect()
     }
@@ -196,19 +199,49 @@ pub struct StepEvent {
     pub reclustered: bool,
 }
 
-/// One access, explained: what the pool did and what the policy looked at.
-/// Recorded only after [`Simulator::record_events`].
-#[derive(Clone, Debug, PartialEq)]
+/// One frame as an event or snapshot sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct FrameView {
+    pub page: Option<PageId>,
+    pub dirty: bool,
+    pub state: FrameState,
+}
+
+/// What one access cost, kept in parts so storage detail can be added to
+/// each later (units from the [`CostModel`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct Cost {
+    /// A hit reads the frame; a miss reads the page from disk.
+    pub access: f64,
+    /// A miss moves the disk head from the previous read.
+    pub seek: f64,
+    /// A miss that evicts a dirty page writes it back first.
+    pub writeback: f64,
+}
+
+impl Cost {
+    pub fn total(&self) -> f64 {
+        self.access + self.seek + self.writeback
+    }
+}
+
+/// One access, explained: what the pool did, what it cost and what the
+/// policy looked at. Recorded only after [`Simulator::record_events`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Event {
-    pub access: Access,
+    #[serde(flatten)]
     pub ctx: Ctx,
+    pub page: PageId,
+    pub write: bool,
     /// Frame now holding the page.
     pub frame: FrameIdx,
+    #[serde(flatten)]
     pub outcome: Outcome,
+    pub cost: Cost,
     /// In the order the policy did them.
     pub notes: Vec<Note>,
-    /// Every frame's state after the access.
-    pub frames: Vec<FrameState>,
+    /// Every frame after the access.
+    pub frames: Vec<FrameView>,
     pub hand: Option<FrameIdx>,
 }
 
@@ -294,6 +327,18 @@ impl Simulator {
         &self.pool
     }
 
+    pub fn trace(&self) -> &Trace {
+        &self.trace
+    }
+
+    pub fn cost_model(&self) -> &CostModel {
+        &self.cost
+    }
+
+    pub fn policy_kind(&self) -> PolicyKind {
+        self.cfg.policy
+    }
+
     /// Run the next query. Returns None when the trace is exhausted.
     pub fn step(&mut self) -> Option<StepEvent> {
         if self.is_done() {
@@ -370,57 +415,69 @@ impl Simulator {
     /// Serve one access; returns its cost.
     fn access(&mut self, a: Access, ctx: Ctx) -> f64 {
         let (frame, outcome) = self.pool.access(a, ctx, &mut self.log);
-        if let Some(events) = &mut self.events {
-            events.push(Event {
-                access: a,
-                ctx,
-                frame,
-                outcome,
-                notes: self.log.take(),
-                frames: self.pool.frame_states(),
-                hand: self.pool.policy().hand(),
-            });
-        }
-        match outcome {
+        let cost = match outcome {
             Outcome::Hit => {
                 self.metrics.hits += 1;
-                self.cost.hit
+                Cost {
+                    access: self.cost.hit,
+                    ..Cost::default()
+                }
             }
             Outcome::Miss { evicted } => {
                 self.metrics.misses += 1;
                 let disk_pos = self.layout.disk_pos(a.page);
                 let seek_dist = disk_pos.abs_diff(self.last_disk_pos);
                 let total_disk = self.trace.num_tables as u64 * self.trace.pages_per_table as u64;
-                let seek_cost = (seek_dist as f64 / total_disk as f64) * self.cost.seek_max;
+                let seek = (seek_dist as f64 / total_disk as f64) * self.cost.seek_max;
                 self.last_disk_pos = disk_pos;
 
-                let mut cost = self.cost.miss + seek_cost;
+                let mut writeback = 0.0;
                 if let Some(e) = evicted {
                     self.metrics.evictions += 1;
                     if e.dirty {
                         self.metrics.dirty_evictions += 1;
-                        cost += self.cost.dirty_writeback;
+                        writeback = self.cost.dirty_writeback;
                     }
                 }
-                cost
+                Cost {
+                    access: self.cost.miss,
+                    seek,
+                    writeback,
+                }
             }
+        };
+        if let Some(events) = &mut self.events {
+            events.push(Event {
+                ctx,
+                page: a.page,
+                write: a.write,
+                frame,
+                outcome,
+                cost,
+                notes: self.log.take(),
+                frames: self.pool.frame_views(),
+                hand: self.pool.policy().hand(),
+            });
         }
+        cost.total()
     }
 
     pub fn snapshot(&self) -> Snapshot {
         let m = &self.metrics;
-        let states = self.pool.frame_states();
         Snapshot {
             tick: self.tick(),
             recluster: self.last_reclustered,
             policy: self.cfg.policy.name().to_string(),
-            frames: (0..self.pool.frames.len())
-                .map(|i| match self.pool.resident(i) {
-                    Some((page, dirty)) => FrameSnap {
+            frames: self
+                .pool
+                .frame_views()
+                .into_iter()
+                .map(|f| match f.page {
+                    Some(page) => FrameSnap {
                         page_id: page as i64,
                         table_id: self.trace.table_of(page) as i32,
-                        dirty,
-                        ref_bit: states[i] == FrameState::Clock { referenced: true },
+                        dirty: f.dirty,
+                        ref_bit: f.state == FrameState::Clock { referenced: true },
                     },
                     None => FrameSnap {
                         page_id: -1,

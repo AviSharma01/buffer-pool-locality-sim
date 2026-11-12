@@ -1,6 +1,6 @@
 //! Traces captured from SQLite by `capture/capture.py` (format `bpsim-trace`,
-//! version 1). Only the fields the engine replays are read here; page labels
-//! and decoded rows are left for the viewer.
+//! version 1). The engine replays `queries`; the other fields describe the
+//! database for the viewer and are passed through to the run file.
 //!
 //! The captured database file is modelled as a single "table" whose page ids
 //! are SQLite's own page numbers, so seek distance is the real distance
@@ -18,9 +18,9 @@
 //! many pages long. With `USING [COVERING] INDEX <index>` the index is what is
 //! read in order, so its pages are marked instead.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::sim::{SimConfig, Simulator};
 use crate::trace::{Access, Trace};
@@ -37,15 +37,38 @@ pub struct CapturedTrace {
     pub sqlite_version: String,
     pub page_size: u32,
     pub page_count: u32,
+    pub objects: Vec<ObjectInfo>,
     /// Which table or index owns each page.
     pub pages: Vec<PageInfo>,
     pub queries: Vec<CapturedQuery>,
+    /// Decoded contents of the pages the queries touch.
+    pub rows: BTreeMap<u32, PageRows>,
+    pub notes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// A table or index.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ObjectInfo {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub table: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PageInfo {
     pub page: u32,
     pub object: String,
+    /// internal, leaf, overflow or free.
+    pub kind: String,
+}
+
+/// One page's cells as a table: b-tree rows, index entries or routing entries.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PageRows {
+    pub object: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -182,7 +205,7 @@ mod tests {
     fn trace_json(format: &str, version: u32, io: &str) -> String {
         format!(
             r#"{{"format":"{format}","version":{version},"scenario":"tiny","sqlite_version":"3.54.1",
-               "page_size":4096,"page_count":3,"rows":{{}},"notes":[],
+               "page_size":4096,"page_count":3,"rows":{{}},"notes":[],"objects":[],
                "pages":[{{"page":1,"object":"sqlite_schema","kind":"leaf"}},
                         {{"page":2,"object":"t","kind":"leaf"}},
                         {{"page":3,"object":"t","kind":"leaf"}}],
