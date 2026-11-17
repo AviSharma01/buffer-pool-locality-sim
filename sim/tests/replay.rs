@@ -1,17 +1,33 @@
-//! Replaying the committed SQLite capture (traces/shop.trace.json). The
+//! Replaying the committed SQLite captures. For traces/shop.trace.json the
 //! expected numbers match an independent JavaScript model of the same policies
 //! from the design mockups, minus the two commit writes it counted as hits.
+//! traces/checkout.trace.json is mostly writes and grows the file.
 
 use bpsim::policy::{FrameState, Note, Why};
 use bpsim::sim::{Event, Outcome};
 use bpsim::{CapturedTrace, PolicyKind, SimConfig, Simulator};
 
-fn shop() -> CapturedTrace {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../traces/shop.trace.json");
-    let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+fn load(name: &str) -> CapturedTrace {
+    let path = format!("{}/../traces/{name}.trace.json", env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!("{path}: {e} (regenerate with capture/capture.py, see CLAUDE.md)")
     });
     CapturedTrace::from_json(&text).unwrap()
+}
+
+fn shop() -> CapturedTrace {
+    load("shop")
+}
+
+fn checkout(policy: PolicyKind, frames: usize) -> bpsim::snapshot::RunSummary {
+    let cfg = SimConfig {
+        frames,
+        policy,
+        ..SimConfig::default()
+    };
+    let mut sim = load("checkout").simulator(cfg);
+    while sim.step().is_some() {}
+    sim.summary()
 }
 
 fn run(policy: PolicyKind, frames: usize, record: bool) -> Simulator {
@@ -211,6 +227,48 @@ fn no_policy_beats_optimal_on_the_real_trace() {
             assert_eq!(s.accesses, 45, "{kind} at {frames} frames");
             let m = s.misses;
             assert!(best <= m, "frames {frames}: opt {best} > {kind} {m}");
+        }
+    }
+}
+
+#[test]
+fn checkout_trace_writes_a_page_it_never_read() {
+    let t = load("checkout");
+    assert_eq!((t.queries.len(), t.page_count), (11, 32));
+    let trace = t.to_trace();
+    // 50 reads, plus the page the restock's split created: written, never read.
+    assert_eq!(trace.accesses().len(), 51);
+    let new_page: Vec<_> = trace.accesses().iter().filter(|a| a.page == 32).collect();
+    assert_eq!(new_page.len(), 1);
+    assert!(new_page[0].write);
+    assert_eq!(trace.accesses().iter().filter(|a| a.write).count(), 32);
+}
+
+#[test]
+fn checkout_with_8_frames_separates_every_kind_of_policy() {
+    let hits: Vec<u64> = PolicyKind::ALL
+        .into_iter()
+        .map(|kind| checkout(kind, 8).hits)
+        .collect();
+    // fifo, lru, clock, pg, innodb, opt
+    assert_eq!(hits, [16, 18, 16, 22, 20, 28]);
+    // Most pages get modified, so most evictions have to write back first.
+    assert_eq!(checkout(PolicyKind::Lru, 8).dirty_evictions, 17);
+    assert_eq!(checkout(PolicyKind::Opt, 8).dirty_evictions, 13);
+}
+
+#[test]
+fn no_policy_beats_optimal_on_checkout() {
+    for frames in [2, 4, 8, 16, 32] {
+        let best = checkout(PolicyKind::Opt, frames).misses;
+        for kind in PolicyKind::ALL {
+            let s = checkout(kind, frames);
+            assert_eq!(s.accesses, 51, "{kind} at {frames} frames");
+            assert!(
+                best <= s.misses,
+                "frames {frames}: opt {best} > {kind} {}",
+                s.misses
+            );
         }
     }
 }
