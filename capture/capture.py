@@ -435,9 +435,12 @@ def _authorizer(
     return apsw.SQLITE_OK
 
 
-def _restrict(conn: apsw.Connection) -> None:
+def _restrict(conn: apsw.Connection, max_pages: int) -> None:
     """From here on the connection refuses anything that reaches another file.
-    The ATTACH limit also stops VACUUM INTO, which attaches its target."""
+    The ATTACH limit also stops VACUUM INTO, which attaches its target. The
+    page cap stops setup or a query from growing the file without bound;
+    SQL cannot raise it, since PRAGMA max_page_count is not allowed."""
+    conn.execute(f"PRAGMA max_page_count = {int(max_pages)}")
     conn.limit(apsw.SQLITE_LIMIT_ATTACHED, 0)
     conn.limit(apsw.SQLITE_LIMIT_SQL_LENGTH, 1_000_000)
     conn.authorizer = _authorizer
@@ -468,6 +471,10 @@ def _run(
             ) from None
         raise ValueError(
             f"{what}: stopped after {seconds:g} s (--timeout raises the limit)"
+        ) from None
+    except apsw.FullError:
+        raise ValueError(
+            f"{what}: the database grew past its page limit (--max-pages raises it)"
         ) from None
     except apsw.AuthError:
         raise ValueError(
@@ -675,7 +682,7 @@ def capture(
         for spec in scenario.indexes:
             _create_index(setup, spec)
         if scenario.setup.strip():
-            _restrict(setup)
+            _restrict(setup, limits.max_pages)
             _run(setup, scenario.setup, "setup", max(SETUP_SECONDS, limits.timeout))
     finally:
         setup.close()
@@ -689,7 +696,7 @@ def capture(
     try:
         conn = _open(db_path, vfs=VFS_NAME)
         conn.execute("PRAGMA cache_size = 1; PRAGMA mmap_size = 0;")
-        _restrict(conn)
+        _restrict(conn, limits.max_pages)
         queries = []
         for title, sql in scenario.queries:
             what = f"query {title!r}"

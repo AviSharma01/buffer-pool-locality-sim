@@ -3,6 +3,7 @@ SQL) and the guards that apply when the database or the SQL may not be ours."""
 
 from __future__ import annotations
 
+import json
 import shutil
 import struct
 import subprocess
@@ -231,6 +232,21 @@ def test_vacuum_in_sql_points_to_the_flag(tmp_path: Path) -> None:
         capture(parse_scenario(text, "t"), tmp_path)
 
 
+def test_setup_and_queries_cannot_grow_the_file_past_the_page_limit(tmp_path: Path) -> None:
+    grow = (
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) "
+        "INSERT INTO t SELECT i, zeroblob(3000) FROM n"
+    )
+    text = f"-- setup\nCREATE TABLE t(a, b);\n{grow};\n-- query: q\nSELECT 1;\n"
+    with pytest.raises(ValueError, match="setup: the database grew past its page limit"):
+        capture(parse_scenario(text, "t"), tmp_path, Limits(max_pages=100))
+    small = "-- setup\nCREATE TABLE t(a, b);\n-- query: grow\n" + grow + ";\n"
+    with pytest.raises(ValueError, match="query 'grow': the database grew past its page limit"):
+        capture(parse_scenario(small, "t"), tmp_path, Limits(max_pages=100))
+    with pytest.raises(ValueError, match="not allowed here"):
+        people(tmp_path, ["PRAGMA max_page_count = 1000000"])
+
+
 def test_runaway_queries_are_stopped(tmp_path: Path) -> None:
     forever = (
         "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT count(*) FROM n"
@@ -417,6 +433,32 @@ def test_scenario_name_is_made_safe_for_paths(tmp_path: Path, notes_db: Path) ->
     done = cli("--db", odd, "--sql", "SELECT 1", "-o", out, "--name", "../../etc/x y")
     assert done.returncode == 0, done.stderr
     assert '"scenario": "etc-x-y"' in out.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(
+    not (cap.REPO / "sim" / "target" / "release" / "sim").is_file(), reason="engine not built"
+)
+def test_free_pages_and_reused_pages_replay_with_the_engine(tmp_path: Path) -> None:
+    scenario = tmp_path / "freed.sql"
+    scenario.write_text(
+        "-- setup\nCREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);\n"
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 400)\n"
+        "INSERT INTO t SELECT i, printf('%0200d', i) FROM n;\n"
+        "DELETE FROM t WHERE id > 200;\n"
+        "-- query: Count\nSELECT count(*) FROM t;\n"
+        "-- query: Insert into freed space\n"
+        "INSERT INTO t SELECT id + 1000, v FROM t WHERE id <= 50;\n"
+    )
+    out = tmp_path / "freed.trace.json"
+    done = cli(scenario, "-o", out, "--view", "--frames", "4", "--policy", "lru")
+    assert done.returncode == 0, done.stderr
+    trace = json.loads(out.read_text(encoding="utf-8"))
+    assert any(p["object"] is None for p in trace["pages"])
+    viewer = Path(done.stdout.strip().splitlines()[-1].removeprefix("viewer -> "))
+    run = json.loads((viewer.parent / "run.json").read_text(encoding="utf-8"))["runs"][0]
+    # The insert reuses freelist pages: SQLite writes them without reading.
+    assert run["summary"]["fresh_pages"] >= 1
+    shutil.rmtree(viewer.parent)
 
 
 @pytest.mark.skipif(

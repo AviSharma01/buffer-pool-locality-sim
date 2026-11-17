@@ -22,7 +22,7 @@
 :root{
   --bg:#f6f5f2; --ink:#1c1b19; --ink-2:#55514a; --muted:#6b665e; --line:#0000001f; --soft:#0000000a;
   --accent:#9a3412; --hit:#2f6b3c; --miss:#a3461f; --mark:#f3d27a66;
-  --o-schema:#7d7872; --o0:#3f7d4d; --o1:#4b60c8; --o2:#b47a12; --o3:#8a4fb0; --o4:#17828a; --o5:#b8496a;
+  --o-schema:#7d7872; --free:#d9d5cd; --o0:#3f7d4d; --o1:#4b60c8; --o2:#b47a12; --o3:#8a4fb0; --o4:#17828a; --o5:#b8496a;
   --f-display:"Bricolage Grotesque", ui-sans-serif, system-ui, sans-serif;
   --f-body:"Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --f-mono:"Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -31,7 +31,7 @@
 @media (prefers-color-scheme: dark){:root{
   --bg:#111112; --ink:#eceae6; --ink-2:#aca79f; --muted:#918c84; --line:#ffffff24; --soft:#ffffff0a;
   --accent:#ec8a63; --hit:#86c08f; --miss:#ec8a63; --mark:#e5c15b38;
-  --o-schema:#9b968f; --o0:#86c08f; --o1:#8c9cf2; --o2:#e5c15b; --o3:#c29be0; --o4:#5fc4cc; --o5:#ee8fab;
+  --o-schema:#9b968f; --free:#3a3835; --o0:#86c08f; --o1:#8c9cf2; --o2:#e5c15b; --o3:#c29be0; --o4:#5fc4cc; --o5:#ee8fab;
   color-scheme:dark;
 }}
 *{box-sizing:border-box}
@@ -272,7 +272,7 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
 <script id="run" type="application/json">__BPSIM_RUN__</script>
 <script>
 "use strict";
-const FORMAT = "bpsim-run", VERSION = 2;
+const FORMAT = "bpsim-run", VERSION = 3;
 const INFO = {
   fifo:   {name: "FIFO", how: "oldest load out", textbook: true},
   lru:    {name: "LRU", how: "least recent out"},
@@ -286,10 +286,11 @@ const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls)
 const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const nameOf = p => INFO[p]?.name || p;
 /* Time for one access under a storage profile, from what the engine recorded:
-   a hit, or a sequential or random read, plus a write-back if a modified page
-   had to go out first. Every profile prices the same events. */
-const msOf = (e, P) => (e.kind === "hit" ? P.hit_ms : e.read === "sequential" ? P.sequential_read_ms : P.random_read_ms) +
-  (e.evicted?.dirty ? P.write_ms : 0);
+   a hit, a sequential or random read, or nothing to read for a page SQLite
+   wrote without reading, plus a write-back if a modified page had to go out
+   first. Every profile prices the same events. */
+const readMs = (e, P) => e.kind === "hit" ? P.hit_ms : e.read === "sequential" ? P.sequential_read_ms : e.read === "random" ? P.random_read_ms : 0;
+const msOf = (e, P) => readMs(e, P) + (e.evicted?.dirty ? P.write_ms : 0);
 const costOf = e => msOf(e, PROFILE);
 function fmtMs(ms) {
   if (ms < 1) { const us = ms * 1000; return `${us < 10 ? us.toFixed(1) : us.toFixed(0)} µs`; }
@@ -303,9 +304,9 @@ let visible = [], focus = null, mode = "step", k = -1, playing = false, raceId =
 const speed = () => +$("speed").value;
 const sleep = ms => new Promise(r => setTimeout(r, ms * speed()));
 
-const colorOf = page => OBJ[PAGE[page]?.object] || "var(--o-schema)";
-const objLabel = o => o === "sqlite_schema" ? "schema" : (o || "unused");
-const pageDesc = page => PAGE[page] ? `${objLabel(PAGE[page].object)} ${kindLabel(page)}` : page === 1 ? "header" : "not described";
+const colorOf = page => PAGE[page] && PAGE[page].object == null ? "var(--free)" : OBJ[PAGE[page]?.object] || "var(--o-schema)";
+const objLabel = o => o === "sqlite_schema" ? "schema" : (o || "free");
+const pageDesc = page => !PAGE[page] ? (page === 1 ? "header" : "not described") : PAGE[page].object == null ? "free page" : `${objLabel(PAGE[page].object)} ${kindLabel(page)}`;
 const kindLabel = page => page === 1 ? "header" : PAGE[page]?.kind === "internal" ? "interior" : (PAGE[page]?.kind || "page");
 const isScanQ = q => EV0.slice(q.accesses[0], q.accesses[1]).some(e => e.scan);
 
@@ -345,13 +346,13 @@ function start(data) {
 /* each event list must recount to its own summary, priced as the summary was */
 function addsUp(run) {
   const P = D.profiles[run.summary.storage];
-  let hits = 0, seq = 0, random = 0, dirty = 0, ms = 0;
+  let hits = 0, seq = 0, random = 0, fresh = 0, dirty = 0, ms = 0;
   for (const e of run.events) {
-    if (e.kind === "hit") hits++; else if (e.read === "sequential") seq++; else random++;
+    if (e.kind === "hit") hits++; else if (e.read === "sequential") seq++; else if (e.read === "random") random++; else fresh++;
     if (e.evicted?.dirty) dirty++; ms += msOf(e, P);
   }
   const s = run.summary;
-  return P && hits === s.hits && seq === s.sequential_reads && random === s.random_reads && dirty === s.dirty_evictions &&
+  return P && hits === s.hits && seq === s.sequential_reads && random === s.random_reads && fresh === s.fresh_pages && dirty === s.dirty_evictions &&
     Math.abs(ms - s.total_ms) < 1e-9 * Math.max(1, s.total_ms);
 }
 
@@ -400,6 +401,9 @@ function buildDisk() {
   const legend = $("legend"); legend.replaceChildren(el("span", "", `${D.scenario}.db on disk, ${D.page_count} pages`));
   for (const o of ["sqlite_schema", ...D.objects.map(o => o.name)]) {
     const s = el("span"); const sw = el("i"); s.style.setProperty("--c", OBJ[o]); s.append(sw, objLabel(o)); legend.append(s);
+  }
+  if (D.pages.some(p => p.object == null)) {
+    const s = el("span"); const sw = el("i"); s.style.setProperty("--c", "var(--free)"); s.append(sw, "free (on the freelist)"); legend.append(s);
   }
   const m = el("span"); const dot = el("i"); dot.style.cssText = "background:var(--accent);border-radius:50%"; m.append(dot, "modified in memory"); legend.append(m);
 }
@@ -522,6 +526,7 @@ function paintBand(p, at) {
 function describe(p, e) {
   const ev = e.evicted, parts = [], sweeps = e.notes.filter(n => n.kind === "swept").length;
   if (e.read) parts.push(e.read === "sequential" ? "next page on disk: sequential read" : "random read");
+  else if (e.kind === "miss") parts.push("a page SQLite writes without reading: nothing to read from disk");
   for (const n of e.notes) {
     if (n.kind === "evict") {
       const w = n.why, v = `p${ev.page}`;

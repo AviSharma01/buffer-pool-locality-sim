@@ -17,6 +17,10 @@ pub struct RunSummary {
     pub hit_rate: f64,
     pub sequential_reads: u64,
     pub random_reads: u64,
+    /// Misses on pages SQLite wrote without reading them first (a new page,
+    /// or a free page reused): the frame is filled with no disk read.
+    /// misses = sequential_reads + random_reads + fresh_pages.
+    pub fresh_pages: u64,
     pub evictions: u64,
     /// Modified pages written back before their frame was reused.
     pub dirty_evictions: u64,

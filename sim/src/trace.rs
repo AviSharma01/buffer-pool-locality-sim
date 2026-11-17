@@ -15,6 +15,9 @@ use crate::{PageId, TableId};
 pub struct Access {
     pub page: PageId,
     pub write: bool,
+    /// SQLite wrote this page without reading it (a new page, or a free page
+    /// reused): on a miss there is nothing to read from disk.
+    pub fresh: bool,
     /// Part of a sequential scan of a relation this many pages long. Policies
     /// may treat big scans differently (PostgreSQL's scan ring).
     pub scan: Option<u32>,
@@ -57,6 +60,7 @@ impl Trace {
                     vec![Access {
                         page,
                         write: false,
+                        fresh: false,
                         scan: None,
                     }]
                 })
@@ -155,6 +159,7 @@ fn sample_query<R: Rng>(w: &Workload, phase: &Phase, rng: &mut R) -> Vec<Access>
         .map(|(page, scan)| Access {
             page,
             write: rng.gen_bool(w.write_prob),
+            fresh: false,
             scan,
         })
         .collect()
@@ -169,6 +174,7 @@ mod tests {
         let a = |page| Access {
             page,
             write: false,
+            fresh: false,
             scan: None,
         };
         let t = Trace::from_queries(1, 10, vec![vec![a(1), a(2)], vec![a(1)], vec![a(3), a(2)]]);

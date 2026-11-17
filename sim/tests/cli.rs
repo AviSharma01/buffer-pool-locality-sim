@@ -186,7 +186,7 @@ fn comparing_policies_writes_one_run_file_that_adds_up() {
     let run_file = read_json(&run.join("run.json"));
     assert_eq!(
         (&run_file["format"], &run_file["version"]),
-        (&Value::from("bpsim-run"), &Value::from(2))
+        (&Value::from("bpsim-run"), &Value::from(3))
     );
     assert_eq!(run_file["storage"], "ssd");
     assert_eq!(run_file["frames"], 8);
@@ -230,7 +230,9 @@ fn priced(events: &[Value], profile: &Value) -> f64 {
         .iter()
         .map(|e| {
             let read = match e["read"].as_str() {
-                None => ms("hit_ms"),
+                None if e["kind"] == "hit" => ms("hit_ms"),
+                // A page SQLite wrote without reading: no disk read.
+                None => 0.0,
                 Some("sequential") => ms("sequential_read_ms"),
                 Some("random") => ms("random_read_ms"),
                 Some(other) => panic!("unknown read kind {other}"),

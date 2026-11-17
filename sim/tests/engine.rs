@@ -191,3 +191,167 @@ fn old_cost_sections_are_refused_with_a_pointer_to_storage() {
     let err = Workload::from_toml(&text).unwrap_err();
     assert!(err.contains("--storage ssd|hdd"), "{err}");
 }
+
+/// A random captured-style trace: queries of point lookups, short runs and
+/// marked scans over `pages` pages, with writes, and some pages written
+/// without being read first (new or reused pages).
+fn random_trace(seed: u64) -> (bpsim::trace::Trace, u32) {
+    use bpsim::trace::{Access, Trace};
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+    let mut rng = StdRng::seed_from_u64(seed);
+    let pages: u32 = rng.gen_range(4..=40);
+    let queries = (0..rng.gen_range(1..=12))
+        .map(|_| {
+            let mut q = Vec::new();
+            for _ in 0..rng.gen_range(1..=6) {
+                let start = rng.gen_range(1..=pages);
+                let (len, scan) = match rng.gen_range(0..3) {
+                    0 => (1, None),
+                    1 => (rng.gen_range(2..=5), None),
+                    _ => (pages, Some(pages)),
+                };
+                for page in (start..start + len).map(|p| (p - 1) % pages + 1) {
+                    let write = rng.gen_bool(0.2);
+                    q.push(Access {
+                        page,
+                        write,
+                        fresh: write && rng.gen_bool(0.25),
+                        scan,
+                    });
+                }
+            }
+            q
+        })
+        .collect();
+    (Trace::from_queries(1, pages + 1, queries), pages)
+}
+
+fn replay(
+    trace: &bpsim::trace::Trace,
+    policy: PolicyKind,
+    frames: usize,
+    storage: StorageKind,
+) -> bpsim::sim::Metrics {
+    let cfg = SimConfig {
+        frames,
+        policy,
+        storage,
+    };
+    let mut sim = Simulator::new(trace.clone(), cfg);
+    while sim.step().is_some() {}
+    sim.metrics().clone()
+}
+
+/// Misses of a textbook LRU and of Belady's OPT, written as plainly as
+/// possible, to compare the engine against.
+fn reference_misses(pages: &[u32], frames: usize) -> (u64, u64) {
+    let mut lru: Vec<u32> = Vec::new(); // least recent first
+    let mut lru_misses = 0;
+    for &p in pages {
+        if let Some(i) = lru.iter().position(|&q| q == p) {
+            lru.remove(i);
+        } else {
+            lru_misses += 1;
+            if lru.len() == frames {
+                lru.remove(0);
+            }
+        }
+        lru.push(p);
+    }
+    let mut opt: Vec<u32> = Vec::new();
+    let mut opt_misses = 0;
+    for (i, &p) in pages.iter().enumerate() {
+        if opt.contains(&p) {
+            continue;
+        }
+        opt_misses += 1;
+        if opt.len() == frames {
+            let next_use = |q: u32| {
+                pages[i + 1..]
+                    .iter()
+                    .position(|&r| r == q)
+                    .unwrap_or(usize::MAX)
+            };
+            let furthest = (0..opt.len()).max_by_key(|&j| next_use(opt[j])).unwrap();
+            opt.remove(furthest);
+        }
+        opt.push(p);
+    }
+    (lru_misses, opt_misses)
+}
+
+/// Guarantees that hold for any trace, checked on many random ones: the
+/// counts add up, storage only prices what the pool decided, LRU and OPT
+/// never get worse with more memory, and nothing beats OPT on misses.
+#[test]
+fn guarantees_hold_on_random_traces() {
+    for seed in 0..300 {
+        let (trace, pages) = random_trace(seed);
+        let mut sizes: Vec<usize> = [1, 2, 3, 5, 8, 13]
+            .into_iter()
+            .filter(|&f| f <= pages as usize)
+            .collect();
+        sizes.push(pages as usize);
+        let mut prev = [u64::MAX; 2];
+        for &frames in &sizes {
+            let opt = replay(&trace, PolicyKind::Opt, frames, StorageKind::Ssd).misses;
+            let order: Vec<u32> = trace.accesses().iter().map(|a| a.page).collect();
+            let lru = replay(&trace, PolicyKind::Lru, frames, StorageKind::Ssd).misses;
+            assert_eq!(
+                (lru, opt),
+                reference_misses(&order, frames),
+                "seed {seed}, {frames} frames"
+            );
+            for kind in PolicyKind::ALL {
+                let what = format!("seed {seed}, {kind}, {frames} frames");
+                let [ssd, hdd] = StorageKind::ALL.map(|s| replay(&trace, kind, frames, s));
+                assert_eq!(
+                    ssd.hits + ssd.misses,
+                    trace.accesses().len() as u64,
+                    "{what}"
+                );
+                assert_eq!(
+                    ssd.sequential_reads + ssd.random_reads + ssd.fresh_pages,
+                    ssd.misses,
+                    "{what}"
+                );
+                assert_eq!(
+                    (
+                        ssd.hits,
+                        ssd.sequential_reads,
+                        ssd.random_reads,
+                        ssd.fresh_pages,
+                        ssd.evictions,
+                        ssd.dirty_evictions
+                    ),
+                    (
+                        hdd.hits,
+                        hdd.sequential_reads,
+                        hdd.random_reads,
+                        hdd.fresh_pages,
+                        hdd.evictions,
+                        hdd.dirty_evictions
+                    ),
+                    "{what}"
+                );
+                assert!(
+                    opt <= ssd.misses,
+                    "{what}: OPT missed {opt} > {}",
+                    ssd.misses
+                );
+                if let Some(i) = [PolicyKind::Lru, PolicyKind::Opt]
+                    .iter()
+                    .position(|&k| k == kind)
+                {
+                    assert!(
+                        ssd.misses <= prev[i],
+                        "{what}: {} > {} with fewer frames",
+                        ssd.misses,
+                        prev[i]
+                    );
+                    prev[i] = ssd.misses;
+                }
+            }
+        }
+    }
+}

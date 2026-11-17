@@ -171,6 +171,8 @@ pub struct Metrics {
     pub misses: u64,
     pub sequential_reads: u64,
     pub random_reads: u64,
+    /// Misses on pages SQLite wrote without reading: no disk read.
+    pub fresh_pages: u64,
     pub evictions: u64,
     pub dirty_evictions: u64,
     pub total_ms: f64,
@@ -333,6 +335,12 @@ impl Simulator {
                         self.head = Some(e.page);
                     }
                 }
+                if a.fresh {
+                    // SQLite overwrites the whole page: the frame is filled
+                    // in memory and the disk is not touched.
+                    self.metrics.fresh_pages += 1;
+                    return self.record(a, ctx, frame, outcome, None, ms);
+                }
                 let read = if self.head.is_some_and(|h| h.checked_add(1) == Some(a.page)) {
                     self.metrics.sequential_reads += 1;
                     Read::Sequential
@@ -344,6 +352,19 @@ impl Simulator {
                 (Some(read), ms + profile.read_ms(read))
             }
         };
+        self.record(a, ctx, frame, outcome, read, ms)
+    }
+
+    /// Keep the event if events are being recorded; returns `ms`.
+    fn record(
+        &mut self,
+        a: Access,
+        ctx: Ctx,
+        frame: FrameIdx,
+        outcome: Outcome,
+        read: Option<Read>,
+        ms: f64,
+    ) -> f64 {
         if let Some(events) = &mut self.events {
             events.push(Event {
                 ctx,
@@ -374,6 +395,7 @@ impl Simulator {
             hit_rate: m.hit_rate(),
             sequential_reads: m.sequential_reads,
             random_reads: m.random_reads,
+            fresh_pages: m.fresh_pages,
             evictions: m.evictions,
             dirty_evictions: m.dirty_evictions,
             total_ms: m.total_ms,
@@ -396,6 +418,7 @@ mod tests {
         let access = |&(page, write): &(PageId, bool)| Access {
             page,
             write,
+            fresh: false,
             scan: None,
         };
         let queries = vec![
@@ -441,6 +464,33 @@ mod tests {
         let p = StorageKind::Hdd.profile();
         let ms = 3.0 * p.sequential_read_ms + 5.0 * p.random_read_ms + 2.0 * p.write_ms;
         assert!((m.total_ms - ms).abs() < 1e-9, "{} vs {ms}", m.total_ms);
+    }
+
+    /// A page SQLite writes without reading costs no read and leaves the
+    /// device where it was: page 7 below is not "next" after the fresh page 6.
+    #[test]
+    fn a_page_written_without_reading_needs_no_read() {
+        let a = |page, fresh| Access {
+            page,
+            write: fresh,
+            fresh,
+            scan: None,
+        };
+        let cfg = SimConfig {
+            frames: 4,
+            policy: PolicyKind::Lru,
+            storage: StorageKind::Hdd,
+        };
+        let queries = vec![vec![a(5, false), a(6, true), a(7, false)]];
+        let mut sim = Simulator::new(Trace::from_queries(1, 32, queries), cfg);
+        sim.record_events();
+        while sim.step().is_some() {}
+        let reads: Vec<_> = sim.events().iter().map(|e| e.read).collect();
+        assert_eq!(reads, [Some(Read::Random), None, Some(Read::Random)]);
+        let m = sim.metrics();
+        assert_eq!((m.misses, m.fresh_pages, m.random_reads), (3, 1, 2));
+        let hdd = StorageKind::Hdd.profile();
+        assert!((m.total_ms - 2.0 * hdd.random_read_ms).abs() < 1e-9);
     }
 
     #[test]

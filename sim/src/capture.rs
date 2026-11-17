@@ -57,7 +57,8 @@ pub struct ObjectInfo {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PageInfo {
     pub page: u32,
-    pub object: String,
+    /// None for a free page: on the freelist, owned by no table or index.
+    pub object: Option<String>,
     /// internal, leaf, overflow or free.
     pub kind: String,
 }
@@ -137,11 +138,11 @@ impl CapturedTrace {
         let owner: HashMap<u32, &str> = self
             .pages
             .iter()
-            .map(|p| (p.page, p.object.as_str()))
+            .filter_map(|p| Some((p.page, p.object.as_deref()?)))
             .collect();
         let mut size: HashMap<&str, u32> = HashMap::new();
-        for p in &self.pages {
-            *size.entry(p.object.as_str()).or_default() += 1;
+        for object in self.pages.iter().filter_map(|p| p.object.as_deref()) {
+            *size.entry(object).or_default() += 1;
         }
         let queries = self
             .queries
@@ -186,6 +187,7 @@ fn fold_writes(q: &CapturedQuery, scan_of: impl Fn(u32) -> Option<u32>) -> Vec<A
             (op, _) => accesses.push(Access {
                 page,
                 write: op == IoOp::Write,
+                fresh: op == IoOp::Write,
                 scan: scan_of(page),
             }),
         }
@@ -252,6 +254,24 @@ mod tests {
     #[test]
     fn a_write_without_a_read_stays_a_write_access() {
         assert_eq!(accesses(r#"[["r",1],["w",2]]"#), [(1, false), (2, true)]);
+        let t = CapturedTrace::from_json(&trace_json(FORMAT, 1, r#"[["r",1],["w",2],["w",1]]"#))
+            .unwrap();
+        let fresh: Vec<_> = t.to_trace().accesses().iter().map(|a| a.fresh).collect();
+        assert_eq!(fresh, [false, true]);
+    }
+
+    /// Pages on the freelist belong to no table: they load, and a scan's
+    /// size counts only the pages its table owns.
+    #[test]
+    fn free_pages_belong_to_no_object() {
+        let json = trace_json(FORMAT, 1, r#"[["r",1],["r",2],["r",3]]"#).replace(
+            r#"{"page":3,"object":"t","kind":"leaf"}"#,
+            r#"{"page":3,"object":null,"kind":"free"}"#,
+        );
+        let t = CapturedTrace::from_json(&json).unwrap();
+        assert_eq!(t.pages[2].object, None);
+        let scans: Vec<_> = t.to_trace().accesses().iter().map(|a| a.scan).collect();
+        assert_eq!(scans, [None, Some(1), None]);
     }
 
     #[test]

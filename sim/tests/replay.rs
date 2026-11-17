@@ -66,7 +66,10 @@ const TRACES: [&str; 5] = ["shop", "checkout", "growth", "growth-vacuum", "shop-
 const SHOP_LRU_SEQ: u64 = 16;
 const SHOP_LRU_RANDOM: u64 = 14;
 const CHECKOUT_LRU_SEQ: u64 = 2;
-const CHECKOUT_LRU_RANDOM: u64 = 31;
+const CHECKOUT_LRU_RANDOM: u64 = 30;
+/// The restock splits a full page into page 32, which SQLite writes without
+/// reading: that miss fills a frame with no disk read.
+const CHECKOUT_FRESH: u64 = 1;
 
 /// The report (query 4) scans orders; queries 5..9 repeat the lookups.
 const REPORT: usize = 4;
@@ -259,7 +262,8 @@ fn checkout_trace_writes_a_page_it_never_read() {
     assert_eq!(trace.accesses().len(), 51);
     let new_page: Vec<_> = trace.accesses().iter().filter(|a| a.page == 32).collect();
     assert_eq!(new_page.len(), 1);
-    assert!(new_page[0].write);
+    assert!(new_page[0].write && new_page[0].fresh);
+    assert_eq!(trace.accesses().iter().filter(|a| a.fresh).count(), 1);
     assert_eq!(trace.accesses().iter().filter(|a| a.write).count(), 32);
 }
 
@@ -311,7 +315,7 @@ fn storage_never_changes_what_is_cached() {
                     "{what}"
                 );
                 assert_eq!(
-                    ssd.sequential_reads + ssd.random_reads,
+                    ssd.sequential_reads + ssd.random_reads + ssd.fresh_pages,
                     ssd.misses,
                     "{what}"
                 );
@@ -341,8 +345,8 @@ fn shop_and_checkout_reads_and_times_with_8_frames() {
 
     let c = summary("checkout", PolicyKind::Lru, 8, StorageKind::Ssd);
     assert_eq!(
-        (c.sequential_reads, c.random_reads),
-        (CHECKOUT_LRU_SEQ, CHECKOUT_LRU_RANDOM)
+        (c.sequential_reads, c.random_reads, c.fresh_pages),
+        (CHECKOUT_LRU_SEQ, CHECKOUT_LRU_RANDOM, CHECKOUT_FRESH)
     );
 }
 
