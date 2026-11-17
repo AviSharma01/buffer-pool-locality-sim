@@ -5,7 +5,7 @@
 
 use bpsim::policy::{FrameState, Note, Why};
 use bpsim::sim::{Event, Outcome};
-use bpsim::{CapturedTrace, PolicyKind, SimConfig, Simulator};
+use bpsim::{CapturedTrace, PolicyKind, SimConfig, Simulator, StorageKind};
 
 fn load(name: &str) -> CapturedTrace {
     let path = format!("{}/../traces/{name}.trace.json", env!("CARGO_MANIFEST_DIR"));
@@ -19,15 +19,32 @@ fn shop() -> CapturedTrace {
     load("shop")
 }
 
-fn checkout(policy: PolicyKind, frames: usize) -> bpsim::summary::RunSummary {
-    let cfg = SimConfig { frames, policy };
-    let mut sim = load("checkout").simulator(cfg);
+fn summary(
+    name: &str,
+    policy: PolicyKind,
+    frames: usize,
+    storage: StorageKind,
+) -> bpsim::summary::RunSummary {
+    let cfg = SimConfig {
+        frames,
+        policy,
+        storage,
+    };
+    let mut sim = load(name).simulator(cfg);
     while sim.step().is_some() {}
     sim.summary()
 }
 
+fn checkout(policy: PolicyKind, frames: usize) -> bpsim::summary::RunSummary {
+    summary("checkout", policy, frames, StorageKind::Ssd)
+}
+
 fn run(policy: PolicyKind, frames: usize, record: bool) -> Simulator {
-    let cfg = SimConfig { frames, policy };
+    let cfg = SimConfig {
+        frames,
+        policy,
+        ..SimConfig::default()
+    };
     let mut sim = shop().simulator(cfg);
     if record {
         sim.record_events();
@@ -39,6 +56,13 @@ fn run(policy: PolicyKind, frames: usize, record: bool) -> Simulator {
 fn replay(policy: PolicyKind, frames: usize) -> bpsim::summary::RunSummary {
     run(policy, frames, false).summary()
 }
+
+/// LRU with 8 frames, recounted by hand from the run files: the report's scan
+/// of orders reads 14 pages in a row; checkout's reads are almost all random.
+const SHOP_LRU_SEQ: u64 = 16;
+const SHOP_LRU_RANDOM: u64 = 14;
+const CHECKOUT_LRU_SEQ: u64 = 2;
+const CHECKOUT_LRU_RANDOM: u64 = 31;
 
 /// The report (query 4) scans orders; queries 5..9 repeat the lookups.
 const REPORT: usize = 4;
@@ -262,4 +286,58 @@ fn no_policy_beats_optimal_on_checkout() {
             );
         }
     }
+}
+
+/// Storage prices what the pool decided; it must never change the decisions.
+#[test]
+fn storage_never_changes_what_is_cached() {
+    for name in ["shop", "checkout"] {
+        for frames in [1, 2, 4, 8, 16, 32] {
+            for kind in PolicyKind::ALL {
+                let [ssd, hdd] = StorageKind::ALL.map(|s| summary(name, kind, frames, s));
+                let what = format!("{name} {kind} at {frames} frames");
+                assert_eq!(
+                    (ssd.hits, ssd.evictions, ssd.dirty_evictions),
+                    (hdd.hits, hdd.evictions, hdd.dirty_evictions),
+                    "{what}"
+                );
+                assert_eq!(
+                    (ssd.sequential_reads, ssd.random_reads),
+                    (hdd.sequential_reads, hdd.random_reads),
+                    "{what}"
+                );
+                assert_eq!(
+                    ssd.sequential_reads + ssd.random_reads,
+                    ssd.misses,
+                    "{what}"
+                );
+                assert!(hdd.total_ms > ssd.total_ms, "{what}");
+            }
+        }
+    }
+}
+
+#[test]
+fn shop_and_checkout_reads_and_times_with_8_frames() {
+    let s = summary("shop", PolicyKind::Lru, 8, StorageKind::Ssd);
+    assert_eq!(
+        (s.sequential_reads, s.random_reads),
+        (SHOP_LRU_SEQ, SHOP_LRU_RANDOM)
+    );
+    // 15 hits, the reads above and 2 write-backs, priced per page.
+    let expect = |p: bpsim::storage::Profile| {
+        15.0 * p.hit_ms
+            + SHOP_LRU_SEQ as f64 * p.sequential_read_ms
+            + SHOP_LRU_RANDOM as f64 * p.random_read_ms
+            + 2.0 * p.write_ms
+    };
+    assert!((s.total_ms - expect(StorageKind::Ssd.profile())).abs() < 1e-9);
+    let h = summary("shop", PolicyKind::Lru, 8, StorageKind::Hdd);
+    assert!((h.total_ms - expect(StorageKind::Hdd.profile())).abs() < 1e-9);
+
+    let c = summary("checkout", PolicyKind::Lru, 8, StorageKind::Ssd);
+    assert_eq!(
+        (c.sequential_reads, c.random_reads),
+        (CHECKOUT_LRU_SEQ, CHECKOUT_LRU_RANDOM)
+    );
 }

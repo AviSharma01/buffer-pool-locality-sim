@@ -1,9 +1,9 @@
-//! The run file (format `bpsim-run`, version 1): one captured trace replayed
+//! The run file (format `bpsim-run`, version 2): one captured trace replayed
 //! through one or more policies with every access explained. The CLI writes it
 //! as `run.json` and builds it into `viewer.html`.
 //!
 //! Shape: the trace's description (objects, pages, queries, rows, notes), the
-//! pool size and cost model, then per policy its summary and one
+//! pool size and storage profiles, then per policy its summary and one
 //! [`Event`](crate::sim::Event) per access, each with every frame after it.
 
 use std::collections::BTreeMap;
@@ -12,11 +12,11 @@ use serde::Serialize;
 
 use crate::capture::{CapturedTrace, ObjectInfo, PageInfo, PageRows};
 use crate::sim::{Event, Simulator};
+use crate::storage::{Profile, StorageKind};
 use crate::summary::RunSummary;
-use crate::workload::CostModel;
 
 pub const FORMAT: &str = "bpsim-run";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 #[derive(Serialize)]
 pub struct RunFile<'a> {
@@ -27,7 +27,10 @@ pub struct RunFile<'a> {
     pub page_size: u32,
     pub page_count: u32,
     pub frames: usize,
-    pub cost: &'a CostModel,
+    /// The profile the summaries were priced with; the viewer opens on it.
+    pub storage: StorageKind,
+    /// Every profile, so the viewer can price the same events either way.
+    pub profiles: BTreeMap<&'static str, Profile>,
     pub objects: &'a [ObjectInfo],
     pub pages: &'a [PageInfo],
     pub queries: Vec<QueryView<'a>>,
@@ -64,6 +67,7 @@ impl<'a> RunFile<'a> {
                 let summary = sim.summary();
                 assert!(sim.is_done(), "replay finished");
                 assert_eq!(summary.frames, frames, "same pool size");
+                assert_eq!(summary.storage, first.summary().storage, "same storage");
                 assert_eq!(
                     sim.events().len() as u64,
                     summary.accesses,
@@ -98,7 +102,11 @@ impl<'a> RunFile<'a> {
             page_size: trace.page_size,
             page_count: trace.page_count,
             frames,
-            cost: first.cost_model(),
+            storage: first.summary().storage,
+            profiles: StorageKind::ALL
+                .into_iter()
+                .map(|k| (k.name(), k.profile()))
+                .collect(),
             objects: &trace.objects,
             pages: &trace.pages,
             queries,

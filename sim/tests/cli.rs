@@ -186,8 +186,9 @@ fn comparing_policies_writes_one_run_file_that_adds_up() {
     let run_file = read_json(&run.join("run.json"));
     assert_eq!(
         (&run_file["format"], &run_file["version"]),
-        (&Value::from("bpsim-run"), &Value::from(1))
+        (&Value::from("bpsim-run"), &Value::from(2))
     );
+    assert_eq!(run_file["storage"], "ssd");
     assert_eq!(run_file["frames"], 8);
     assert_eq!(
         run_file["queries"][4]["accesses"],
@@ -206,19 +207,11 @@ fn comparing_policies_writes_one_run_file_that_adds_up() {
         assert_eq!(events.len(), 45, "{policy}");
         let hits = events.iter().filter(|e| e["kind"] == "hit").count();
         assert_eq!(hits as u64, summary["hits"].as_u64().unwrap(), "{policy}");
-        let cost: f64 = events
-            .iter()
-            .map(|e| {
-                let c = &e["cost"];
-                c["access"].as_f64().unwrap()
-                    + c["seek"].as_f64().unwrap()
-                    + c["writeback"].as_f64().unwrap()
-            })
-            .sum();
-        let total = summary["total_cost"].as_f64().unwrap();
+        let ms = priced(events, &run_file["profiles"]["ssd"]);
+        let total = summary["total_ms"].as_f64().unwrap();
         assert!(
-            (cost - total).abs() < 1e-9 * total,
-            "{policy}: {cost} vs {total}"
+            (ms - total).abs() < 1e-9 * total,
+            "{policy}: {ms} vs {total}"
         );
         assert!(
             events
@@ -227,6 +220,78 @@ fn comparing_policies_writes_one_run_file_that_adds_up() {
         );
     }
     assert_eq!(embedded_run(&run.join("viewer.html")), run_file);
+}
+
+/// What the viewer does: price each event from its kind with a profile from
+/// the run file.
+fn priced(events: &[Value], profile: &Value) -> f64 {
+    let ms = |key: &str| profile[key].as_f64().unwrap();
+    events
+        .iter()
+        .map(|e| {
+            let read = match e["read"].as_str() {
+                None => ms("hit_ms"),
+                Some("sequential") => ms("sequential_read_ms"),
+                Some("random") => ms("random_read_ms"),
+                Some(other) => panic!("unknown read kind {other}"),
+            };
+            let writeback = if e["evicted"]["dirty"] == true {
+                ms("write_ms")
+            } else {
+                0.0
+            };
+            read + writeback
+        })
+        .sum()
+}
+
+/// One run file is enough for either storage: pricing an SSD run's events
+/// with the HDD profile gives exactly what an HDD run reports.
+#[test]
+fn the_viewer_can_price_one_run_for_every_storage() {
+    let dir = out_dir("storage");
+    let trace = format!(
+        "{}/../traces/checkout.trace.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let base = [
+        "--trace",
+        trace.as_str(),
+        "--policy",
+        "lru,pg",
+        "--frames",
+        "6",
+    ];
+    let mut runs = Vec::new();
+    for storage in ["ssd", "hdd"] {
+        let out_root = dir.join(storage);
+        let extra = ["--storage", storage, "--out", out_root.to_str().unwrap()];
+        let out = sim(&[&base[..], &extra[..]].concat());
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        runs.push(read_json(
+            &only_run(&out_root.join("checkout/compare")).join("run.json"),
+        ));
+    }
+    let [ssd, hdd] = [&runs[0], &runs[1]];
+    assert_eq!(ssd["profiles"], hdd["profiles"]);
+    for i in 0..2 {
+        let events = ssd["runs"][i]["events"].as_array().unwrap();
+        assert_eq!(events, hdd["runs"][i]["events"].as_array().unwrap());
+        let hdd_total = hdd["runs"][i]["summary"]["total_ms"].as_f64().unwrap();
+        let priced = priced(events, &ssd["profiles"]["hdd"]);
+        assert!(
+            (priced - hdd_total).abs() < 1e-9 * hdd_total,
+            "{priced} vs {hdd_total}"
+        );
+    }
+    assert_rejected(
+        &["--trace", &trace, "--storage", "tape"],
+        "expected ssd or hdd",
+    );
 }
 
 #[test]

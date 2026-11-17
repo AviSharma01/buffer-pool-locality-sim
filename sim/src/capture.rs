@@ -24,7 +24,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::sim::{SimConfig, Simulator};
 use crate::trace::{Access, Trace};
-use crate::workload::CostModel;
 
 pub const FORMAT: &str = "bpsim-trace";
 pub const VERSION: u32 = 1;
@@ -162,7 +161,7 @@ impl CapturedTrace {
 
     /// A simulator ready to replay this trace.
     pub fn simulator(&self, cfg: SimConfig) -> Simulator {
-        Simulator::new(self.to_trace(), CostModel::default(), cfg)
+        Simulator::new(self.to_trace(), cfg)
     }
 }
 
@@ -267,6 +266,7 @@ mod tests {
         let mut sim = t.simulator(SimConfig {
             frames: 2,
             policy: crate::PolicyKind::Lru,
+            ..SimConfig::default()
         });
         while sim.step().is_some() {}
         let s = sim.summary();

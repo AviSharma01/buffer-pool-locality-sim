@@ -4,7 +4,7 @@
 //! a query mix, sampled with a seeded RNG) or *explicit* (a fixed reference
 //! string in `explicit_pages`, one page per query).
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::TableId;
 
@@ -24,8 +24,6 @@ pub struct Workload {
     /// Probability that an access writes (dirties) the page.
     #[serde(default = "defaults::write_prob")]
     pub write_prob: f64,
-    #[serde(default)]
-    pub cost: CostModel,
     #[serde(default, rename = "phase")]
     pub phases: Vec<Phase>,
     /// Fixed reference string of page ids. Mutually exclusive with phases.
@@ -68,32 +66,6 @@ pub struct QueryTemplate {
     pub weight: f64,
 }
 
-/// I/O cost model. Units are arbitrary; only ratios matter.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct CostModel {
-    /// Cost of a buffer pool hit.
-    pub hit: f64,
-    /// Fixed cost of reading a page from disk on a miss.
-    pub miss: f64,
-    /// Seek cost of moving the disk head across the whole disk; scaled
-    /// linearly by distance from the previously fetched page.
-    pub seek_max: f64,
-    /// Extra cost when the evicted page is dirty and must be written back.
-    pub dirty_writeback: f64,
-}
-
-impl Default for CostModel {
-    fn default() -> Self {
-        Self {
-            hit: 1.0,
-            miss: 10.0,
-            seek_max: 30.0,
-            dirty_writeback: 20.0,
-        }
-    }
-}
-
 mod defaults {
     pub fn write_prob() -> f64 {
         0.05
@@ -125,6 +97,16 @@ fn check_prob(name: &str, p: f64) -> Result<(), String> {
 
 impl Workload {
     pub fn from_toml(s: &str) -> Result<Self, String> {
+        let table: toml::Table = s
+            .parse()
+            .map_err(|e| format!("invalid workload TOML: {e}"))?;
+        if table.contains_key("cost") {
+            return Err(
+                "the [cost] section was removed in v0.2; costs now come from \
+                        --storage ssd|hdd"
+                    .into(),
+            );
+        }
         let w: Workload = toml::from_str(s).map_err(|e| format!("invalid workload TOML: {e}"))?;
         w.validate()?;
         Ok(w)
@@ -171,17 +153,6 @@ impl Workload {
             return Err("pages_per_table must be at least 1".into());
         }
         check_prob("write_prob", self.write_prob)?;
-        let c = &self.cost;
-        for (name, v) in [
-            ("hit", c.hit),
-            ("miss", c.miss),
-            ("seek_max", c.seek_max),
-            ("dirty_writeback", c.dirty_writeback),
-        ] {
-            if !(v.is_finite() && v >= 0.0) {
-                return Err(format!("cost.{name} must be finite and >= 0, got {v}"));
-            }
-        }
 
         match (&self.explicit_pages, self.phases.is_empty()) {
             (Some(_), false) => {

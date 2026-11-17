@@ -7,9 +7,10 @@ use rand::{Rng, SeedableRng};
 use serde::Serialize;
 
 use crate::policy::{Ctx, FrameState, Log, Note, Policy, PolicyKind};
+use crate::storage::{Read, StorageKind};
 use crate::summary::RunSummary;
 use crate::trace::{Access, Trace};
-use crate::workload::{CostModel, Workload};
+use crate::workload::Workload;
 use crate::{FrameIdx, PageId};
 
 /// Build the trace for a seeded run. Everything random about a run comes
@@ -150,6 +151,8 @@ impl BufferPool {
 pub struct SimConfig {
     pub frames: usize,
     pub policy: PolicyKind,
+    /// Prices the run; never changes what is cached.
+    pub storage: StorageKind,
 }
 
 impl Default for SimConfig {
@@ -157,6 +160,7 @@ impl Default for SimConfig {
         Self {
             frames: 64,
             policy: PolicyKind::Clock,
+            storage: StorageKind::Ssd,
         }
     }
 }
@@ -165,9 +169,11 @@ impl Default for SimConfig {
 pub struct Metrics {
     pub hits: u64,
     pub misses: u64,
+    pub sequential_reads: u64,
+    pub random_reads: u64,
     pub evictions: u64,
     pub dirty_evictions: u64,
-    pub total_cost: f64,
+    pub total_ms: f64,
 }
 
 impl Metrics {
@@ -189,26 +195,9 @@ pub struct FrameView {
     pub state: FrameState,
 }
 
-/// What one access cost, kept in parts so storage detail can be added to
-/// each later (units from the [`CostModel`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
-pub struct Cost {
-    /// A hit reads the frame; a miss reads the page from disk.
-    pub access: f64,
-    /// A miss moves the disk head from the previous read.
-    pub seek: f64,
-    /// A miss that evicts a dirty page writes it back first.
-    pub writeback: f64,
-}
-
-impl Cost {
-    pub fn total(&self) -> f64 {
-        self.access + self.seek + self.writeback
-    }
-}
-
-/// One access, explained: what the pool did, what it cost and what the
-/// policy looked at. Recorded only after [`Simulator::record_events`].
+/// One access, explained: what the pool did, how the page came off the
+/// device and what the policy looked at. Its time follows from `read` and
+/// `outcome` (a dirty eviction is a write-back) under any storage profile. Recorded only after [`Simulator::record_events`].
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Event {
     #[serde(flatten)]
@@ -219,7 +208,9 @@ pub struct Event {
     pub frame: FrameIdx,
     #[serde(flatten)]
     pub outcome: Outcome,
-    pub cost: Cost,
+    /// For a miss: whether the page was read sequentially or at random.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read: Option<Read>,
     /// In the order the policy did them.
     pub notes: Vec<Note>,
     /// Every frame after the access.
@@ -229,27 +220,27 @@ pub struct Event {
 
 pub struct Simulator {
     trace: Trace,
-    cost: CostModel,
     cfg: SimConfig,
     pool: BufferPool,
     next_query: usize,
-    last_disk_pos: u64,
+    /// The last page the device read or wrote. Pages sit on disk in id
+    /// order, so the next one is a sequential read.
+    head: Option<PageId>,
     metrics: Metrics,
     log: Log,
     events: Option<Vec<Event>>,
 }
 
 impl Simulator {
-    pub fn new(trace: Trace, cost: CostModel, cfg: SimConfig) -> Self {
+    pub fn new(trace: Trace, cfg: SimConfig) -> Self {
         assert!(cfg.frames > 0, "buffer pool needs at least one frame");
         let policy = cfg.policy.build(cfg.frames, &trace);
         Self {
             pool: BufferPool::new(cfg.frames, policy),
             trace,
-            cost,
             cfg,
             next_query: 0,
-            last_disk_pos: 0,
+            head: None,
             metrics: Metrics::default(),
             log: Log::default(),
             events: None,
@@ -270,7 +261,7 @@ impl Simulator {
 
     /// Convenience: build the scenario for `w`/`seed` and run it to the end.
     pub fn run(w: &Workload, seed: u64, ticks: u64, cfg: SimConfig) -> Self {
-        let mut sim = Self::new(build_scenario(w, seed, ticks), w.cost.clone(), cfg);
+        let mut sim = Self::new(build_scenario(w, seed, ticks), cfg);
         while sim.step().is_some() {}
         sim
     }
@@ -296,10 +287,6 @@ impl Simulator {
         &self.trace
     }
 
-    pub fn cost_model(&self) -> &CostModel {
-        &self.cost
-    }
-
     pub fn policy_kind(&self) -> PolicyKind {
         self.cfg.policy
     }
@@ -319,44 +306,42 @@ impl Simulator {
                 query: q,
                 scan: a.scan,
             };
-            self.metrics.total_cost += self.access(a, ctx);
+            self.metrics.total_ms += self.access(a, ctx);
         }
         Some(self.tick())
     }
 
-    /// Serve one access; returns its cost.
+    /// Serve one access; returns its time in milliseconds.
     fn access(&mut self, a: Access, ctx: Ctx) -> f64 {
         let (frame, outcome) = self.pool.access(a, ctx, &mut self.log);
-        let cost = match outcome {
+        let profile = self.cfg.storage.profile();
+        let (read, ms) = match outcome {
             Outcome::Hit => {
                 self.metrics.hits += 1;
-                Cost {
-                    access: self.cost.hit,
-                    ..Cost::default()
-                }
+                (None, profile.hit_ms)
             }
             Outcome::Miss { evicted } => {
                 self.metrics.misses += 1;
-                // Pages sit on disk in id order.
-                let disk_pos = a.page as u64;
-                let seek_dist = disk_pos.abs_diff(self.last_disk_pos);
-                let total_disk = self.trace.num_tables as u64 * self.trace.pages_per_table as u64;
-                let seek = (seek_dist as f64 / total_disk as f64) * self.cost.seek_max;
-                self.last_disk_pos = disk_pos;
-
-                let mut writeback = 0.0;
+                let mut ms = 0.0;
                 if let Some(e) = evicted {
                     self.metrics.evictions += 1;
+                    // The modified page goes out first, so the device ends
+                    // up at that page before it reads the new one.
                     if e.dirty {
                         self.metrics.dirty_evictions += 1;
-                        writeback = self.cost.dirty_writeback;
+                        ms += profile.write_ms;
+                        self.head = Some(e.page);
                     }
                 }
-                Cost {
-                    access: self.cost.miss,
-                    seek,
-                    writeback,
-                }
+                let read = if self.head.is_some_and(|h| h.checked_add(1) == Some(a.page)) {
+                    self.metrics.sequential_reads += 1;
+                    Read::Sequential
+                } else {
+                    self.metrics.random_reads += 1;
+                    Read::Random
+                };
+                self.head = Some(a.page);
+                (Some(read), ms + profile.read_ms(read))
             }
         };
         if let Some(events) = &mut self.events {
@@ -366,13 +351,13 @@ impl Simulator {
                 write: a.write,
                 frame,
                 outcome,
-                cost,
+                read,
                 notes: self.log.take(),
                 frames: self.pool.frame_views(),
                 hand: self.pool.policy().hand(),
             });
         }
-        cost.total()
+        ms
     }
 
     pub fn summary(&self) -> RunSummary {
@@ -381,18 +366,21 @@ impl Simulator {
         RunSummary {
             policy: self.cfg.policy.name().to_string(),
             frames: self.cfg.frames,
+            storage: self.cfg.storage,
             queries,
             accesses: m.hits + m.misses,
             hits: m.hits,
             misses: m.misses,
             hit_rate: m.hit_rate(),
+            sequential_reads: m.sequential_reads,
+            random_reads: m.random_reads,
             evictions: m.evictions,
             dirty_evictions: m.dirty_evictions,
-            total_cost: m.total_cost,
-            mean_cost_per_query: if queries == 0 {
+            total_ms: m.total_ms,
+            mean_ms_per_query: if queries == 0 {
                 0.0
             } else {
-                m.total_cost / queries as f64
+                m.total_ms / queries as f64
             },
         }
     }
@@ -402,6 +390,66 @@ impl Simulator {
 mod tests {
     use super::*;
 
+    /// One frame and LRU, so every access below is a miss and the order of
+    /// reads and write-backs is easy to follow.
+    fn reads(pages: &[(PageId, bool)], split_after: usize) -> (Vec<Option<Read>>, Metrics) {
+        let access = |&(page, write): &(PageId, bool)| Access {
+            page,
+            write,
+            scan: None,
+        };
+        let queries = vec![
+            pages[..split_after].iter().map(access).collect(),
+            pages[split_after..].iter().map(access).collect(),
+        ];
+        let cfg = SimConfig {
+            frames: 1,
+            policy: PolicyKind::Lru,
+            storage: StorageKind::Hdd,
+        };
+        let mut sim = Simulator::new(Trace::from_queries(1, 32, queries), cfg);
+        sim.record_events();
+        while sim.step().is_some() {}
+        let kinds = sim.events().iter().map(|e| e.read).collect();
+        (kinds, sim.metrics().clone())
+    }
+
+    #[test]
+    fn reads_are_sequential_only_right_after_the_last_page_touched() {
+        use Read::{Random, Sequential};
+        let (kinds, m) = reads(
+            &[
+                (5, false),  // first read of the run: random
+                (6, false),  // next page
+                (8, false),  // skips one
+                (9, false),  // next page, in the next query: the device stays put
+                (3, true),   // random, and now modified
+                (4, false),  // 3 is written back first, so 4 follows it
+                (7, true),   // random
+                (12, false), // 7 is written back; 12 is not next to it
+            ],
+            3,
+        );
+        let expect = [
+            Random, Sequential, Random, Sequential, Random, Sequential, Random, Random,
+        ];
+        assert_eq!(kinds, expect.map(Some));
+        assert_eq!(
+            (m.sequential_reads, m.random_reads, m.dirty_evictions),
+            (3, 5, 2)
+        );
+        let p = StorageKind::Hdd.profile();
+        let ms = 3.0 * p.sequential_read_ms + 5.0 * p.random_read_ms + 2.0 * p.write_ms;
+        assert!((m.total_ms - ms).abs() < 1e-9, "{} vs {ms}", m.total_ms);
+    }
+
+    #[test]
+    fn a_hit_needs_no_read() {
+        let (kinds, m) = reads(&[(5, false), (5, false)], 1);
+        assert_eq!(kinds, [Some(Read::Random), None]);
+        assert_eq!(m.hits, 1);
+    }
+
     #[test]
     fn pool_stays_consistent_for_every_policy() {
         let w = Workload::builtin_default();
@@ -410,8 +458,9 @@ mod tests {
                 let cfg = SimConfig {
                     frames,
                     policy: kind,
+                    ..SimConfig::default()
                 };
-                let mut sim = Simulator::new(build_scenario(&w, 3, 400), w.cost.clone(), cfg);
+                let mut sim = Simulator::new(build_scenario(&w, 3, 400), cfg);
                 while sim.step().is_some() {
                     sim.pool()
                         .check_consistency()

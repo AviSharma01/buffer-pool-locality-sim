@@ -1,7 +1,7 @@
 //! Behavioural tests for the engine: regression against v0.1 and policy
 //! guarantees from the literature.
 
-use bpsim::{PolicyKind, SimConfig, Simulator, Workload};
+use bpsim::{PolicyKind, SimConfig, Simulator, StorageKind, Workload};
 
 fn workload(file: &str) -> Workload {
     let path = format!("{}/workloads/{file}", env!("CARGO_MANIFEST_DIR"));
@@ -9,7 +9,11 @@ fn workload(file: &str) -> Workload {
 }
 
 fn cfg(policy: PolicyKind, frames: usize) -> SimConfig {
-    SimConfig { frames, policy }
+    SimConfig {
+        frames,
+        policy,
+        ..SimConfig::default()
+    }
 }
 
 fn misses(w: &Workload, seed: u64, ticks: u64, policy: PolicyKind, frames: usize) -> u64 {
@@ -121,4 +125,69 @@ fn shipped_workloads_are_valid() {
         }
     }
     assert!(n >= 3);
+}
+
+/// Storage only prices the run: hits, evictions and how each page came off
+/// the device are the same on every profile, and a hard drive is slower.
+#[test]
+fn storage_never_changes_cache_behaviour() {
+    for file in ["default.toml", "scan.toml"] {
+        let w = workload(file);
+        for kind in PolicyKind::ALL {
+            let [ssd, hdd] = StorageKind::ALL.map(|storage| {
+                let c = SimConfig {
+                    storage,
+                    ..cfg(kind, 64)
+                };
+                Simulator::run(&w, 9, 1500, c).summary()
+            });
+            assert_eq!(
+                (
+                    ssd.hits,
+                    ssd.evictions,
+                    ssd.dirty_evictions,
+                    ssd.random_reads
+                ),
+                (
+                    hdd.hits,
+                    hdd.evictions,
+                    hdd.dirty_evictions,
+                    hdd.random_reads
+                ),
+                "{file} {kind}"
+            );
+            assert!(hdd.total_ms > ssd.total_ms, "{file} {kind}");
+        }
+    }
+}
+
+/// A scan reads consecutive pages, so most of its misses are sequential.
+#[test]
+fn scans_read_sequentially() {
+    let s = Simulator::run(&workload("scan.toml"), 3, 5000, cfg(PolicyKind::Lru, 64)).summary();
+    let w = Simulator::run(
+        &Workload::builtin_default(),
+        3,
+        5000,
+        cfg(PolicyKind::Lru, 64),
+    )
+    .summary();
+    let share = |s: &bpsim::summary::RunSummary| s.sequential_reads as f64 / s.misses as f64;
+    assert!(share(&s) > 0.5, "scan workload: {}", share(&s));
+    assert!(
+        share(&s) > 2.0 * share(&w),
+        "scan {} vs default {}",
+        share(&s),
+        share(&w)
+    );
+}
+
+#[test]
+fn old_cost_sections_are_refused_with_a_pointer_to_storage() {
+    let text = format!(
+        "{}\n[cost]\nhit = 1.0\n",
+        bpsim::workload::DEFAULT_WORKLOAD_TOML
+    );
+    let err = Workload::from_toml(&text).unwrap_err();
+    assert!(err.contains("--storage ssd|hdd"), "{err}");
 }

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use bpsim::PolicyKind;
+use bpsim::{PolicyKind, StorageKind};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -29,6 +29,11 @@ pub struct Cli {
     /// Number of queries to simulate (ignored by explicit-trace workloads).
     #[arg(long, default_value_t = 5000, value_parser = clap::value_parser!(u64).range(1..))]
     pub ticks: u64,
+
+    /// Storage to price disk reads and write-backs with: ssd or hdd. It never
+    /// changes what is cached; the viewer can switch between them.
+    #[arg(long, default_value = "ssd")]
+    pub storage: StorageKind,
 
     /// Buffer pool size in frames.
     #[arg(long, default_value_t = 64, value_parser = positive_usize)]

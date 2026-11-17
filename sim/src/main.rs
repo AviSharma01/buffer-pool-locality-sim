@@ -56,6 +56,7 @@ impl Input {
         let cfg = SimConfig {
             frames: args.frames,
             policy,
+            storage: args.storage,
         };
         match self {
             Input::Trace(t) => {
@@ -63,11 +64,7 @@ impl Input {
                 sim.record_events();
                 sim
             }
-            Input::Workload(w) => Simulator::new(
-                build_scenario(w, args.seed, args.ticks),
-                w.cost.clone(),
-                cfg,
-            ),
+            Input::Workload(w) => Simulator::new(build_scenario(w, args.seed, args.ticks), cfg),
         }
     }
 }
@@ -162,8 +159,15 @@ fn run(args: Cli) -> Result<(), String> {
 
         let summary = sim.summary();
         println!(
-            "{} | {} | frames {} | hit rate {:.3} | mean cost/query {:.2}",
-            name, summary.policy, summary.frames, summary.hit_rate, summary.mean_cost_per_query
+            "{} | {} | frames {} | {} | hit rate {:.3} | {} random, {} sequential reads | {:.3} ms/query",
+            name,
+            summary.policy,
+            summary.frames,
+            summary.storage,
+            summary.hit_rate,
+            summary.random_reads,
+            summary.sequential_reads,
+            summary.mean_ms_per_query
         );
         let is_trace = matches!(input, Input::Trace(_));
         write_json(

@@ -233,6 +233,10 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
         <button type="button" id="mStep" aria-pressed="true">Step</button>
         <button type="button" id="mRace" aria-pressed="false">Race</button>
       </div>
+      <div class="seg" role="group" aria-label="Storage">
+        <button type="button" id="sSsd" aria-pressed="true">SSD</button>
+        <button type="button" id="sHdd" aria-pressed="false">HDD</button>
+      </div>
       <button type="button" class="icon" id="prev" aria-label="Previous read">◀</button>
       <button type="button" id="play">Play</button>
       <button type="button" class="icon" id="next" aria-label="Next read">▶</button>
@@ -245,7 +249,7 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
   <div class="moment" id="moment" aria-live="polite"></div>
 
   <section class="chart" id="chart" aria-label="The run: per pool, one bar per page for as long as it stayed in memory">
-    <div class="crow axisrow"><span class="cnote" id="chartNote"></span><div class="ctrack axis" id="axis"></div><span class="cnote" style="text-align:right">cost · hits</span></div>
+    <div class="crow axisrow"><span class="cnote" id="chartNote"></span><div class="ctrack axis" id="axis"></div><span class="cnote" style="text-align:right">time · hits</span></div>
     <div class="pools" id="pools"></div>
     <div class="crow keyrow"><button type="button" class="link" id="helpBtn" aria-expanded="false" aria-controls="help">How to read this</button><div class="key" id="key"></div><span></span></div>
     <div class="help" id="help" hidden></div>
@@ -268,7 +272,7 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
 <script id="run" type="application/json">__BPSIM_RUN__</script>
 <script>
 "use strict";
-const FORMAT = "bpsim-run", VERSION = 1;
+const FORMAT = "bpsim-run", VERSION = 2;
 const INFO = {
   fifo:   {name: "FIFO", how: "oldest load out", textbook: true},
   lru:    {name: "LRU", how: "least recent out"},
@@ -281,10 +285,20 @@ const $ = id => document.getElementById(id);
 const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
 const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const nameOf = p => INFO[p]?.name || p;
-const costOf = e => e.cost.access + e.cost.seek + e.cost.writeback;
+/* Time for one access under a storage profile, from what the engine recorded:
+   a hit, or a sequential or random read, plus a write-back if a modified page
+   had to go out first. Every profile prices the same events. */
+const msOf = (e, P) => (e.kind === "hit" ? P.hit_ms : e.read === "sequential" ? P.sequential_read_ms : P.random_read_ms) +
+  (e.evicted?.dirty ? P.write_ms : 0);
+const costOf = e => msOf(e, PROFILE);
+function fmtMs(ms) {
+  if (ms < 1) { const us = ms * 1000; return `${us < 10 ? us.toFixed(1) : us.toFixed(0)} µs`; }
+  if (ms < 1000) return `${ms < 10 ? ms.toFixed(2) : ms.toFixed(1)} ms`;
+  return `${(ms / 1000).toFixed(2)} s`;
+}
 
 /* everything about the loaded run; replaced when a run.json is dropped */
-let D, RUN, EV0, K, N, PAGE, OBJ, BARS, CUM, KIND, LANES, POS, MOMENTS = [];
+let D, RUN, EV0, K, N, PAGE, OBJ, BARS, CUM, KIND, LANES, POS, MOMENTS = [], STORAGE, PROFILE;
 let visible = [], focus = null, mode = "step", k = -1, playing = false, raceId = 0;
 const speed = () => +$("speed").value;
 const sleep = ms => new Promise(r => setTimeout(r, ms * speed()));
@@ -300,13 +314,12 @@ function start(data) {
   if (!data.runs?.length || !data.runs[0].events.length) throw new Error("the run file has no events");
   stopRace(); playing = false;
   D = data; N = D.frames; EV0 = D.runs[0].events; K = EV0.length;
-  RUN = {}; BARS = {}; CUM = {}; KIND = {}; LANES = {}; POS = {};
+  RUN = {}; BARS = {}; KIND = {}; LANES = {}; POS = {};
   for (const r of D.runs) {
     RUN[r.policy] = r; BARS[r.policy] = residency(r.events);
-    let cost = 0, hits = 0; const c = [], h = [];
-    for (const e of r.events) { cost += costOf(e); if (e.kind === "hit") hits++; c.push(cost); h.push(hits); }
-    CUM[r.policy] = {c, h}; KIND[r.policy] = r.events[0].frames[r.events[0].frame].state.kind;
+    KIND[r.policy] = r.events[0].frames[r.events[0].frame].state.kind;
   }
+  setStorage(D.storage, false);
   PAGE = {}; for (const p of D.pages) PAGE[p.page] = p;
   OBJ = {sqlite_schema: "var(--o-schema)"};
   D.objects.forEach((o, i) => { OBJ[o.name] = `var(--o${i % 6})`; });
@@ -329,12 +342,30 @@ function start(data) {
   jump(MOMENTS.length && MOMENTS[0].k > 0 ? MOMENTS[0].k - 1 : -1);
 }
 
-/* each event list must recount to its own summary */
+/* each event list must recount to its own summary, priced as the summary was */
 function addsUp(run) {
-  let hits = 0, misses = 0, dirty = 0, cost = 0;
-  for (const e of run.events) { e.kind === "hit" ? hits++ : misses++; if (e.evicted?.dirty) dirty++; cost += costOf(e); }
+  const P = D.profiles[run.summary.storage];
+  let hits = 0, seq = 0, random = 0, dirty = 0, ms = 0;
+  for (const e of run.events) {
+    if (e.kind === "hit") hits++; else if (e.read === "sequential") seq++; else random++;
+    if (e.evicted?.dirty) dirty++; ms += msOf(e, P);
+  }
   const s = run.summary;
-  return hits === s.hits && misses === s.misses && dirty === s.dirty_evictions && Math.abs(cost - s.total_cost) < 1e-6 * Math.max(1, s.total_cost);
+  return P && hits === s.hits && seq === s.sequential_reads && random === s.random_reads && dirty === s.dirty_evictions &&
+    Math.abs(ms - s.total_ms) < 1e-9 * Math.max(1, s.total_ms);
+}
+
+/* switching storage reprices the same events; nothing cached changes */
+function setStorage(kind, redraw = true) {
+  if (!D.profiles[kind]) return;
+  STORAGE = kind; PROFILE = D.profiles[kind]; CUM = {};
+  for (const r of D.runs) {
+    let ms = 0, hits = 0; const c = [], h = [];
+    for (const e of r.events) { ms += costOf(e); if (e.kind === "hit") hits++; c.push(ms); h.push(hits); }
+    CUM[r.policy] = {c, h};
+  }
+  $("sSsd").setAttribute("aria-pressed", kind === "ssd"); $("sHdd").setAttribute("aria-pressed", kind === "hdd");
+  if (redraw) { buildHelp(); buildMoments(); renderAll(k); }
 }
 
 /* one bar per (frame, page): the reads it stayed for, and its hits */
@@ -400,13 +431,14 @@ function buildHelp() {
   tip("Bars.", "A bar is one page staying in one frame. Long bars mean the pool kept the page. Many short bars mean it keeps throwing pages out.");
   tip("Moving.", "Drag on the chart, or use the left and right arrow keys, to move through the reads. Click a query number or a diamond to jump.");
   tip("Opening a pool.", "Click a pool's name to open it and see how it decides what to evict. One pool is open at a time.");
-  tip("Cost.", `What the reads so far cost: ${D.cost.hit} for a hit, ${D.cost.miss} for a disk read plus up to ${D.cost.seek_max} for how far the read is from the last one, and ${D.cost.dirty_writeback} more to write back a modified page first.`);
-  tip("Race.", "Replays every pool at the pace of its cost, so the cheapest finishes first.");
+  const P = PROFILE, label = STORAGE === "hdd" ? "a hard drive" : "an SSD";
+  tip("Time.", `Rough time on ${label}: ${fmtMs(P.hit_ms)} for a hit, ${fmtMs(P.sequential_read_ms)} to read the page right after the last one the disk touched, ${fmtMs(P.random_read_ms)} to read any other page, and ${fmtMs(P.write_ms)} more to write a modified page back first. Switch SSD and HDD at the top; what is cached stays the same.`);
+  tip("Race.", "Replays every pool at the pace of its time, on a squashed scale so hits stay visible next to slow reads. The fastest finishes first.");
   const mini = [];
   if (RUN.pg) mini.push("the PostgreSQL-style scan ring is a quarter of the pool (real: 32 pages)");
   if (RUN.innodb) mini.push("InnoDB-style promotes a page on a hit in a later query (real: after 1 second)");
   help.append(el("p", "foot", `Page reads were captured from SQLite ${D.sqlite_version} and replayed through miniature policies` + (mini.length ? `: ${mini.join("; ")}` : "") +
-    ". Every pool sees SQLite's reads; another database would read different pages for the same query."));
+    ". Every pool sees SQLite's reads; another database would read different pages for the same query. Times are rough per-page figures, and the operating system's own file cache is left out."));
 }
 
 /* ---------- chart + pools for the visible set ---------- */
@@ -489,6 +521,7 @@ function paintBand(p, at) {
 /* ---------- one access in words ---------- */
 function describe(p, e) {
   const ev = e.evicted, parts = [], sweeps = e.notes.filter(n => n.kind === "swept").length;
+  if (e.read) parts.push(e.read === "sequential" ? "next page on disk: sequential read" : "random read");
   for (const n of e.notes) {
     if (n.kind === "evict") {
       const w = n.why, v = `p${ev.page}`;
@@ -586,7 +619,7 @@ function paintLane(p, at) {
   const shown = e || {frames: Array.from({length: N}, () => ({page: null, dirty: false, state: {kind: "empty"}})), hand: null};
   if (p === focus) L.fig.replaceChildren(drawFocus(p, shown, at, touched)); else L.fig.replaceChildren();
   const t = totals(p, at);
-  L.score.querySelector(".t").textContent = t.cost.toFixed(0);
+  L.score.querySelector(".t").textContent = at < 0 ? "0" : fmtMs(t.cost);
   L.score.querySelector(".s").textContent = at < 0 ? "no reads yet" : `${t.hits}/${at + 1} hits`;
   L.sayEl.replaceChildren();
   if (e && mode === "step") L.sayEl.append(el("span", "k " + e.kind, e.kind), describe(p, e));
@@ -633,7 +666,7 @@ function buildMoments() {
   }
   for (const p of real) {
     const i = E(p).findIndex(e => e.evicted?.dirty);
-    if (i >= 0) { list.push({k: i, t: "A modified page goes back to disk", d: `${nameOf(p)} writes p${E(p)[i].evicted.page} back before reusing the frame, so this read costs ${D.cost.dirty_writeback} more.`}); break; }
+    if (i >= 0) { list.push({k: i, t: "A modified page goes back to disk", d: `${nameOf(p)} writes p${E(p)[i].evicted.page} back before reusing the frame, so this read takes ${fmtMs(PROFILE.write_ms)} longer.`}); break; }
   }
   if (real.length > 1) {
     let best = null;
@@ -641,7 +674,7 @@ function buildMoments() {
       const h = real.map(p => E(p).slice(q.accesses[0], q.accesses[1]).filter(e => e.kind === "hit").length), gap = Math.max(...h) - Math.min(...h);
       if (gap > 0 && (!best || gap > best.gap)) best = {gap, i, h};
     });
-    if (best) { const q = D.queries[best.i], n = q.accesses[1] - q.accesses[0]; list.push({k: q.accesses[0], t: "Same query, different cost", d: real.map((p, j) => `${nameOf(p)} ${best.h[j]}/${n} hits`).join(" · ")}); }
+    if (best) { const q = D.queries[best.i], n = q.accesses[1] - q.accesses[0]; list.push({k: q.accesses[0], t: "Same query, different time", d: real.map((p, j) => `${nameOf(p)} ${best.h[j]}/${n} hits`).join(" · ")}); }
   }
   MOMENTS = list.sort((a, b) => a.k - b.k);
 }
@@ -703,7 +736,7 @@ function renderFold(at) {
     const evs = RUN[p].events, row = el("div", "qcost"), l = el("div", "l"), ticks = el("div", "ticks");
     let cost = 0, hits = 0;
     for (let i = a; i < b; i++) { const done = i <= at; if (done) { cost += costOf(evs[i]); if (evs[i].kind === "hit") hits++; } ticks.append(el("i", done ? evs[i].kind : "")); }
-    l.append(nameOf(p), el("span", "", `${hits}/${at - a + 1} hits · cost ${cost.toFixed(0)}`)); row.append(l, ticks); list.append(row);
+    l.append(nameOf(p), el("span", "", `${hits}/${at - a + 1} hits · ${fmtMs(cost)}`)); row.append(l, ticks); list.append(row);
   }
   cc.append(list);
   body.append(cq, cp, cc);
@@ -759,7 +792,7 @@ function stopRace() { raceId++; if (mode === "race") { playing = false; $("play"
 async function race() {
   stopRace(); const id = raceId; playing = true; $("play").textContent = "Stop"; k = -1; clearPlaces(); renderAll(-1); let place = 0;
   await Promise.all(visible.map(async p => {
-    for (let i = 0; i < K; i++) { if (id !== raceId) return; await animateStep(p, i, id); if (id !== raceId) return; await sleep(30 + costOf(RUN[p].events[i]) * 13); }
+    for (let i = 0; i < K; i++) { if (id !== raceId) return; await animateStep(p, i, id); if (id !== raceId) return; await sleep(30 + 60 * Math.log10(1 + costOf(RUN[p].events[i]) / PROFILE.hit_ms)); }
     if (id !== raceId) return; place++;
     const pl = LANES[p].score.querySelector(".place"); pl.textContent = ["1st", "2nd", "3rd"][place - 1] || place + "th"; pl.classList.add("on");
   }));
@@ -767,6 +800,8 @@ async function race() {
 }
 $("play").addEventListener("click", () => mode === "race" ? (playing ? stopRace() : race()) : (playing ? stop() : play()));
 $("mStep").addEventListener("click", () => setMode("step"));
+$("sSsd").addEventListener("click", () => { stopRace(); setStorage("ssd"); });
+$("sHdd").addEventListener("click", () => { stopRace(); setStorage("hdd"); });
 $("mRace").addEventListener("click", () => setMode("race"));
 $("prev").addEventListener("click", () => { stop(); jump(k - 1); });
 $("next").addEventListener("click", () => { stop(); stepForward(); });
