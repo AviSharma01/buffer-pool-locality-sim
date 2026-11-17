@@ -7,6 +7,7 @@ import shutil
 import struct
 import subprocess
 import sys
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,8 @@ from capture import Limits, Scenario, capture, decode_rows, parse_scenario
 HERE = Path(__file__).parent.parent
 PEOPLE = HERE / "examples" / "people.csv"
 CHECKOUT = HERE / "scenarios" / "checkout.sql"
+GROWTH = HERE / "scenarios" / "growth.sql"
+TRACES = HERE.parent / "traces"
 
 
 def make_db(path: Path, sql: str) -> Path:
@@ -200,6 +203,7 @@ def test_untrusted_databases_are_opened_defensively(notes_db: Path) -> None:
     [
         "ATTACH '{out}' AS other",
         "VACUUM INTO '{out}'",
+        "VACUUM",
         "PRAGMA journal_mode = WAL",
         "PRAGMA writable_schema = ON",
         "PRAGMA cache_size = 5000",
@@ -219,6 +223,12 @@ def test_scenario_setup_is_restricted_too(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="setup: not allowed here"):
         capture(parse_scenario(text, "t"), tmp_path)
     assert not out.exists()
+
+
+def test_vacuum_in_sql_points_to_the_flag(tmp_path: Path) -> None:
+    text = "-- setup\nCREATE TABLE t(a);\nVACUUM;\n-- query: q\nSELECT 1;\n"
+    with pytest.raises(ValueError, match=r"setup: not allowed here.*VACUUM \(use --vacuum\)"):
+        capture(parse_scenario(text, "t"), tmp_path)
 
 
 def test_runaway_queries_are_stopped(tmp_path: Path) -> None:
@@ -289,6 +299,61 @@ def test_checkout_grows_the_file_and_stays_replayable(tmp_path: Path) -> None:
     assert "1 page(s) were created by the queries" in trace["notes"][3]
 
 
+# ---- layout ----
+
+
+def runs_out_of_order(trace: dict[str, Any]) -> dict[str, int]:
+    """For each table and index, how often its next page is not the next page in the file."""
+    pages: dict[str, list[int]] = {}
+    for p in trace["pages"]:
+        if p["object"] not in (None, "sqlite_schema"):
+            pages.setdefault(p["object"], []).append(p["page"])
+    return {o: sum(b != a + 1 for a, b in pairwise(ps)) for o, ps in pages.items()}
+
+
+def test_vacuum_puts_each_table_and_index_in_one_run(tmp_path: Path) -> None:
+    text = GROWTH.read_text(encoding="utf-8")
+    grown = capture(parse_scenario(text, "growth"), tmp_path)
+    scenario = parse_scenario(text, "growth")
+    scenario.vacuum = True
+    vacuumed = capture(scenario, tmp_path)
+    assert runs_out_of_order(grown) == {"orders": 24, "events": 27, "events_order": 13}
+    # One jump each: from the root page, written first, to the leaves after it.
+    assert runs_out_of_order(vacuumed) == {"orders": 1, "events": 1, "events_order": 1}
+    assert [q["sql"] for q in grown["queries"]] == [q["sql"] for q in vacuumed["queries"]]
+    assert cap.VACUUM_NOTE in vacuumed["notes"] and cap.VACUUM_NOTE not in grown["notes"]
+    # The rebuilt index packs into one page fewer, so layouts can differ in size too.
+    assert (grown["page_count"], vacuumed["page_count"]) == (77, 76)
+
+
+def test_vacuum_changes_where_rows_live_not_what_queries_return(tmp_path: Path) -> None:
+    scenario = parse_scenario(GROWTH.read_text(encoding="utf-8"), "growth")
+    grown = make_db(tmp_path / "grown.db", scenario.setup)
+    vacuumed = tmp_path / "vacuumed.db"
+    shutil.copyfile(grown, vacuumed)
+    cap._vacuum(vacuumed, 10)
+    results = []
+    for path in (grown, vacuumed):
+        conn = apsw.Connection(str(path))
+        results.append([list(conn.execute(sql)) for _, sql in scenario.queries])
+        conn.close()
+    assert results[0] == results[1] and results[0][0] != []
+
+
+@pytest.mark.parametrize("name", ["shop", "checkout", "growth", "shop-vacuum", "growth-vacuum"])
+def test_shipped_traces_match_a_fresh_capture(tmp_path: Path, name: str) -> None:
+    shipped = (TRACES / f"{name}.trace.json").read_text(encoding="utf-8")
+    base = name.removesuffix("-vacuum")
+    scenario = parse_scenario(
+        (HERE / "scenarios" / f"{base}.sql").read_text(encoding="utf-8"), name
+    )
+    scenario.vacuum = name.endswith("-vacuum")
+    fresh = capture(scenario, tmp_path)
+    if f'"sqlite_version": "{fresh["sqlite_version"]}"' not in shipped:
+        pytest.skip(f"traces were captured with another SQLite than {fresh['sqlite_version']}")
+    assert cap.dump(fresh) == shipped
+
+
 # ---- command line ----
 
 
@@ -327,6 +392,22 @@ def test_command_line_errors_are_one_line(args: list[str], message: str) -> None
     assert done.returncode == 1
     assert done.stderr.startswith("error: ") and message in done.stderr
     assert "Traceback" not in done.stderr
+
+
+def test_vacuum_works_on_your_own_database_and_leaves_it_alone(
+    tmp_path: Path, notes_db: Path
+) -> None:
+    before = notes_db.read_bytes()
+    out = tmp_path / "o.json"
+    done = cli("--db", notes_db, "--sql", "SELECT count(*) FROM notes", "--vacuum", "-o", out)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.startswith("notes-vacuum: 1 queries")
+    assert cap.VACUUM_NOTE in out.read_text(encoding="utf-8")
+    assert notes_db.read_bytes() == before
+    csv = cli(
+        "--csv", f"people={PEOPLE}", "--sql", "SELECT 1", "--vacuum", "--name", "p", "-o", out
+    )
+    assert csv.returncode == 0 and csv.stdout.startswith("p-vacuum:"), csv.stderr
 
 
 def test_scenario_name_is_made_safe_for_paths(tmp_path: Path, notes_db: Path) -> None:

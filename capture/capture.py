@@ -4,14 +4,17 @@ A scenario is one SQL file: a `-- setup` section that builds the database,
 then `-- query: <title>` sections, one statement each. The database can also
 come from your own data: an existing SQLite file (`--db`, always used as a
 copy) or CSV files that become tables (`--csv`), with queries from a file or
-from `--sql`. The tool replays the queries through a VFS shim that logs every
-read and write SQLite makes on the main database file. The result is a trace
-the Rust engine can replay through any buffer pool.
+from `--sql`. `--vacuum` rebuilds the database with VACUUM before the queries,
+so each table and index sits in one run of pages. The tool replays the queries
+through a VFS shim that logs every read and write SQLite makes on the main
+database file. The result is a trace the Rust engine can replay through any
+buffer pool.
 
 Databases and SQL from elsewhere are treated as untrusted: the original file
-is never opened, ATTACH, extensions and most PRAGMAs are refused, schemas are
-not trusted, and size and time limits apply. This guards against hostile
-files and mistakes; it is not a sandbox.
+is never opened; ATTACH, VACUUM, extensions and most PRAGMAs are refused in
+SQL (--vacuum runs VACUUM itself, on the copy); schemas are not trusted; and
+size and time limits apply. This guards against hostile files and mistakes;
+it is not a sandbox.
 
 Trace format (JSON, version 1):
     format, version, scenario, sqlite_version, page_size, page_count
@@ -23,6 +26,8 @@ Trace format (JSON, version 1):
 
 Usage:
     python capture/capture.py capture/scenarios/shop.sql -o traces/shop.trace.json
+    python capture/capture.py capture/scenarios/growth.sql --vacuum \\
+        -o traces/growth-vacuum.trace.json
     python capture/capture.py --db my.sqlite --sql "SELECT * FROM t WHERE id = 7" --view
     python capture/capture.py --csv people=people.csv --index "people(email)" \\
         --sql "SELECT * FROM people WHERE email = 'a@b.c'" --view
@@ -60,6 +65,10 @@ NOTES = [
     "almost every page reference is visible. Writes are logged when the statement commits.",
     "Rows show each page as it was right after setup, before any query ran.",
 ]
+VACUUM_NOTE = (
+    "The database was rebuilt with VACUUM after setup, so each table and index sits in one run "
+    "of pages. Capture it without --vacuum to compare the layout it grew into."
+)
 
 # What scenario and command-line SQL may use. Everything that reaches another
 # file or changes how SQLite does I/O (which would make the trace meaningless)
@@ -97,6 +106,7 @@ class Scenario:
     db: Path | None = None
     csvs: list[tuple[str, Path]] = field(default_factory=list)
     indexes: list[str] = field(default_factory=list)
+    vacuum: bool = False
 
 
 def _check_single_statement(title: str, sql: str) -> str:
@@ -461,7 +471,8 @@ def _run(
         ) from None
     except apsw.AuthError:
         raise ValueError(
-            f"{what}: not allowed here. ATTACH, loading extensions and PRAGMAs other than "
+            f"{what}: not allowed here. ATTACH, VACUUM (use --vacuum), loading extensions and "
+            "PRAGMAs other than "
             f"{', '.join(sorted(ALLOWED_PRAGMAS))} are refused"
         ) from None
     except apsw.Error as e:
@@ -627,6 +638,19 @@ def _layout(
     return page_size, objects, pages
 
 
+def _vacuum(db_path: Path, seconds: float) -> None:
+    """Rebuild our working copy so every table and index is contiguous.
+
+    The guards stay on for scenario SQL: SQLite runs VACUUM by attaching a
+    temporary database, so this fixed statement runs on its own connection
+    without the ATTACH guard, still with the schema untrusted and a time limit."""
+    conn = _open(db_path)
+    try:
+        _run(conn, "VACUUM", "--vacuum", seconds)
+    finally:
+        conn.close()
+
+
 def capture(
     scenario: Scenario, workdir: Path, limits: Limits | None = None, rows: bool = True
 ) -> dict[str, Any]:
@@ -655,6 +679,8 @@ def capture(
             _run(setup, scenario.setup, "setup", max(SETUP_SECONDS, limits.timeout))
     finally:
         setup.close()
+    if scenario.vacuum:
+        _vacuum(db_path, max(SETUP_SECONDS, limits.timeout))
     page_size, objects_before, pages_before = _layout(db_path, limits)
     if rows:
         shutil.copyfile(db_path, before_path)
@@ -678,7 +704,7 @@ def capture(
     # Inserts can grow the file, so the page map describes it after the queries.
     _, objects, pages = _layout(db_path, limits)
     touched = sorted({page for q in queries for _, page in q["io"]})
-    notes = list(NOTES)
+    notes = list(NOTES) + ([VACUUM_NOTE] if scenario.vacuum else [])
     decoded: dict[int, dict[str, Any]] = {}
     if rows:
         known = [pages_before[p - 1] for p in touched if p <= len(pages_before)]
@@ -767,6 +793,9 @@ def build_scenario(args: argparse.Namespace) -> Scenario:
         raise ValueError("no queries: add --sql \"...\" or '-- query:' sections in a scenario file")
     fallback = args.db.stem if args.db is not None else scenario.csvs[0][0] if args.csv else ""
     scenario.name = _safe_name(args.name or scenario.name or fallback)
+    if args.vacuum:
+        scenario.vacuum = True
+        scenario.name += "-vacuum"
     return scenario
 
 
@@ -807,6 +836,11 @@ def main() -> None:
     data.add_argument("--sql", action="append", default=[], metavar="STATEMENT", help="a query")
     data.add_argument("--name", help="scenario name (letters, digits, - and _)")
     data.add_argument("--no-rows", action="store_true", help="leave row contents out of the trace")
+    data.add_argument(
+        "--vacuum",
+        action="store_true",
+        help="rebuild the database with VACUUM before the queries (name gets -vacuum)",
+    )
     lim = parser.add_argument_group("limits")
     lim.add_argument("--max-pages", type=int, default=defaults.max_pages)
     lim.add_argument("--timeout", type=float, default=defaults.timeout, help="seconds per query")

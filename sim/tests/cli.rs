@@ -361,3 +361,28 @@ fn rejects_bad_trace_arguments() {
         "frame entries",
     );
 }
+
+/// `sim ... | head -1` closes the pipe after one line; the run still finishes
+/// and writes its files instead of panicking.
+#[test]
+fn a_reader_that_stops_early_does_not_break_the_run() {
+    let dir = out_dir("closed-pipe");
+    let trace = format!("{}/../traces/shop.trace.json", env!("CARGO_MANIFEST_DIR"));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sim"))
+        .args(["--trace", &trace, "--policy", "all", "--frames", "8"])
+        .args(["--out", dir.to_str().unwrap()])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run sim binary");
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(
+        only_run(&dir.join("shop/compare"))
+            .join("viewer.html")
+            .is_file()
+    );
+}

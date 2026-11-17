@@ -1,6 +1,7 @@
 mod cli;
 
 use std::fs;
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 
 use bpsim::run::RunFile;
@@ -23,6 +24,15 @@ fn main() {
     if let Err(e) = run(Cli::parse()) {
         eprintln!("error: {e}");
         std::process::exit(1);
+    }
+}
+
+/// Prints one line of progress. A reader that stops early (`sim ... | head -1`)
+/// closes the pipe; that is not a failure, and the run still writes its files.
+fn say(line: std::fmt::Arguments) {
+    match writeln!(std::io::stdout(), "{line}") {
+        Err(e) if e.kind() != ErrorKind::BrokenPipe => eprintln!("warning: could not print: {e}"),
+        _ => {}
     }
 }
 
@@ -158,7 +168,7 @@ fn run(args: Cli) -> Result<(), String> {
         while sim.step().is_some() {}
 
         let summary = sim.summary();
-        println!(
+        say(format_args!(
             "{} | {} | frames {} | {} | hit rate {:.3} | {} random, {} sequential reads | {:.3} ms/query",
             name,
             summary.policy,
@@ -168,7 +178,7 @@ fn run(args: Cli) -> Result<(), String> {
             summary.random_reads,
             summary.sequential_reads,
             summary.mean_ms_per_query
-        );
+        ));
         let is_trace = matches!(input, Input::Trace(_));
         write_json(
             &dir.join("summary.json"),
@@ -188,6 +198,6 @@ fn run(args: Cli) -> Result<(), String> {
         write(&run_dir.join("run.json"), &format!("{run_json}\n"))?;
         write(&run_dir.join("viewer.html"), &viewer_html(&run_json))?;
     }
-    println!("Run written to {}", run_dir.display());
+    say(format_args!("Run written to {}", run_dir.display()));
     Ok(())
 }

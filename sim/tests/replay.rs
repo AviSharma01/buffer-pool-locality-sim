@@ -1,7 +1,10 @@
 //! Replaying the committed SQLite captures. For traces/shop.trace.json the
 //! expected numbers match an independent JavaScript model of the same policies
 //! from the design mockups, minus the two commit writes it counted as hits.
-//! traces/checkout.trace.json is mostly writes and grows the file.
+//! traces/checkout.trace.json is mostly writes and grows the file. The growth
+//! and *-vacuum traces are the same queries on two layouts of one database: as
+//! it grew, and rebuilt with VACUUM. Their numbers below were recounted by an
+//! independent LRU model in Python.
 
 use bpsim::policy::{FrameState, Note, Why};
 use bpsim::sim::{Event, Outcome};
@@ -59,6 +62,7 @@ fn replay(policy: PolicyKind, frames: usize) -> bpsim::summary::RunSummary {
 
 /// LRU with 8 frames, recounted by hand from the run files: the report's scan
 /// of orders reads 14 pages in a row; checkout's reads are almost all random.
+const TRACES: [&str; 5] = ["shop", "checkout", "growth", "growth-vacuum", "shop-vacuum"];
 const SHOP_LRU_SEQ: u64 = 16;
 const SHOP_LRU_RANDOM: u64 = 14;
 const CHECKOUT_LRU_SEQ: u64 = 2;
@@ -291,7 +295,7 @@ fn no_policy_beats_optimal_on_checkout() {
 /// Storage prices what the pool decided; it must never change the decisions.
 #[test]
 fn storage_never_changes_what_is_cached() {
-    for name in ["shop", "checkout"] {
+    for name in TRACES {
         for frames in [1, 2, 4, 8, 16, 32] {
             for kind in PolicyKind::ALL {
                 let [ssd, hdd] = StorageKind::ALL.map(|s| summary(name, kind, frames, s));
@@ -340,4 +344,57 @@ fn shop_and_checkout_reads_and_times_with_8_frames() {
         (c.sequential_reads, c.random_reads),
         (CHECKOUT_LRU_SEQ, CHECKOUT_LRU_RANDOM)
     );
+}
+
+/// Orders and their event log grew side by side, so a scan of either jumps
+/// across the file. VACUUM puts each in one run: the same hits, but most
+/// reads become sequential, which is what a hard drive rewards.
+#[test]
+fn vacuum_turns_scattered_scans_into_sequential_reads() {
+    let lru = |name| summary(name, PolicyKind::Lru, 8, StorageKind::Hdd);
+    let (grown, vacuumed) = (lru("growth"), lru("growth-vacuum"));
+    assert_eq!(
+        (grown.hits, grown.sequential_reads, grown.random_reads),
+        (3, 12, 83)
+    );
+    assert_eq!(
+        (
+            vacuumed.hits,
+            vacuumed.sequential_reads,
+            vacuumed.random_reads
+        ),
+        (3, 84, 11)
+    );
+    assert!(grown.total_ms > 7.0 * vacuumed.total_ms);
+    for kind in PolicyKind::ALL {
+        for storage in StorageKind::ALL {
+            let [g, v] = ["growth", "growth-vacuum"].map(|n| summary(n, kind, 8, storage));
+            assert_eq!(g.hits, v.hits, "{kind} {storage}");
+            assert!(v.random_reads < g.random_reads, "{kind} {storage}");
+            assert!(v.total_ms < g.total_ms, "{kind} {storage}");
+        }
+    }
+}
+
+/// VACUUM is not always a win. Shop's scan was already in one run, and its
+/// lookups read a user's index entry and row, which were written side by side
+/// as the table grew. VACUUM separates them, so two reads that were sequential
+/// become random.
+#[test]
+fn vacuum_can_cost_reads_when_rows_were_already_near_each_other() {
+    let lru = |name| summary(name, PolicyKind::Lru, 8, StorageKind::Ssd);
+    let (grown, vacuumed) = (lru("shop"), lru("shop-vacuum"));
+    assert_eq!(grown.hits, vacuumed.hits);
+    assert_eq!(
+        (vacuumed.sequential_reads, vacuumed.random_reads),
+        (SHOP_LRU_SEQ - 2, SHOP_LRU_RANDOM + 2)
+    );
+    let find_by_email = |name| {
+        let q = &load(name).queries[2];
+        assert_eq!(q.title, "Find user by email");
+        q.io.iter().map(|&(_, page)| page).collect::<Vec<_>>()
+    };
+    // Index leaf, then the cached users root, then the user's leaf right after it.
+    assert_eq!(find_by_email("shop"), [1, 3, 29, 2, 30]);
+    assert_eq!(find_by_email("shop-vacuum"), [1, 4, 52, 2, 21]);
 }
