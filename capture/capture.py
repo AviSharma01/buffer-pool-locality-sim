@@ -776,7 +776,7 @@ def view(trace_path: Path, frames: int, policy: str) -> Path:
     if not sim.is_file():
         raise ValueError("--view needs the engine: run `cargo build --release` in sim/ first")
     cmd = [str(sim), "--trace", str(trace_path), "--policy", policy, "--frames", str(frames)]
-    cmd += ["--snapshot-every", "0", "--out", str(REPO / "outputs" / "runs")]
+    cmd += ["--out", str(REPO / "outputs" / "runs")]
     done = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if done.returncode != 0:
         raise ValueError(done.stderr.strip().removeprefix("error: ") or "the engine failed")

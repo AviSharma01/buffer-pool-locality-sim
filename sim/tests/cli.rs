@@ -1,5 +1,5 @@
 //! CLI input validation: every input that crashed v0.1 must now fail cleanly
-//! with a message, and a normal run must write snapshots + summary.json.
+//! with a message, and a normal run must write summary.json.
 //! Trace runs also write run.json and viewer.html with the same data built in.
 
 use std::path::{Path, PathBuf};
@@ -30,13 +30,21 @@ fn assert_rejected(args: &[&str], expect: &str) {
 
 #[test]
 fn rejects_inputs_that_used_to_panic() {
-    assert_rejected(&["--recluster-every", "0"], "--recluster-every");
     assert_rejected(&["--frames", "0"], "must be at least 1");
     assert_rejected(&["--ticks", "0"], "--ticks");
     assert_rejected(&["--policy", "random"], "unknown policy");
     assert_rejected(&["--policy", "lru,random"], "unknown policy");
     assert_rejected(&["--policy", "lru,LRU"], "listed twice");
-    assert_rejected(&["--co-access-decay", "0"], "must be in (0, 1]");
+    // Flags retired with reclustering and the old visualiser are rejected,
+    // not silently ignored.
+    for gone in [
+        "--recluster",
+        "--recluster-every",
+        "--co-access-decay",
+        "--snapshot-every",
+    ] {
+        assert_rejected(&[gone, "1"], "unexpected argument");
+    }
     assert_rejected(&["--frames", "5000"], "exceeds the workload's total pages");
 }
 
@@ -59,33 +67,7 @@ fn rejects_invalid_workload_file() {
 }
 
 #[test]
-fn snapshot_every_zero_writes_summary_only() {
-    let dir = out_dir("summary_only");
-    let out = sim(&[
-        "--ticks",
-        "50",
-        "--snapshot-every",
-        "0",
-        "--out",
-        dir.to_str().unwrap(),
-    ]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let run = std::fs::read_dir(dir.join("default/clock/recluster"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    assert!(run.join("summary.json").exists());
-    assert_eq!(std::fs::read_dir(run.join("snapshots")).unwrap().count(), 0);
-}
-
-#[test]
-fn normal_run_writes_snapshots() {
+fn normal_run_writes_a_summary() {
     let dir = out_dir("normal_run");
     let out = sim(&[
         "--ticks",
@@ -100,15 +82,11 @@ fn normal_run_writes_snapshots() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let run = std::fs::read_dir(dir.join("default/innodb/recluster"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let run = only_run(&dir.join("default/innodb"));
     assert_eq!(
-        std::fs::read_dir(run.join("snapshots")).unwrap().count(),
-        10
+        std::fs::read_dir(&run).unwrap().count(),
+        1,
+        "summary.json only"
     );
     let summary: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(run.join("summary.json")).unwrap()).unwrap();
@@ -182,17 +160,11 @@ fn replays_a_captured_trace() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let run = std::fs::read_dir(dir.join("shop/lru/replay"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let run = only_run(&dir.join("shop/lru"));
     let summary: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(run.join("summary.json")).unwrap()).unwrap();
     assert_eq!(summary["trace"], "shop");
     assert_eq!(summary["hits"], 15);
-    assert_eq!(std::fs::read_dir(run.join("snapshots")).unwrap().count(), 9);
     assert!(summary.get("seed").is_none() && summary.get("workload").is_none());
     let run_file = read_json(&run.join("run.json"));
     assert_eq!(run_file["runs"].as_array().unwrap().len(), 1);
@@ -210,7 +182,7 @@ fn comparing_policies_writes_one_run_file_that_adds_up() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let run = only_run(&dir.join("shop/compare/replay"));
+    let run = only_run(&dir.join("shop/compare"));
     let run_file = read_json(&run.join("run.json"));
     assert_eq!(
         (&run_file["format"], &run_file["version"]),
@@ -229,12 +201,6 @@ fn comparing_policies_writes_one_run_file_that_adds_up() {
         let policy = r["policy"].as_str().unwrap();
         let summary = read_json(&run.join(policy).join("summary.json"));
         assert_eq!(summary["hits"], r["summary"]["hits"], "{policy}");
-        assert_eq!(
-            std::fs::read_dir(run.join(policy).join("snapshots"))
-                .unwrap()
-                .count(),
-            9
-        );
 
         let events = r["events"].as_array().unwrap();
         assert_eq!(events.len(), 45, "{policy}");
@@ -280,7 +246,7 @@ fn database_text_cannot_break_out_of_the_viewer_page() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let run = only_run(&dir.join("tiny/clock/replay"));
+    let run = only_run(&dir.join("tiny/clock"));
     let embedded = embedded_run(&run.join("viewer.html"));
     assert_eq!(embedded["rows"]["2"]["rows"][0][0], "</script><!-- <b>");
     assert_eq!(embedded, read_json(&run.join("run.json")));
@@ -302,7 +268,7 @@ fn comparing_policies_on_a_workload_writes_summaries_only() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let run = only_run(&dir.join("default/compare/recluster"));
+    let run = only_run(&dir.join("default/compare"));
     for policy in ["lru", "opt"] {
         assert_eq!(
             read_json(&run.join(policy).join("summary.json"))["policy"],

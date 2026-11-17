@@ -1,22 +1,20 @@
-//! Buffer pool + disk layout simulator.
+//! Buffer pool simulator.
 //!
-//! Pipeline: a [`Workload`] (TOML) plus a seed produces a [`trace::Trace`] up
-//! front. A [`Simulator`] replays that trace through a buffer pool with a
-//! pluggable replacement [`policy::Policy`], optionally reclustering tables on
-//! disk as it goes.
+//! A trace of page accesses comes either from a page trace captured from
+//! SQLite ([`CapturedTrace`]) or from a synthetic [`Workload`] (TOML) plus a
+//! seed. A [`Simulator`] replays it through a buffer pool with a pluggable
+//! replacement [`policy::Policy`].
 //!
-//! All randomness lives in trace generation. Policies and reclustering are
-//! deterministic, so two runs with the same seed see the identical access
-//! stream and differ only in the knob being tested (paired A/B comparison).
+//! All randomness lives in trace generation and policies are deterministic,
+//! so every policy sees the identical access stream (paired comparison).
 //!
 //! This crate does no file I/O so it can be compiled to WebAssembly.
 
 pub mod capture;
-pub mod layout;
 pub mod policy;
 pub mod run;
 pub mod sim;
-pub mod snapshot;
+pub mod summary;
 pub mod trace;
 pub mod workload;
 

@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::capture::{CapturedTrace, ObjectInfo, PageInfo, PageRows};
 use crate::sim::{Event, Simulator};
-use crate::snapshot::RunSummary;
+use crate::summary::RunSummary;
 use crate::workload::CostModel;
 
 pub const FORMAT: &str = "bpsim-run";

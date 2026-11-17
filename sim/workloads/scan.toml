@@ -3,7 +3,7 @@
 # policy does well. From tick 2001, 5% of queries also scan 100 consecutive
 # pages, which flushes the hot set out of FIFO/LRU/Clock. The PostgreSQL-style
 # scan ring and InnoDB-style midpoint insertion keep most of it. Compare
-# policies with --recluster=false.
+# policies with --policy all.
 
 name = "scan"
 description = "Small hot set; long sequential scans start at tick 2001."

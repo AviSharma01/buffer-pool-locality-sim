@@ -3,7 +3,6 @@ mod cli;
 use std::fs;
 use std::path::Path;
 
-use bpsim::layout::MAX_RECLUSTER_TABLES;
 use bpsim::run::RunFile;
 use bpsim::{CapturedTrace, PolicyKind, SimConfig, Simulator, Workload, build_scenario};
 use chrono::Local;
@@ -36,7 +35,7 @@ struct SummaryFile<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     seed: Option<u64>,
     #[serde(flatten)]
-    run: bpsim::snapshot::RunSummary,
+    run: bpsim::summary::RunSummary,
 }
 
 /// What a run replays: a seeded synthetic workload or a captured SQLite trace.
@@ -53,20 +52,10 @@ impl Input {
         }
     }
 
-    fn mode(&self, args: &Cli) -> &'static str {
-        match self {
-            Input::Trace(_) => "replay",
-            Input::Workload(_) if args.recluster => "recluster",
-            Input::Workload(_) => "no_recluster",
-        }
-    }
-
     fn simulator(&self, policy: PolicyKind, args: &Cli) -> Simulator {
         let cfg = SimConfig {
             frames: args.frames,
             policy,
-            recluster_every: args.recluster.then_some(args.recluster_every),
-            co_access_decay: args.co_access_decay,
         };
         match self {
             Input::Trace(t) => {
@@ -74,10 +63,11 @@ impl Input {
                 sim.record_events();
                 sim
             }
-            Input::Workload(w) => {
-                let (trace, initial_layout) = build_scenario(w, args.seed, args.ticks);
-                Simulator::new(trace, initial_layout, w.cost.clone(), cfg)
-            }
+            Input::Workload(w) => Simulator::new(
+                build_scenario(w, args.seed, args.ticks),
+                w.cost.clone(),
+                cfg,
+            ),
         }
     }
 }
@@ -117,13 +107,6 @@ fn load_workload(args: &Cli) -> Result<Input, String> {
         None => Workload::builtin_default(),
     };
     check_frames(args.frames, workload.total_pages(), "workload")?;
-    if args.recluster && workload.num_tables > MAX_RECLUSTER_TABLES {
-        return Err(format!(
-            "reclustering is brute force (n!) and supports at most {MAX_RECLUSTER_TABLES} tables; \
-             this workload has {}. Use --recluster=false",
-            workload.num_tables
-        ));
-    }
     Ok(Input::Workload(workload))
 }
 
@@ -155,7 +138,6 @@ fn run(args: Cli) -> Result<(), String> {
         None => load_workload(&args)?,
     };
     let name = input.name().to_string();
-    let mode = input.mode(&args);
     let policies = &args.policy.0;
     let compare = policies.len() > 1;
 
@@ -165,11 +147,7 @@ fn run(args: Cli) -> Result<(), String> {
     } else {
         policies[0].name()
     };
-    let run_dir = args.out.join(&name).join(folder).join(mode).join(ts);
-    let snapshot_every = args.snapshot_every.unwrap_or(match input {
-        Input::Trace(_) => 1,
-        Input::Workload(_) => 10,
-    });
+    let run_dir = args.out.join(&name).join(folder).join(ts);
 
     let mut sims = Vec::with_capacity(policies.len());
     for &policy in policies {
@@ -179,31 +157,13 @@ fn run(args: Cli) -> Result<(), String> {
         } else {
             run_dir.clone()
         };
-        let snap_dir = dir.join("snapshots");
-        create_dir(&snap_dir)?;
-
-        while let Some(ev) = sim.step() {
-            // The layout does not depend on the policy, so print it once.
-            if ev.reclustered && sims.is_empty() {
-                println!("tick {}: recluster → order: {:?}", ev.tick, sim.layout());
-            }
-            if snapshot_every > 0 && ev.tick % snapshot_every == 0 {
-                write_json(
-                    &snap_dir.join(format!("{:06}.json", ev.tick)),
-                    &sim.snapshot(),
-                )?;
-            }
-        }
+        create_dir(&dir)?;
+        while sim.step().is_some() {}
 
         let summary = sim.summary();
         println!(
-            "{} | {} | frames {} | {} | hit rate {:.3} | mean cost/query {:.2}",
-            name,
-            summary.policy,
-            summary.frames,
-            mode,
-            summary.hit_rate,
-            summary.mean_cost_per_query
+            "{} | {} | frames {} | hit rate {:.3} | mean cost/query {:.2}",
+            name, summary.policy, summary.frames, summary.hit_rate, summary.mean_cost_per_query
         );
         let is_trace = matches!(input, Input::Trace(_));
         write_json(

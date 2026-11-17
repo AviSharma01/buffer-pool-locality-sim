@@ -1,7 +1,7 @@
 //! Access traces: the full, pre-generated stream of page accesses a run
 //! replays. Generating the trace up front (rather than sampling during the
 //! run) is what lets the optimal policy look into the future and guarantees
-//! every policy/layout variant sees the identical stream.
+//! every policy sees the identical stream.
 
 use std::collections::HashMap;
 use std::ops::Range;

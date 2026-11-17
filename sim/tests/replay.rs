@@ -19,23 +19,15 @@ fn shop() -> CapturedTrace {
     load("shop")
 }
 
-fn checkout(policy: PolicyKind, frames: usize) -> bpsim::snapshot::RunSummary {
-    let cfg = SimConfig {
-        frames,
-        policy,
-        ..SimConfig::default()
-    };
+fn checkout(policy: PolicyKind, frames: usize) -> bpsim::summary::RunSummary {
+    let cfg = SimConfig { frames, policy };
     let mut sim = load("checkout").simulator(cfg);
     while sim.step().is_some() {}
     sim.summary()
 }
 
 fn run(policy: PolicyKind, frames: usize, record: bool) -> Simulator {
-    let cfg = SimConfig {
-        frames,
-        policy,
-        ..SimConfig::default()
-    };
+    let cfg = SimConfig { frames, policy };
     let mut sim = shop().simulator(cfg);
     if record {
         sim.record_events();
@@ -44,7 +36,7 @@ fn run(policy: PolicyKind, frames: usize, record: bool) -> Simulator {
     sim
 }
 
-fn replay(policy: PolicyKind, frames: usize) -> bpsim::snapshot::RunSummary {
+fn replay(policy: PolicyKind, frames: usize) -> bpsim::summary::RunSummary {
     run(policy, frames, false).summary()
 }
 
@@ -100,7 +92,6 @@ fn lru_with_8_frames_matches_the_design_numbers() {
     assert_eq!((s.hits, s.misses), (15, 30));
     // The update dirtied pages 1 and 5; the report later pushes both out.
     assert_eq!(s.dirty_evictions, 2);
-    assert_eq!(s.reclusters, 0);
 }
 
 #[test]

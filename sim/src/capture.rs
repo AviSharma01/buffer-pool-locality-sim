@@ -3,8 +3,8 @@
 //! database for the viewer and are passed through to the run file.
 //!
 //! The captured database file is modelled as a single "table" whose page ids
-//! are SQLite's own page numbers, so seek distance is the real distance
-//! between pages in the file and reclustering has nothing to reorder.
+//! are SQLite's own page numbers, so distance on disk is the real distance
+//! between pages in the file.
 //!
 //! SQLite logs a write when a statement commits, after the statement already
 //! read and changed that page in memory. Replaying the write as its own request
@@ -160,13 +160,9 @@ impl CapturedTrace {
         Trace::from_queries(1, self.page_count + 1, queries)
     }
 
-    /// A simulator ready to replay this trace. Reclustering never applies.
+    /// A simulator ready to replay this trace.
     pub fn simulator(&self, cfg: SimConfig) -> Simulator {
-        let cfg = SimConfig {
-            recluster_every: None,
-            ..cfg
-        };
-        Simulator::new(self.to_trace(), vec![0], CostModel::default(), cfg)
+        Simulator::new(self.to_trace(), CostModel::default(), cfg)
     }
 }
 
@@ -271,7 +267,6 @@ mod tests {
         let mut sim = t.simulator(SimConfig {
             frames: 2,
             policy: crate::PolicyKind::Lru,
-            ..SimConfig::default()
         });
         while sim.step().is_some() {}
         let s = sim.summary();

@@ -1,5 +1,5 @@
-//! Behavioural tests for the engine: regression against v0.1, policy
-//! guarantees from the literature, and the paired-comparison invariant.
+//! Behavioural tests for the engine: regression against v0.1 and policy
+//! guarantees from the literature.
 
 use bpsim::{PolicyKind, SimConfig, Simulator, Workload};
 
@@ -8,74 +8,46 @@ fn workload(file: &str) -> Workload {
     Workload::from_toml(&std::fs::read_to_string(&path).unwrap()).unwrap()
 }
 
-fn cfg(policy: PolicyKind, frames: usize, recluster: bool) -> SimConfig {
-    SimConfig {
-        frames,
-        policy,
-        recluster_every: recluster.then_some(500),
-        ..SimConfig::default()
-    }
+fn cfg(policy: PolicyKind, frames: usize) -> SimConfig {
+    SimConfig { frames, policy }
 }
 
 fn misses(w: &Workload, seed: u64, ticks: u64, policy: PolicyKind, frames: usize) -> u64 {
-    Simulator::run(w, seed, ticks, cfg(policy, frames, false))
+    Simulator::run(w, seed, ticks, cfg(policy, frames))
         .metrics()
         .misses
 }
 
-/// The refactored engine must reproduce the v0.1 seed-42 results bit for bit
-/// (numbers from the original README / snapshot 005000.json).
+/// The engine must still cache exactly as v0.1 did for seed 42 (numbers from
+/// the original README / snapshot 005000.json, tag v0.1). Costs are not
+/// compared: v0.1 also charged for where reclustering had moved each table.
 #[test]
 fn reproduces_v0_1_seed_42() {
-    let w = Workload::builtin_default();
-
-    let on = Simulator::run(&w, 42, 5000, cfg(PolicyKind::Clock, 64, true));
-    let s = on.summary();
-    assert_eq!(s.final_avg_cost_ema, 82.32561358114384);
-    assert_eq!(s.final_locality_ema, 1.15550556352084);
+    let s = Simulator::run(
+        &Workload::builtin_default(),
+        42,
+        5000,
+        cfg(PolicyKind::Clock, 64),
+    )
+    .summary();
     assert_eq!(s.hit_rate, 0.2860001446515104);
     assert_eq!((s.evictions, s.dirty_evictions), (29552, 2060));
-    assert_eq!(s.final_layout, vec![3, 4, 2, 0, 1, 5]);
-
-    let off = Simulator::run(&w, 42, 5000, cfg(PolicyKind::Clock, 64, false));
-    let s = off.summary();
-    assert_eq!(s.final_avg_cost_ema, 87.43163167490162);
-    assert_eq!(s.final_locality_ema, 2.0167927875805627);
-    assert_eq!(s.final_layout, vec![4, 2, 1, 0, 5, 3]);
 }
 
 #[test]
 fn same_seed_is_deterministic() {
-    let w = workload("drift.toml");
+    let w = workload("scan.toml");
     for kind in PolicyKind::ALL {
-        let a = Simulator::run(&w, 7, 800, cfg(kind, 32, true));
-        let b = Simulator::run(&w, 7, 800, cfg(kind, 32, true));
+        let a = Simulator::run(&w, 7, 800, cfg(kind, 32));
+        let b = Simulator::run(&w, 7, 800, cfg(kind, 32));
         assert_eq!(a.summary(), b.summary(), "{kind}");
-        assert_eq!(a.snapshot(), b.snapshot(), "{kind}");
-    }
-}
-
-/// Reclustering changes only where pages live on disk, never which pages are
-/// cached, so hits/misses/evictions must be identical with and without it.
-/// This is what makes the A/B comparison paired.
-#[test]
-fn reclustering_never_changes_cache_behaviour() {
-    let w = Workload::builtin_default();
-    for kind in PolicyKind::ALL {
-        let on = Simulator::run(&w, 11, 1500, cfg(kind, 64, true)).summary();
-        let off = Simulator::run(&w, 11, 1500, cfg(kind, 64, false)).summary();
-        assert_eq!(
-            (on.hits, on.misses, on.evictions),
-            (off.hits, off.misses, off.evictions),
-            "{kind}"
-        );
     }
 }
 
 /// Belady's MIN is optimal: no policy may miss less on the same trace.
 #[test]
 fn opt_is_a_lower_bound() {
-    for file in ["default.toml", "scan.toml", "drift.toml"] {
+    for file in ["default.toml", "scan.toml"] {
         let w = workload(file);
         for seed in 1..=4 {
             for frames in [8, 64, 200] {
@@ -148,5 +120,5 @@ fn shipped_workloads_are_valid() {
             n += 1;
         }
     }
-    assert!(n >= 4);
+    assert!(n >= 3);
 }
