@@ -60,16 +60,58 @@ fn replay(policy: PolicyKind, frames: usize) -> bpsim::summary::RunSummary {
     run(policy, frames, false).summary()
 }
 
-/// LRU with 8 frames, recounted by hand from the run files: the report's scan
-/// of orders reads 14 pages in a row; checkout's reads are almost all random.
 const TRACES: [&str; 5] = ["shop", "checkout", "growth", "growth-vacuum", "shop-vacuum"];
-const SHOP_LRU_SEQ: u64 = 16;
-const SHOP_LRU_RANDOM: u64 = 14;
-const CHECKOUT_LRU_SEQ: u64 = 2;
-const CHECKOUT_LRU_RANDOM: u64 = 30;
-/// The restock splits a full page into page 32, which SQLite writes without
-/// reading: that miss fills a frame with no disk read.
-const CHECKOUT_FRESH: u64 = 1;
+
+/// LRU with 8 frames: next-page, further-on and jump reads, and total time on
+/// SSD and HDD. From the independent model in the 3.4b check (the reviewer's
+/// policy model with the pricing rules written from the plan), which agreed
+/// with the engine on 708 runs.
+struct Pinned {
+    name: &'static str,
+    reads: (u64, u64, u64),
+    fresh: u64,
+    ssd_ms: f64,
+    hdd_ms: f64,
+}
+const LRU_8: [Pinned; 5] = [
+    Pinned {
+        name: "shop",
+        reads: (18, 7, 5),
+        fresh: 0,
+        ssd_ms: 1.3647,
+        hdd_ms: 99.4415,
+    },
+    // The restock splits a full page into page 32, which SQLite writes
+    // without reading: that miss fills a frame with no disk read.
+    Pinned {
+        name: "checkout",
+        reads: (7, 12, 13),
+        fresh: 1,
+        ssd_ms: 1.6432,
+        hdd_ms: 397.3618,
+    },
+    Pinned {
+        name: "growth",
+        reads: (12, 77, 6),
+        fresh: 0,
+        ssd_ms: 4.2373,
+        hdd_ms: 100.6803,
+    },
+    Pinned {
+        name: "growth-vacuum",
+        reads: (84, 5, 6),
+        fresh: 0,
+        ssd_ms: 4.2373,
+        hdd_ms: 98.3403,
+    },
+    Pinned {
+        name: "shop-vacuum",
+        reads: (16, 7, 7),
+        fresh: 0,
+        ssd_ms: 1.3647,
+        hdd_ms: 124.7415,
+    },
+];
 
 /// The report (query 4) scans orders; queries 5..9 repeat the lookups.
 const REPORT: usize = 4;
@@ -309,16 +351,17 @@ fn storage_never_changes_what_is_cached() {
                     (hdd.hits, hdd.evictions, hdd.dirty_evictions),
                     "{what}"
                 );
-                assert_eq!(
-                    (ssd.sequential_reads, ssd.random_reads),
-                    (hdd.sequential_reads, hdd.random_reads),
-                    "{what}"
-                );
-                assert_eq!(
-                    ssd.sequential_reads + ssd.random_reads + ssd.fresh_pages,
-                    ssd.misses,
-                    "{what}"
-                );
+                let reads = |s: &bpsim::summary::RunSummary| {
+                    (
+                        s.next_page_reads,
+                        s.ahead_reads,
+                        s.jump_reads,
+                        s.fresh_pages,
+                    )
+                };
+                assert_eq!(reads(&ssd), reads(&hdd), "{what}");
+                let (next, ahead, jump, fresh) = reads(&ssd);
+                assert_eq!(next + ahead + jump + fresh, ssd.misses, "{what}");
                 assert!(hdd.total_ms > ssd.total_ms, "{what}");
             }
         }
@@ -326,73 +369,67 @@ fn storage_never_changes_what_is_cached() {
 }
 
 #[test]
-fn shop_and_checkout_reads_and_times_with_8_frames() {
-    let s = summary("shop", PolicyKind::Lru, 8, StorageKind::Ssd);
-    assert_eq!(
-        (s.sequential_reads, s.random_reads),
-        (SHOP_LRU_SEQ, SHOP_LRU_RANDOM)
-    );
-    // 15 hits, the reads above and 2 write-backs, priced per page.
-    let expect = |p: bpsim::storage::Profile| {
-        15.0 * p.hit_ms
-            + SHOP_LRU_SEQ as f64 * p.sequential_read_ms
-            + SHOP_LRU_RANDOM as f64 * p.random_read_ms
-            + 2.0 * p.write_ms
-    };
-    assert!((s.total_ms - expect(StorageKind::Ssd.profile())).abs() < 1e-9);
-    let h = summary("shop", PolicyKind::Lru, 8, StorageKind::Hdd);
-    assert!((h.total_ms - expect(StorageKind::Hdd.profile())).abs() < 1e-9);
-
-    let c = summary("checkout", PolicyKind::Lru, 8, StorageKind::Ssd);
-    assert_eq!(
-        (c.sequential_reads, c.random_reads, c.fresh_pages),
-        (CHECKOUT_LRU_SEQ, CHECKOUT_LRU_RANDOM, CHECKOUT_FRESH)
-    );
-}
-
-/// Orders and their event log grew side by side, so a scan of either jumps
-/// across the file. VACUUM puts each in one run: the same hits, but most
-/// reads become sequential, which is what a hard drive rewards.
-#[test]
-fn vacuum_turns_scattered_scans_into_sequential_reads() {
-    let lru = |name| summary(name, PolicyKind::Lru, 8, StorageKind::Hdd);
-    let (grown, vacuumed) = (lru("growth"), lru("growth-vacuum"));
-    assert_eq!(
-        (grown.hits, grown.sequential_reads, grown.random_reads),
-        (3, 12, 83)
-    );
-    assert_eq!(
-        (
-            vacuumed.hits,
-            vacuumed.sequential_reads,
-            vacuumed.random_reads
-        ),
-        (3, 84, 11)
-    );
-    assert!(grown.total_ms > 7.0 * vacuumed.total_ms);
-    for kind in PolicyKind::ALL {
-        for storage in StorageKind::ALL {
-            let [g, v] = ["growth", "growth-vacuum"].map(|n| summary(n, kind, 8, storage));
-            assert_eq!(g.hits, v.hits, "{kind} {storage}");
-            assert!(v.random_reads < g.random_reads, "{kind} {storage}");
-            assert!(v.total_ms < g.total_ms, "{kind} {storage}");
-        }
+fn reads_and_times_with_8_frames_match_the_independent_model() {
+    for p in LRU_8 {
+        let [ssd, hdd] = StorageKind::ALL.map(|s| summary(p.name, PolicyKind::Lru, 8, s));
+        assert_eq!(
+            (ssd.next_page_reads, ssd.ahead_reads, ssd.jump_reads),
+            p.reads,
+            "{}",
+            p.name
+        );
+        assert_eq!(ssd.fresh_pages, p.fresh, "{}", p.name);
+        assert!(
+            (ssd.total_ms - p.ssd_ms).abs() < 1e-9,
+            "{}: {}",
+            p.name,
+            ssd.total_ms
+        );
+        assert!(
+            (hdd.total_ms - p.hdd_ms).abs() < 1e-9,
+            "{}: {}",
+            p.name,
+            hdd.total_ms
+        );
     }
 }
 
-/// VACUUM is not always a win. Shop's scan was already in one run, and its
+/// Orders and their event log grew side by side, so orders' pages are 2 to 4
+/// apart. In 3.3 only the very next page was cheap, so this layout looked 7x
+/// slower on a hard drive; that was an artefact. Reading a few pages further
+/// on costs a hard drive only the time for the skipped pages to pass under
+/// the head, and an SSD nothing extra, so VACUUM barely changes the time here:
+/// it pays off once pages can be read in fewer, larger requests (read-ahead).
+#[test]
+fn vacuum_barely_changes_the_time_of_finely_interleaved_tables() {
+    for kind in PolicyKind::ALL {
+        let [g, v] = ["growth", "growth-vacuum"].map(|n| summary(n, kind, 8, StorageKind::Ssd));
+        assert_eq!(g.hits, v.hits, "{kind}");
+        assert!(
+            (g.total_ms - v.total_ms).abs() < 1e-9,
+            "{kind}: an SSD has no head"
+        );
+        let [g, v] = ["growth", "growth-vacuum"].map(|n| summary(n, kind, 8, StorageKind::Hdd));
+        let ratio = g.total_ms / v.total_ms;
+        assert!((1.0..1.05).contains(&ratio), "{kind}: {ratio}");
+        assert!(v.next_page_reads > 5 * g.next_page_reads, "{kind}");
+    }
+}
+
+/// VACUUM can make things slower. Shop's scan was already in one run, and its
 /// lookups read a user's index entry and row, which were written side by side
-/// as the table grew. VACUUM separates them, so two reads that were sequential
-/// become random.
+/// as the table grew. VACUUM separates them, so on a hard drive two cheap
+/// reads become jumps.
 #[test]
 fn vacuum_can_cost_reads_when_rows_were_already_near_each_other() {
-    let lru = |name| summary(name, PolicyKind::Lru, 8, StorageKind::Ssd);
+    let lru = |name| summary(name, PolicyKind::Lru, 8, StorageKind::Hdd);
     let (grown, vacuumed) = (lru("shop"), lru("shop-vacuum"));
     assert_eq!(grown.hits, vacuumed.hits);
-    assert_eq!(
-        (vacuumed.sequential_reads, vacuumed.random_reads),
-        (SHOP_LRU_SEQ - 2, SHOP_LRU_RANDOM + 2)
-    );
+    assert_eq!(vacuumed.jump_reads, grown.jump_reads + 2);
+    for kind in PolicyKind::ALL {
+        let [s, v] = ["shop", "shop-vacuum"].map(|n| summary(n, kind, 8, StorageKind::Hdd));
+        assert!(v.total_ms > 1.1 * s.total_ms, "{kind}");
+    }
     let find_by_email = |name| {
         let q = &load(name).queries[2];
         assert_eq!(q.title, "Find user by email");
@@ -401,4 +438,56 @@ fn vacuum_can_cost_reads_when_rows_were_already_near_each_other() {
     // Index leaf, then the cached users root, then the user's leaf right after it.
     assert_eq!(find_by_email("shop"), [1, 3, 29, 2, 30]);
     assert_eq!(find_by_email("shop-vacuum"), [1, 4, 52, 2, 21]);
+}
+
+/// Price a recorded run under any profile, the way the viewer does.
+fn priced_with(name: &str, policy: PolicyKind, frames: usize, p: bpsim::storage::Profile) -> f64 {
+    let cfg = SimConfig {
+        frames,
+        policy,
+        ..SimConfig::default()
+    };
+    let mut sim = load(name).simulator(cfg);
+    sim.record_events();
+    while sim.step().is_some() {}
+    sim.events()
+        .iter()
+        .map(|e| match (e.outcome, e.read) {
+            (Outcome::Hit, _) => p.hit_ms,
+            (Outcome::Miss { evicted }, read) => {
+                read.map_or(0.0, |r| p.read_ms(r, 1))
+                    + if evicted.is_some_and(|v| v.dirty) {
+                        p.write_ms()
+                    } else {
+                        0.0
+                    }
+            }
+        })
+        .sum()
+}
+
+/// The hard drive's 0.2 ms overhead for reading further on is the one
+/// assumed figure. The lessons drawn from it must hold from 0.05 to 2 ms:
+/// growth and growth-vacuum stay within 5%, and shop-vacuum stays slower.
+#[test]
+fn the_vacuum_lessons_hold_for_any_reasonable_drive_overhead() {
+    for near in [0.05, 0.1, 0.2, 0.5, 1.0, 2.0] {
+        let p = bpsim::storage::Profile {
+            near_request_ms: near,
+            ..StorageKind::Hdd.profile()
+        };
+        for kind in PolicyKind::ALL {
+            let [g, v, s, sv] = ["growth", "growth-vacuum", "shop", "shop-vacuum"]
+                .map(|n| priced_with(n, kind, 8, p));
+            assert!(
+                (1.0..1.05).contains(&(g / v)),
+                "{near} ms, {kind}: growth {g} vs {v}"
+            );
+            assert!(sv > 1.1 * s, "{near} ms, {kind}: shop-vacuum {sv} vs {s}");
+        }
+    }
+    // At the profile's own figure, pricing events matches the engine's total.
+    let hdd = StorageKind::Hdd.profile();
+    let engine = summary("checkout", PolicyKind::Pg, 8, StorageKind::Hdd).total_ms;
+    assert!((priced_with("checkout", PolicyKind::Pg, 8, hdd) - engine).abs() < 1e-9);
 }

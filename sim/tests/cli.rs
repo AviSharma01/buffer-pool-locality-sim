@@ -186,7 +186,7 @@ fn comparing_policies_writes_one_run_file_that_adds_up() {
     let run_file = read_json(&run.join("run.json"));
     assert_eq!(
         (&run_file["format"], &run_file["version"]),
-        (&Value::from("bpsim-run"), &Value::from(3))
+        (&Value::from("bpsim-run"), &Value::from(4))
     );
     assert_eq!(run_file["storage"], "ssd");
     assert_eq!(run_file["frames"], 8);
@@ -222,10 +222,14 @@ fn comparing_policies_writes_one_run_file_that_adds_up() {
     assert_eq!(embedded_run(&run.join("viewer.html")), run_file);
 }
 
-/// What the viewer does: price each event from its kind with a profile from
-/// the run file.
+/// What the viewer does: price each event from what it records, with a
+/// profile from the run file. Written from the model's description, not from
+/// the engine's code: a read request is a fixed part plus one page; reading
+/// further on from the last page read pays the near overhead plus the
+/// skipped pages, never more than a jump.
 fn priced(events: &[Value], profile: &Value) -> f64 {
     let ms = |key: &str| profile[key].as_f64().unwrap();
+    let (jump, near, page) = (ms("read_request_ms"), ms("near_request_ms"), ms("page_ms"));
     events
         .iter()
         .map(|e| {
@@ -233,12 +237,16 @@ fn priced(events: &[Value], profile: &Value) -> f64 {
                 None if e["kind"] == "hit" => ms("hit_ms"),
                 // A page SQLite wrote without reading: no disk read.
                 None => 0.0,
-                Some("sequential") => ms("sequential_read_ms"),
-                Some("random") => ms("random_read_ms"),
+                Some("next") => near.min(jump) + page,
+                Some("ahead") => {
+                    let skipped = e["skipped"].as_f64().unwrap();
+                    (near + skipped * page).min(jump) + page
+                }
+                Some("jump") => jump + page,
                 Some(other) => panic!("unknown read kind {other}"),
             };
             let writeback = if e["evicted"]["dirty"] == true {
-                ms("write_ms")
+                ms("write_request_ms") + page
             } else {
                 0.0
             };

@@ -1,12 +1,15 @@
-//! The run file (format `bpsim-run`, version 3): one captured trace replayed
+//! The run file (format `bpsim-run`, version 4): one captured trace replayed
 //! through one or more policies with every access explained. The CLI writes it
 //! as `run.json` and builds it into `viewer.html`.
 //!
 //! Shape: the trace's description (objects, pages, queries, rows, notes), the
 //! pool size and storage profiles, then per policy its summary and one
 //! [`Event`](crate::sim::Event) per access, each with every frame after it.
-//! Version 3: a miss on a page SQLite wrote without reading has no `read`
-//! (summary `fresh_pages`), and pages on the freelist have `object: null`.
+//! A miss that read its page has `read` (next, ahead with `skipped`, or
+//! jump: where it was relative to the last page read); a miss on a page SQLite
+//! wrote without reading has none (summary `fresh_pages`). Pages on the
+//! freelist have `object: null`. Every storage profile is included, so a
+//! viewer can price the same events for any of them.
 
 use std::collections::BTreeMap;
 
@@ -18,7 +21,7 @@ use crate::storage::{Profile, StorageKind};
 use crate::summary::RunSummary;
 
 pub const FORMAT: &str = "bpsim-run";
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 #[derive(Serialize)]
 pub struct RunFile<'a> {

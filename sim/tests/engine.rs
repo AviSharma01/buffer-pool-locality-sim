@@ -142,18 +142,8 @@ fn storage_never_changes_cache_behaviour() {
                 Simulator::run(&w, 9, 1500, c).summary()
             });
             assert_eq!(
-                (
-                    ssd.hits,
-                    ssd.evictions,
-                    ssd.dirty_evictions,
-                    ssd.random_reads
-                ),
-                (
-                    hdd.hits,
-                    hdd.evictions,
-                    hdd.dirty_evictions,
-                    hdd.random_reads
-                ),
+                (ssd.hits, ssd.evictions, ssd.dirty_evictions, ssd.jump_reads),
+                (hdd.hits, hdd.evictions, hdd.dirty_evictions, hdd.jump_reads),
                 "{file} {kind}"
             );
             assert!(hdd.total_ms > ssd.total_ms, "{file} {kind}");
@@ -161,7 +151,7 @@ fn storage_never_changes_cache_behaviour() {
     }
 }
 
-/// A scan reads consecutive pages, so most of its misses are sequential.
+/// A scan reads consecutive pages, so most of its misses are next-page reads.
 #[test]
 fn scans_read_sequentially() {
     let s = Simulator::run(&workload("scan.toml"), 3, 5000, cfg(PolicyKind::Lru, 64)).summary();
@@ -172,7 +162,7 @@ fn scans_read_sequentially() {
         cfg(PolicyKind::Lru, 64),
     )
     .summary();
-    let share = |s: &bpsim::summary::RunSummary| s.sequential_reads as f64 / s.misses as f64;
+    let share = |s: &bpsim::summary::RunSummary| s.next_page_reads as f64 / s.misses as f64;
     assert!(share(&s) > 0.5, "scan workload: {}", share(&s));
     assert!(
         share(&s) > 2.0 * share(&w),
@@ -311,23 +301,25 @@ fn guarantees_hold_on_random_traces() {
                     "{what}"
                 );
                 assert_eq!(
-                    ssd.sequential_reads + ssd.random_reads + ssd.fresh_pages,
+                    ssd.next_page_reads + ssd.ahead_reads + ssd.jump_reads + ssd.fresh_pages,
                     ssd.misses,
                     "{what}"
                 );
                 assert_eq!(
                     (
                         ssd.hits,
-                        ssd.sequential_reads,
-                        ssd.random_reads,
+                        ssd.next_page_reads,
+                        ssd.ahead_reads,
+                        ssd.jump_reads,
                         ssd.fresh_pages,
                         ssd.evictions,
                         ssd.dirty_evictions
                     ),
                     (
                         hdd.hits,
-                        hdd.sequential_reads,
-                        hdd.random_reads,
+                        hdd.next_page_reads,
+                        hdd.ahead_reads,
+                        hdd.jump_reads,
                         hdd.fresh_pages,
                         hdd.evictions,
                         hdd.dirty_evictions

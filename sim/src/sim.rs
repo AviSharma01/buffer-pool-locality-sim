@@ -169,8 +169,12 @@ impl Default for SimConfig {
 pub struct Metrics {
     pub hits: u64,
     pub misses: u64,
-    pub sequential_reads: u64,
-    pub random_reads: u64,
+    /// Reads of the page right after the last page read.
+    pub next_page_reads: u64,
+    /// Reads further on, with pages skipped in between.
+    pub ahead_reads: u64,
+    /// Reads backwards, or the first: a full random request.
+    pub jump_reads: u64,
     /// Misses on pages SQLite wrote without reading: no disk read.
     pub fresh_pages: u64,
     pub evictions: u64,
@@ -210,8 +214,10 @@ pub struct Event {
     pub frame: FrameIdx,
     #[serde(flatten)]
     pub outcome: Outcome,
-    /// For a miss: whether the page was read sequentially or at random.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// For a miss that read the page: where it was relative to the last page
+    /// read (`read`: next, ahead with `skipped`, or jump). None for a hit or
+    /// a page SQLite wrote without reading.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub read: Option<Read>,
     /// In the order the policy did them.
     pub notes: Vec<Note>,
@@ -225,9 +231,9 @@ pub struct Simulator {
     cfg: SimConfig,
     pool: BufferPool,
     next_query: usize,
-    /// The last page the device read or wrote. Pages sit on disk in id
-    /// order, so the next one is a sequential read.
-    head: Option<PageId>,
+    /// The last page read from the device: where the read stream is. Pages
+    /// sit on disk in id order.
+    last_read: Option<PageId>,
     metrics: Metrics,
     log: Log,
     events: Option<Vec<Event>>,
@@ -242,7 +248,7 @@ impl Simulator {
             trace,
             cfg,
             next_query: 0,
-            head: None,
+            last_read: None,
             metrics: Metrics::default(),
             log: Log::default(),
             events: None,
@@ -327,12 +333,11 @@ impl Simulator {
                 let mut ms = 0.0;
                 if let Some(e) = evicted {
                     self.metrics.evictions += 1;
-                    // The modified page goes out first, so the device ends
-                    // up at that page before it reads the new one.
+                    // The modified page goes out first, as its own write
+                    // request; the read stream carries on where it was.
                     if e.dirty {
                         self.metrics.dirty_evictions += 1;
-                        ms += profile.write_ms;
-                        self.head = Some(e.page);
+                        ms += profile.write_ms();
                     }
                 }
                 if a.fresh {
@@ -341,15 +346,14 @@ impl Simulator {
                     self.metrics.fresh_pages += 1;
                     return self.record(a, ctx, frame, outcome, None, ms);
                 }
-                let read = if self.head.is_some_and(|h| h.checked_add(1) == Some(a.page)) {
-                    self.metrics.sequential_reads += 1;
-                    Read::Sequential
-                } else {
-                    self.metrics.random_reads += 1;
-                    Read::Random
-                };
-                self.head = Some(a.page);
-                (Some(read), ms + profile.read_ms(read))
+                let read = Read::of(a.page, self.last_read);
+                match read {
+                    Read::Next => self.metrics.next_page_reads += 1,
+                    Read::Ahead { .. } => self.metrics.ahead_reads += 1,
+                    Read::Jump => self.metrics.jump_reads += 1,
+                }
+                self.last_read = Some(a.page);
+                (Some(read), ms + profile.read_ms(read, 1))
             }
         };
         self.record(a, ctx, frame, outcome, read, ms)
@@ -393,9 +397,11 @@ impl Simulator {
             hits: m.hits,
             misses: m.misses,
             hit_rate: m.hit_rate(),
-            sequential_reads: m.sequential_reads,
-            random_reads: m.random_reads,
+            next_page_reads: m.next_page_reads,
+            ahead_reads: m.ahead_reads,
+            jump_reads: m.jump_reads,
             fresh_pages: m.fresh_pages,
+            dirty_at_end: self.pool.frame_views().iter().filter(|f| f.dirty).count() as u64,
             evictions: m.evictions,
             dirty_evictions: m.dirty_evictions,
             total_ms: m.total_ms,
@@ -438,36 +444,49 @@ mod tests {
     }
 
     #[test]
-    fn reads_are_sequential_only_right_after_the_last_page_touched() {
-        use Read::{Random, Sequential};
+    fn reads_are_placed_relative_to_the_last_page_read() {
+        use Read::{Ahead, Jump, Next};
         let (kinds, m) = reads(
             &[
-                (5, false),  // first read of the run: random
+                (5, false),  // first read of the run: a jump
                 (6, false),  // next page
-                (8, false),  // skips one
-                (9, false),  // next page, in the next query: the device stays put
-                (3, true),   // random, and now modified
-                (4, false),  // 3 is written back first, so 4 follows it
-                (7, true),   // random
-                (12, false), // 7 is written back; 12 is not next to it
+                (8, false),  // one page further on
+                (9, false),  // next page, in the next query: the stream carries on
+                (3, true),   // backwards: a jump, and now modified
+                (4, false),  // 3 is written back first, but 4 still follows 3's read
+                (7, true),   // further on
+                (12, false), // 7 is written back; 12 is 4 pages on from 7's read
             ],
             3,
         );
         let expect = [
-            Random, Sequential, Random, Sequential, Random, Sequential, Random, Random,
+            Jump,
+            Next,
+            Ahead { skipped: 1 },
+            Next,
+            Jump,
+            Next,
+            Ahead { skipped: 2 },
+            Ahead { skipped: 4 },
         ];
         assert_eq!(kinds, expect.map(Some));
         assert_eq!(
-            (m.sequential_reads, m.random_reads, m.dirty_evictions),
-            (3, 5, 2)
+            (
+                m.next_page_reads,
+                m.ahead_reads,
+                m.jump_reads,
+                m.dirty_evictions
+            ),
+            (3, 3, 2, 2)
         );
         let p = StorageKind::Hdd.profile();
-        let ms = 3.0 * p.sequential_read_ms + 5.0 * p.random_read_ms + 2.0 * p.write_ms;
+        let ms: f64 = expect.iter().map(|&r| p.read_ms(r, 1)).sum::<f64>() + 2.0 * p.write_ms();
         assert!((m.total_ms - ms).abs() < 1e-9, "{} vs {ms}", m.total_ms);
     }
 
     /// A page SQLite writes without reading costs no read and leaves the
-    /// device where it was: page 7 below is not "next" after the fresh page 6.
+    /// read stream where it was: page 7 below is one page on from 5, not
+    /// "next" after the fresh page 6.
     #[test]
     fn a_page_written_without_reading_needs_no_read() {
         let a = |page, fresh| Access {
@@ -486,17 +505,55 @@ mod tests {
         sim.record_events();
         while sim.step().is_some() {}
         let reads: Vec<_> = sim.events().iter().map(|e| e.read).collect();
-        assert_eq!(reads, [Some(Read::Random), None, Some(Read::Random)]);
+        assert_eq!(
+            reads,
+            [Some(Read::Jump), None, Some(Read::Ahead { skipped: 1 })]
+        );
         let m = sim.metrics();
-        assert_eq!((m.misses, m.fresh_pages, m.random_reads), (3, 1, 2));
+        assert_eq!(
+            (m.misses, m.fresh_pages, m.jump_reads, m.ahead_reads),
+            (3, 1, 1, 1)
+        );
         let hdd = StorageKind::Hdd.profile();
-        assert!((m.total_ms - 2.0 * hdd.random_read_ms).abs() < 1e-9);
+        let ms = hdd.read_ms(Read::Jump, 1) + hdd.read_ms(Read::Ahead { skipped: 1 }, 1);
+        assert!((m.total_ms - ms).abs() < 1e-9);
+    }
+
+    /// Writing a modified page back does not move the read stream: page 21
+    /// follows page 20's read even though page 10 is written out in between.
+    #[test]
+    fn a_write_back_leaves_the_read_stream_alone() {
+        let a = |page, write| Access {
+            page,
+            write,
+            fresh: false,
+            scan: None,
+        };
+        let cfg = SimConfig {
+            frames: 2,
+            policy: PolicyKind::Lru,
+            storage: StorageKind::Hdd,
+        };
+        let queries = vec![vec![a(10, true), a(20, false), a(21, false)]];
+        let mut sim = Simulator::new(Trace::from_queries(1, 32, queries), cfg);
+        sim.record_events();
+        while sim.step().is_some() {}
+        let reads: Vec<_> = sim.events().iter().map(|e| e.read).collect();
+        assert_eq!(
+            reads,
+            [
+                Some(Read::Jump),
+                Some(Read::Ahead { skipped: 9 }),
+                Some(Read::Next)
+            ]
+        );
+        assert_eq!(sim.metrics().dirty_evictions, 1);
     }
 
     #[test]
     fn a_hit_needs_no_read() {
         let (kinds, m) = reads(&[(5, false), (5, false)], 1);
-        assert_eq!(kinds, [Some(Read::Random), None]);
+        assert_eq!(kinds, [Some(Read::Jump), None]);
         assert_eq!(m.hits, 1);
     }
 

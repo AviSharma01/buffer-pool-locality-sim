@@ -272,25 +272,33 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
 <script id="run" type="application/json">__BPSIM_RUN__</script>
 <script>
 "use strict";
-const FORMAT = "bpsim-run", VERSION = 3;
+const FORMAT = "bpsim-run", VERSION = 4;
 const INFO = {
   fifo:   {name: "FIFO", how: "oldest load out", textbook: true},
   lru:    {name: "LRU", how: "least recent out"},
   clock:  {name: "Clock", how: "second chance", textbook: true},
   pg:     {name: "PostgreSQL-style", how: "usage counts + scan ring"},
   innodb: {name: "InnoDB-style", how: "midpoint insertion"},
-  opt:    {name: "Optimal", how: "knows the future"},
+  opt:    {name: "Optimal", how: "fewest misses, not always fastest"},
 };
 const $ = id => document.getElementById(id);
 const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
 const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const nameOf = p => INFO[p]?.name || p;
-/* Time for one access under a storage profile, from what the engine recorded:
-   a hit, a sequential or random read, or nothing to read for a page SQLite
-   wrote without reading, plus a write-back if a modified page had to go out
-   first. Every profile prices the same events. */
-const readMs = (e, P) => e.kind === "hit" ? P.hit_ms : e.read === "sequential" ? P.sequential_read_ms : e.read === "random" ? P.random_read_ms : 0;
-const msOf = (e, P) => readMs(e, P) + (e.evicted?.dirty ? P.write_ms : 0);
+/* Time for one access under a storage profile, from what the engine recorded.
+   A read request costs a fixed part plus one page. Where the page sits
+   relative to the last page read sets the fixed part: the next page or a few
+   pages further on cost the near overhead plus the skipped pages passing
+   under the head (never more than a jump); a jump costs a full request. A
+   page SQLite wrote without reading costs nothing to read. A dirty eviction
+   adds a write request. Every profile prices the same events. */
+function readMs(e, P) {
+  if (e.kind === "hit") return P.hit_ms;
+  const near = n => Math.min(P.near_request_ms + n * P.page_ms, P.read_request_ms) + P.page_ms;
+  return e.read === "next" ? near(0) : e.read === "ahead" ? near(e.skipped) : e.read === "jump" ? P.read_request_ms + P.page_ms : 0;
+}
+const writeMs = P => P.write_request_ms + P.page_ms;
+const msOf = (e, P) => readMs(e, P) + (e.evicted?.dirty ? writeMs(P) : 0);
 const costOf = e => msOf(e, PROFILE);
 function fmtMs(ms) {
   if (ms < 1) { const us = ms * 1000; return `${us < 10 ? us.toFixed(1) : us.toFixed(0)} µs`; }
@@ -332,7 +340,7 @@ function start(data) {
 
   $("drop").hidden = true; $("error").hidden = true; $("app").hidden = false;
   $("title").textContent = `${D.scenario}.db`;
-  $("sub").textContent = `${D.queries.length} quer${D.queries.length === 1 ? "y" : "ies"} · ${K} page reads · ${N} frame${N === 1 ? "" : "s"}`;
+  $("sub").textContent = `${D.queries.length} quer${D.queries.length === 1 ? "y" : "ies"} · ${K} page accesses · ${N} frame${N === 1 ? "" : "s"}`;
   $("scrub").max = K - 1;
   const bad = D.runs.filter(r => !addsUp(r)).map(r => nameOf(r.policy));
   $("warn").hidden = !bad.length;
@@ -346,13 +354,13 @@ function start(data) {
 /* each event list must recount to its own summary, priced as the summary was */
 function addsUp(run) {
   const P = D.profiles[run.summary.storage];
-  let hits = 0, seq = 0, random = 0, fresh = 0, dirty = 0, ms = 0;
+  let hits = 0, next = 0, ahead = 0, jump = 0, fresh = 0, dirty = 0, ms = 0;
   for (const e of run.events) {
-    if (e.kind === "hit") hits++; else if (e.read === "sequential") seq++; else if (e.read === "random") random++; else fresh++;
+    if (e.kind === "hit") hits++; else if (e.read === "next") next++; else if (e.read === "ahead") ahead++; else if (e.read === "jump") jump++; else fresh++;
     if (e.evicted?.dirty) dirty++; ms += msOf(e, P);
   }
   const s = run.summary;
-  return P && hits === s.hits && seq === s.sequential_reads && random === s.random_reads && fresh === s.fresh_pages && dirty === s.dirty_evictions &&
+  return P && hits === s.hits && next === s.next_page_reads && ahead === s.ahead_reads && jump === s.jump_reads && fresh === s.fresh_pages && dirty === s.dirty_evictions &&
     Math.abs(ms - s.total_ms) < 1e-9 * Math.max(1, s.total_ms);
 }
 
@@ -431,18 +439,20 @@ function buildHelp() {
 
   const help = $("help"); help.replaceChildren();
   const tip = (lead, text) => { const p = el("p"); p.append(el("b", "", lead + " "), text); help.append(p); };
-  tip("Rows.", `Each row is one buffer pool serving the same ${K} page reads with ${N} frame${N === 1 ? "" : "s"} of memory. They differ only in what they evict.`);
+  tip("Rows.", `Each row is one buffer pool serving the same ${K} page accesses with ${N} frame${N === 1 ? "" : "s"} of memory. They differ only in what they evict.`);
   tip("Bars.", "A bar is one page staying in one frame. Long bars mean the pool kept the page. Many short bars mean it keeps throwing pages out.");
-  tip("Moving.", "Drag on the chart, or use the left and right arrow keys, to move through the reads. Click a query number or a diamond to jump.");
+  tip("Moving.", "Drag on the chart, or use the left and right arrow keys, to move through the accesses. Click a query number or a diamond to jump.");
   tip("Opening a pool.", "Click a pool's name to open it and see how it decides what to evict. One pool is open at a time.");
   const P = PROFILE, label = STORAGE === "hdd" ? "a hard drive" : "an SSD";
-  tip("Time.", `Rough time on ${label}: ${fmtMs(P.hit_ms)} for a hit, ${fmtMs(P.sequential_read_ms)} to read the page right after the last one the disk touched, ${fmtMs(P.random_read_ms)} to read any other page, and ${fmtMs(P.write_ms)} more to write a modified page back first. Switch SSD and HDD at the top; what is cached stays the same.`);
-  tip("Race.", "Replays every pool at the pace of its time, on a squashed scale so hits stay visible next to slow reads. The fastest finishes first.");
+  tip("Time.", STORAGE === "hdd"
+    ? `Rough time on a hard drive: ${fmtMs(P.hit_ms)} for a hit. A read after a jump (backwards, or the first) is a seek and half a turn of the platter: ${fmtMs(P.read_request_ms + P.page_ms)}. Reading further on is cheap, since the head is already moving that way: ${fmtMs(P.near_request_ms + P.page_ms)} for the next page plus ${fmtMs(P.page_ms)} for each page skipped (${fmtMs(P.near_request_ms)} of that is an assumed overhead). Writing a modified page back is a separate ${fmtMs(writeMs(P))}. Switch SSD and HDD at the top; what is cached stays the same.`
+    : `Rough time on an SSD: ${fmtMs(P.hit_ms)} for a hit, ${fmtMs(P.read_request_ms + P.page_ms)} for any read, wherever the page is (there is no head to move; some drives prefetch the next pages themselves, which is left out), and ${fmtMs(writeMs(P))} to write a modified page back (the drive's cache takes it). So on an SSD, layout only matters once pages are read in fewer, larger requests. Switch SSD and HDD at the top; what is cached stays the same.`);
+  tip("Race.", "Replays every pool at the pace of its time, on a squashed scale so hits stay visible next to slow reads. Optimal has the fewest misses, but not always the least time: it ignores what a miss costs.");
   const mini = [];
   if (RUN.pg) mini.push("the PostgreSQL-style scan ring is a quarter of the pool (real: 32 pages)");
   if (RUN.innodb) mini.push("InnoDB-style promotes a page on a hit in a later query (real: after 1 second)");
   help.append(el("p", "foot", `Page reads were captured from SQLite ${D.sqlite_version} and replayed through miniature policies` + (mini.length ? `: ${mini.join("; ")}` : "") +
-    ". Every pool sees SQLite's reads; another database would read different pages for the same query. Times are rough per-page figures, and the operating system's own file cache is left out."));
+    ". Every pool sees SQLite's reads; another database would read different pages for the same query. Times come from one datasheet per drive (a Samsung 990 Pro SSD, a 7,200 rpm enterprise hard drive); the operating system's file cache and overlapping I/O with work are left out. The layout is SQLite's: tables share one file page by page."));
 }
 
 /* ---------- chart + pools for the visible set ---------- */
@@ -470,7 +480,7 @@ function setFocus(p) { if (p === focus) return; focus = p; markFocus(); buildCha
 function buildChart() {
   const axis = $("axis"); axis.replaceChildren();
   const W = axis.clientWidth || 600;
-  $("chartNote").textContent = `${N} frame${N === 1 ? "" : "s"} × ${K} reads`;
+  $("chartNote").textContent = `${N} frame${N === 1 ? "" : "s"} × ${K} accesses`;
   const seen = new Set();
   for (const m of MOMENTS) {
     if (seen.has(m.k)) continue; seen.add(m.k);
@@ -525,7 +535,9 @@ function paintBand(p, at) {
 /* ---------- one access in words ---------- */
 function describe(p, e) {
   const ev = e.evicted, parts = [], sweeps = e.notes.filter(n => n.kind === "swept").length;
-  if (e.read) parts.push(e.read === "sequential" ? "next page on disk: sequential read" : "random read");
+  if (e.read === "next") parts.push("reads the next page on disk");
+  else if (e.read === "ahead") parts.push(`reads ${e.skipped + 1} page${e.skipped ? "s" : ""} further on`);
+  else if (e.read === "jump") parts.push("jumps on disk: a full request");
   else if (e.kind === "miss") parts.push("a page SQLite writes without reading: nothing to read from disk");
   for (const n of e.notes) {
     if (n.kind === "evict") {
@@ -625,7 +637,9 @@ function paintLane(p, at) {
   if (p === focus) L.fig.replaceChildren(drawFocus(p, shown, at, touched)); else L.fig.replaceChildren();
   const t = totals(p, at);
   L.score.querySelector(".t").textContent = at < 0 ? "0" : fmtMs(t.cost);
-  L.score.querySelector(".s").textContent = at < 0 ? "no reads yet" : `${t.hits}/${at + 1} hits`;
+  const left = at === K - 1 ? RUN[p].summary.dirty_at_end : 0;
+  L.score.querySelector(".s").textContent = at < 0 ? "nothing yet" : `${t.hits}/${at + 1} hits` + (left ? ` · ${left} still modified` : "");
+  L.score.title = left ? `${left} modified page${left > 1 ? "s" : ""} still in memory at the end; a checkpoint would write ${left > 1 ? "them" : "it"} (not counted)` : "";
   L.sayEl.replaceChildren();
   if (e && mode === "step") L.sayEl.append(el("span", "k " + e.kind, e.kind), describe(p, e));
   paintBand(p, at);
@@ -636,11 +650,11 @@ function renderChrome(at) {
   if (at >= 0 && mode === "step") cellEls[EV0[at].page]?.classList.add("now");
   $("scrub").value = at; markAxis(at);
   const q = at >= 0 ? EV0[at].query : -1, query = D.queries[Math.max(0, q)];
-  if (mode === "race") { $("qTitle").textContent = "Race"; $("qSql").textContent = ""; $("pos").textContent = `${K} reads each`; }
+  if (mode === "race") { $("qTitle").textContent = "Race"; $("qSql").textContent = ""; $("pos").textContent = `${K} accesses each`; }
   else {
     $("qTitle").textContent = q < 0 ? "Before the first query" : `${q + 1}. ${query.title}`;
     $("qSql").textContent = q < 0 ? "" : query.sql;
-    $("pos").textContent = at < 0 ? `${K} reads ahead` : `read ${at + 1}/${K} · p${EV0[at].page} ${pageDesc(EV0[at].page)}`;
+    $("pos").textContent = at < 0 ? `${K} accesses ahead` : `access ${at + 1}/${K} · p${EV0[at].page} ${pageDesc(EV0[at].page)}`;
   }
   renderMoment(at); renderFold(at);
 }
@@ -671,7 +685,7 @@ function buildMoments() {
   }
   for (const p of real) {
     const i = E(p).findIndex(e => e.evicted?.dirty);
-    if (i >= 0) { list.push({k: i, t: "A modified page goes back to disk", d: `${nameOf(p)} writes p${E(p)[i].evicted.page} back before reusing the frame, so this read takes ${fmtMs(PROFILE.write_ms)} longer.`}); break; }
+    if (i >= 0) { list.push({k: i, t: "A modified page goes back to disk", d: `${nameOf(p)} writes p${E(p)[i].evicted.page} back before reusing the frame, so this access takes ${fmtMs(writeMs(PROFILE))} longer.`}); break; }
   }
   if (real.length > 1) {
     let best = null;
@@ -679,7 +693,7 @@ function buildMoments() {
       const h = real.map(p => E(p).slice(q.accesses[0], q.accesses[1]).filter(e => e.kind === "hit").length), gap = Math.max(...h) - Math.min(...h);
       if (gap > 0 && (!best || gap > best.gap)) best = {gap, i, h};
     });
-    if (best) { const q = D.queries[best.i], n = q.accesses[1] - q.accesses[0]; list.push({k: q.accesses[0], t: "Same query, different time", d: real.map((p, j) => `${nameOf(p)} ${best.h[j]}/${n} hits`).join(" · ")}); }
+    if (best) { const q = D.queries[best.i], n = q.accesses[1] - q.accesses[0]; list.push({k: q.accesses[0], t: "Same query, different hits", d: real.map((p, j) => `${nameOf(p)} ${best.h[j]}/${n} hits`).join(" · ")}); }
   }
   MOMENTS = list.sort((a, b) => a.k - b.k);
 }
