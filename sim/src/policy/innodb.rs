@@ -21,7 +21,9 @@ use crate::FrameIdx;
 pub struct InnoDb {
     /// Frames from head (most protected) to tail (next victim).
     list: Vec<FrameIdx>,
-    loaded_in: Vec<usize>,
+    /// Query of each frame's first use; None for a page read ahead and not
+    /// used yet (innodb_old_blocks_time counts from the first access).
+    loaded_in: Vec<Option<usize>>,
     /// Region of each listed frame as of the last change.
     region: Vec<Region>,
 }
@@ -36,7 +38,7 @@ impl InnoDb {
     pub fn new(frames: usize) -> Self {
         Self {
             list: Vec::with_capacity(frames),
-            loaded_in: vec![0; frames],
+            loaded_in: vec![None; frames],
             region: vec![Region::Young; frames],
         }
     }
@@ -74,13 +76,17 @@ impl InnoDb {
 
 impl Policy for InnoDb {
     fn on_hit(&mut self, frame: FrameIdx, ctx: Ctx, log: &mut Log) {
-        match self.region[frame] {
-            Region::Young => self.move_to_head(frame),
-            Region::Old if ctx.query != self.loaded_in[frame] => {
+        match (self.region[frame], self.loaded_in[frame]) {
+            (Region::Young, _) => self.move_to_head(frame),
+            (Region::Old, None) => {
+                self.loaded_in[frame] = Some(ctx.query);
+                log.push(Note::FirstUse { frame });
+            }
+            (Region::Old, Some(q)) if q != ctx.query => {
                 self.move_to_head(frame);
                 log.push(Note::Promoted { frame });
             }
-            Region::Old => log.push(Note::StaysOld { frame }),
+            (Region::Old, Some(_)) => log.push(Note::StaysOld { frame }),
         }
         self.relabel(frame, log);
     }
@@ -89,9 +95,16 @@ impl Policy for InnoDb {
         let len = self.list.len() + 1;
         let midpoint = len - old_len(len);
         self.list.insert(midpoint, frame);
-        self.loaded_in[frame] = ctx.query;
+        self.loaded_in[frame] = Some(ctx.query);
         log.push(Note::Inserted { frame });
         self.relabel(frame, log);
+    }
+
+    /// Read ahead: also enters at the head of old, but counts as not used
+    /// yet, so its first real use does not promote it.
+    fn on_read_ahead(&mut self, frame: FrameIdx, ctx: Ctx, log: &mut Log) {
+        self.on_load(frame, ctx, log);
+        self.loaded_in[frame] = None;
     }
 
     fn victim(&mut self, _ctx: Ctx, log: &mut Log) -> FrameIdx {
@@ -195,5 +208,27 @@ mod tests {
             p.on_hit(f, ctx, &mut log());
         }
         assert_eq!(p.list[..5], young_before);
+    }
+
+    /// A page read ahead also enters at the head of old, but its first use
+    /// only starts its clock: a first use in a later query does not promote
+    /// it; a second use in a still later query does.
+    #[test]
+    fn a_page_read_ahead_is_not_promoted_by_its_first_use() {
+        let mut p = filled(8);
+        let v = p.victim(at(8, 1), &mut log());
+        p.on_read_ahead(v, at(8, 1), &mut log());
+        let mut l = log();
+        p.on_hit(v, at(9, 2), &mut l);
+        assert_eq!(l.take(), [Note::FirstUse { frame: v }]);
+        assert!(matches!(
+            p.state(v),
+            FrameState::InnoDb {
+                region: Region::Old,
+                ..
+            }
+        ));
+        p.on_hit(v, at(10, 3), &mut l);
+        assert_eq!(l.take()[0], Note::Promoted { frame: v });
     }
 }

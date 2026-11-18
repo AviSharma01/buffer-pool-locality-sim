@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use bpsim::sim::ReadAhead;
 use bpsim::{PolicyKind, StorageKind};
 use clap::Parser;
 
@@ -34,6 +35,12 @@ pub struct Cli {
     /// changes what is cached; the viewer can switch between them.
     #[arg(long, default_value = "ssd")]
     pub storage: StorageKind,
+
+    /// Read ahead on a miss that continues a table or index (PostgreSQL-style:
+    /// on scans): auto (a quarter of the pool, at most 8 pages), off, or a page
+    /// count. Optimal never reads ahead.
+    #[arg(long, default_value = "auto", value_name = "auto|off|N")]
+    pub read_ahead: ReadAhead,
 
     /// Buffer pool size in frames.
     #[arg(long, default_value_t = 64, value_parser = positive_usize)]

@@ -164,7 +164,13 @@ fn replays_a_captured_trace() {
     let summary: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(run.join("summary.json")).unwrap()).unwrap();
     assert_eq!(summary["trace"], "shop");
-    assert_eq!(summary["hits"], 15);
+    // Read-ahead is on by default: the report's scan of orders reads pages
+    // ahead, so 9 of its misses become hits (15 with --read-ahead off).
+    assert_eq!(summary["hits"], 24);
+    assert_eq!(
+        (&summary["pages_read_ahead"], &summary["read_ahead_hits"]),
+        (&Value::from(9), &Value::from(9))
+    );
     assert!(summary.get("seed").is_none() && summary.get("workload").is_none());
     let run_file = read_json(&run.join("run.json"));
     assert_eq!(run_file["runs"].as_array().unwrap().len(), 1);
@@ -186,7 +192,7 @@ fn comparing_policies_writes_one_run_file_that_adds_up() {
     let run_file = read_json(&run.join("run.json"));
     assert_eq!(
         (&run_file["format"], &run_file["version"]),
-        (&Value::from("bpsim-run"), &Value::from(4))
+        (&Value::from("bpsim-run"), &Value::from(5))
     );
     assert_eq!(run_file["storage"], "ssd");
     assert_eq!(run_file["frames"], 8);
@@ -207,6 +213,29 @@ fn comparing_policies_writes_one_run_file_that_adds_up() {
         assert_eq!(events.len(), 45, "{policy}");
         let hits = events.iter().filter(|e| e["kind"] == "hit").count();
         assert_eq!(hits as u64, summary["hits"].as_u64().unwrap(), "{policy}");
+        let count = |key: &str| -> u64 {
+            events
+                .iter()
+                .map(|e| e[key].as_array().map_or(0, |a| a.len() as u64))
+                .sum()
+        };
+        let ahead_hits = events
+            .iter()
+            .filter(|e| e["read_ahead_hit"] == true)
+            .count() as u64;
+        assert_eq!(
+            count("ahead"),
+            summary["pages_read_ahead"].as_u64().unwrap(),
+            "{policy}"
+        );
+        assert_eq!(
+            ahead_hits,
+            summary["read_ahead_hits"].as_u64().unwrap(),
+            "{policy}"
+        );
+        if policy == "opt" {
+            assert_eq!(count("ahead"), 0, "Optimal never reads ahead");
+        }
         let ms = priced(events, &run_file["profiles"]["ssd"]);
         let total = summary["total_ms"].as_f64().unwrap();
         assert!(
@@ -237,20 +266,24 @@ fn priced(events: &[Value], profile: &Value) -> f64 {
                 None if e["kind"] == "hit" => ms("hit_ms"),
                 // A page SQLite wrote without reading: no disk read.
                 None => 0.0,
-                Some("next") => near.min(jump) + page,
-                Some("ahead") => {
-                    let skipped = e["skipped"].as_f64().unwrap();
-                    (near + skipped * page).min(jump) + page
+                Some(kind) => {
+                    // The missed page and the pages read ahead with it.
+                    let pages = 1.0 + e["ahead"].as_array().map_or(0, |a| a.len()) as f64;
+                    let fixed = match kind {
+                        "next" => near.min(jump),
+                        "ahead" => (near + e["skipped"].as_f64().unwrap() * page).min(jump),
+                        "jump" => jump,
+                        other => panic!("unknown read kind {other}"),
+                    };
+                    fixed + pages * page
                 }
-                Some("jump") => jump + page,
-                Some(other) => panic!("unknown read kind {other}"),
             };
-            let writeback = if e["evicted"]["dirty"] == true {
-                ms("write_request_ms") + page
-            } else {
-                0.0
-            };
-            read + writeback
+            let read_ahead_evictions = e["ahead_evicted"].as_array().cloned().unwrap_or_default();
+            let writebacks = std::iter::once(&e["evicted"])
+                .chain(read_ahead_evictions.iter())
+                .filter(|v| v["dirty"] == true)
+                .count() as f64;
+            read + writebacks * (ms("write_request_ms") + page)
         })
         .sum()
 }
@@ -301,6 +334,10 @@ fn the_viewer_can_price_one_run_for_every_storage() {
     assert_rejected(
         &["--trace", &trace, "--storage", "tape"],
         "expected ssd or hdd",
+    );
+    assert_rejected(
+        &["--trace", &trace, "--read-ahead", "lots"],
+        "expected auto, off or a page count",
     );
 }
 

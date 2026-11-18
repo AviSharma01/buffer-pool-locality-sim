@@ -67,6 +67,7 @@ impl Input {
             frames: args.frames,
             policy,
             storage: args.storage,
+            read_ahead: args.read_ahead,
         };
         match self {
             Input::Trace(t) => {
@@ -169,15 +170,14 @@ fn run(args: Cli) -> Result<(), String> {
 
         let summary = sim.summary();
         say(format_args!(
-            "{} | {} | frames {} | {} | hit rate {:.3} | reads: {} next, {} ahead, {} jumps | {:.3} ms/query",
+            "{} | {} | frames {} | {} | hit rate {:.3} | {} disk requests, {} pages read ahead | {:.3} ms/query",
             name,
             summary.policy,
             summary.frames,
             summary.storage,
             summary.hit_rate,
-            summary.next_page_reads,
-            summary.ahead_reads,
-            summary.jump_reads,
+            summary.read_requests,
+            summary.pages_read_ahead,
             summary.mean_ms_per_query
         ));
         let is_trace = matches!(input, Input::Trace(_));

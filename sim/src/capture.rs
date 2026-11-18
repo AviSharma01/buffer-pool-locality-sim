@@ -156,8 +156,18 @@ impl CapturedTrace {
                 fold_writes(q, scan_of)
             })
             .collect();
+        let mut ids: HashMap<&str, u32> = HashMap::new();
+        let mut owners = vec![None; self.page_count as usize + 1];
+        for p in &self.pages {
+            if let (Some(object), Some(slot)) =
+                (p.object.as_deref(), owners.get_mut(p.page as usize))
+            {
+                let next = ids.len() as u32;
+                *slot = Some(*ids.entry(object).or_insert(next));
+            }
+        }
         // Page 0 does not exist in SQLite; reserving it keeps ids equal to page numbers.
-        Trace::from_queries(1, self.page_count + 1, queries)
+        Trace::from_queries(1, self.page_count + 1, queries).with_owners(owners)
     }
 
     /// A simulator ready to replay this trace.

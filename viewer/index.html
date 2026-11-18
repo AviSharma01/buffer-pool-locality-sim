@@ -272,7 +272,7 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
 <script id="run" type="application/json">__BPSIM_RUN__</script>
 <script>
 "use strict";
-const FORMAT = "bpsim-run", VERSION = 4;
+const FORMAT = "bpsim-run", VERSION = 5;
 const INFO = {
   fifo:   {name: "FIFO", how: "oldest load out", textbook: true},
   lru:    {name: "LRU", how: "least recent out"},
@@ -284,7 +284,7 @@ const INFO = {
 const $ = id => document.getElementById(id);
 const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
 const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
-const nameOf = p => INFO[p]?.name || p;
+const nameOf = p => p === "opt" && READS_AHEAD ? "Optimal (no read-ahead)" : INFO[p]?.name || p;
 /* Time for one access under a storage profile, from what the engine recorded.
    A read request costs a fixed part plus one page. Where the page sits
    relative to the last page read sets the fixed part: the next page or a few
@@ -295,10 +295,12 @@ const nameOf = p => INFO[p]?.name || p;
 function readMs(e, P) {
   if (e.kind === "hit") return P.hit_ms;
   const near = n => Math.min(P.near_request_ms + n * P.page_ms, P.read_request_ms) + P.page_ms;
-  return e.read === "next" ? near(0) : e.read === "ahead" ? near(e.skipped) : e.read === "jump" ? P.read_request_ms + P.page_ms : 0;
+  const extra = (e.ahead?.length || 0) * P.page_ms; // pages read ahead ride in the same request
+  return extra + (e.read === "next" ? near(0) : e.read === "ahead" ? near(e.skipped) : e.read === "jump" ? P.read_request_ms + P.page_ms : 0);
 }
 const writeMs = P => P.write_request_ms + P.page_ms;
-const msOf = (e, P) => readMs(e, P) + (e.evicted?.dirty ? writeMs(P) : 0);
+const writeBacks = e => (e.evicted?.dirty ? 1 : 0) + (e.ahead_evicted || []).filter(v => v.dirty).length;
+const msOf = (e, P) => readMs(e, P) + writeBacks(e) * writeMs(P);
 const costOf = e => msOf(e, PROFILE);
 function fmtMs(ms) {
   if (ms < 1) { const us = ms * 1000; return `${us < 10 ? us.toFixed(1) : us.toFixed(0)} µs`; }
@@ -307,7 +309,7 @@ function fmtMs(ms) {
 }
 
 /* everything about the loaded run; replaced when a run.json is dropped */
-let D, RUN, EV0, K, N, PAGE, OBJ, BARS, CUM, KIND, LANES, POS, MOMENTS = [], STORAGE, PROFILE;
+let D, RUN, EV0, K, N, PAGE, OBJ, BARS, CUM, KIND, LANES, POS, MOMENTS = [], STORAGE, PROFILE, READS_AHEAD = false;
 let visible = [], focus = null, mode = "step", k = -1, playing = false, raceId = 0;
 const speed = () => +$("speed").value;
 const sleep = ms => new Promise(r => setTimeout(r, ms * speed()));
@@ -328,6 +330,7 @@ function start(data) {
     RUN[r.policy] = r; BARS[r.policy] = residency(r.events);
     KIND[r.policy] = r.events[0].frames[r.events[0].frame].state.kind;
   }
+  READS_AHEAD = D.runs.some(r => r.summary.read_ahead_cap > 0);
   setStorage(D.storage, false);
   PAGE = {}; for (const p of D.pages) PAGE[p.page] = p;
   OBJ = {sqlite_schema: "var(--o-schema)"};
@@ -340,7 +343,9 @@ function start(data) {
 
   $("drop").hidden = true; $("error").hidden = true; $("app").hidden = false;
   $("title").textContent = `${D.scenario}.db`;
-  $("sub").textContent = `${D.queries.length} quer${D.queries.length === 1 ? "y" : "ies"} · ${K} page accesses · ${N} frame${N === 1 ? "" : "s"}`;
+  const cap = Math.max(...D.runs.map(r => r.summary.read_ahead_cap));
+  $("sub").textContent = `${D.queries.length} quer${D.queries.length === 1 ? "y" : "ies"} · ${K} page accesses · ${N} frame${N === 1 ? "" : "s"} · ` +
+    (cap ? `read-ahead up to ${cap} page${cap > 1 ? "s" : ""}` : "no read-ahead");
   $("scrub").max = K - 1;
   const bad = D.runs.filter(r => !addsUp(r)).map(r => nameOf(r.policy));
   $("warn").hidden = !bad.length;
@@ -354,13 +359,14 @@ function start(data) {
 /* each event list must recount to its own summary, priced as the summary was */
 function addsUp(run) {
   const P = D.profiles[run.summary.storage];
-  let hits = 0, next = 0, ahead = 0, jump = 0, fresh = 0, dirty = 0, ms = 0;
+  let hits = 0, next = 0, ahead = 0, jump = 0, fresh = 0, dirty = 0, ms = 0, early = 0, earlyHits = 0;
   for (const e of run.events) {
     if (e.kind === "hit") hits++; else if (e.read === "next") next++; else if (e.read === "ahead") ahead++; else if (e.read === "jump") jump++; else fresh++;
-    if (e.evicted?.dirty) dirty++; ms += msOf(e, P);
+    dirty += writeBacks(e); ms += msOf(e, P); early += e.ahead?.length || 0; if (e.read_ahead_hit) earlyHits++;
   }
   const s = run.summary;
   return P && hits === s.hits && next === s.next_page_reads && ahead === s.ahead_reads && jump === s.jump_reads && fresh === s.fresh_pages && dirty === s.dirty_evictions &&
+    early === s.pages_read_ahead && earlyHits === s.read_ahead_hits && next + ahead + jump === s.read_requests &&
     Math.abs(ms - s.total_ms) < 1e-9 * Math.max(1, s.total_ms);
 }
 
@@ -369,9 +375,12 @@ function setStorage(kind, redraw = true) {
   if (!D.profiles[kind]) return;
   STORAGE = kind; PROFILE = D.profiles[kind]; CUM = {};
   for (const r of D.runs) {
-    let ms = 0, hits = 0; const c = [], h = [];
-    for (const e of r.events) { ms += costOf(e); if (e.kind === "hit") hits++; c.push(ms); h.push(hits); }
-    CUM[r.policy] = {c, h};
+    let ms = 0, hits = 0, early = 0, req = 0; const c = [], h = [], a = [], q = [];
+    for (const e of r.events) {
+      ms += costOf(e); if (e.kind === "hit") hits++; if (e.read_ahead_hit) early++; if (e.read) req++;
+      c.push(ms); h.push(hits); a.push(early); q.push(req);
+    }
+    CUM[r.policy] = {c, h, a, q};
   }
   $("sSsd").setAttribute("aria-pressed", kind === "ssd"); $("sHdd").setAttribute("aria-pressed", kind === "hdd");
   if (redraw) { buildHelp(); buildMoments(); renderAll(k); }
@@ -448,11 +457,13 @@ function buildHelp() {
     ? `Rough time on a hard drive: ${fmtMs(P.hit_ms)} for a hit. A read after a jump (backwards, or the first) is a seek and half a turn of the platter: ${fmtMs(P.read_request_ms + P.page_ms)}. Reading further on is cheap, since the head is already moving that way: ${fmtMs(P.near_request_ms + P.page_ms)} for the next page plus ${fmtMs(P.page_ms)} for each page skipped (${fmtMs(P.near_request_ms)} of that is an assumed overhead). Writing a modified page back is a separate ${fmtMs(writeMs(P))}. Switch SSD and HDD at the top; what is cached stays the same.`
     : `Rough time on an SSD: ${fmtMs(P.hit_ms)} for a hit, ${fmtMs(P.read_request_ms + P.page_ms)} for any read, wherever the page is (there is no head to move; some drives prefetch the next pages themselves, which is left out), and ${fmtMs(writeMs(P))} to write a modified page back (the drive's cache takes it). So on an SSD, layout only matters once pages are read in fewer, larger requests. Switch SSD and HDD at the top; what is cached stays the same.`);
   tip("Race.", "Replays every pool at the pace of its time, on a squashed scale so hits stay visible next to slow reads. Optimal has the fewest misses, but not always the least time: it ignores what a miss costs.");
+  if (READS_AHEAD) tip("Read-ahead.", "When a miss continues a table or index (its previous access was the page before), the pool also reads the next few pages of that table in the same request, up to a quarter of the pool. PostgreSQL-style reads ahead for scans instead, and only as far as its scan ring allows. Read-ahead pages enter cold: Clock leaves their bit clear, InnoDB-style puts them at the head of old and starts their clock at first use. Hits on them show as \"read ahead\". Requests count how often a query waited on the disk. Optimal never reads ahead, so others can beat its misses.");
   const mini = [];
   if (RUN.pg) mini.push("the PostgreSQL-style scan ring is a quarter of the pool (real: 32 pages)");
   if (RUN.innodb) mini.push("InnoDB-style promotes a page on a hit in a later query (real: after 1 second)");
   help.append(el("p", "foot", `Page reads were captured from SQLite ${D.sqlite_version} and replayed through miniature policies` + (mini.length ? `: ${mini.join("; ")}` : "") +
-    ". Every pool sees SQLite's reads; another database would read different pages for the same query. Times come from one datasheet per drive (a Samsung 990 Pro SSD, a 7,200 rpm enterprise hard drive); the operating system's file cache and overlapping I/O with work are left out. The layout is SQLite's: tables share one file page by page."));
+    ". Every pool sees SQLite's reads; another database would read different pages for the same query. Times come from one datasheet per drive (a Samsung 990 Pro SSD, a 7,200 rpm enterprise hard drive); the operating system's file cache and overlapping I/O with work are left out. The layout is SQLite's: tables share one file page by page." +
+    (READS_AHEAD ? " Read-ahead here is a simple rule (two pages of a table in a row; scans for PostgreSQL-style); real InnoDB reads a whole 64-page extent once 56 of its pages were read in order, and would not read ahead tables this small at all." : "")));
 }
 
 /* ---------- chart + pools for the visible set ---------- */
@@ -525,7 +536,7 @@ function markAxis(at) {
   for (const s of $("axis").querySelectorAll(".qs")) { const i = +s.dataset.q; s.classList.toggle("cur", i === q); s.classList.toggle("done", q >= 0 && D.queries[i].accesses[0] <= at); }
   for (const b of $("axis").querySelectorAll(".mk")) b.classList.toggle("cur", mode === "step" && +b.dataset.k === at);
 }
-const totals = (p, at) => at < 0 ? {cost: 0, hits: 0} : {cost: CUM[p].c[at], hits: CUM[p].h[at]};
+const totals = (p, at) => at < 0 ? {cost: 0, hits: 0, early: 0, req: 0} : {cost: CUM[p].c[at], hits: CUM[p].h[at], early: CUM[p].a[at], req: CUM[p].q[at]};
 function paintBand(p, at) {
   const L = LANES[p], x = `${100 * (at + 1) / K}%`;
   L.track.querySelector(".veil").style.left = x;
@@ -539,9 +550,15 @@ function describe(p, e) {
   else if (e.read === "ahead") parts.push(`reads ${e.skipped + 1} page${e.skipped ? "s" : ""} further on`);
   else if (e.read === "jump") parts.push("jumps on disk: a full request");
   else if (e.kind === "miss") parts.push("a page SQLite writes without reading: nothing to read from disk");
+  if (e.ahead?.length) parts.push(`reads ${e.ahead.length > 1 ? `p${e.ahead[0]}–p${e.ahead.at(-1)}` : `p${e.ahead[0]}`} ahead in the same request`);
+  if (e.read_ahead_hit) parts.push("read ahead earlier: no wait");
+  /* evict notes come in order: the missed page's victim (if any), then the read-ahead's */
+  const victims = [ev, ...(e.ahead_evicted || [])].filter(Boolean); let vi = 0;
   for (const n of e.notes) {
     if (n.kind === "evict") {
-      const w = n.why, v = `p${ev.page}`;
+      const vic = victims[vi++] || {page: "?", dirty: false}, early = vic !== ev;
+      const w = n.why, v = `p${vic.page}`;
+      if (early) parts.push("for the read-ahead");
       if (sweeps) parts.push(`hand passes ${sweeps} frame${sweeps > 1 ? "s" : ""}`);
       parts.push(
         w.kind === "least_recent" ? `evicts ${v}, used least recently` :
@@ -550,7 +567,7 @@ function describe(p, e) {
         w.kind === "ring_reuse" ? `the scan reuses its ring frame, evicting ${v}` :
         w.kind === "old_tail" ? `evicts ${v} from the old tail` :
         w.kind === "furthest_next_use" ? (w.next_use == null ? `evicts ${v}, never needed again` : `evicts ${v}, needed last (read ${w.next_use + 1})`) : `evicts ${v}`);
-      if (ev.dirty) parts.push(`${v} was modified: written back first`);
+      if (vic.dirty) parts.push(`${v} was modified: written back first`);
     }
     else if (n.kind === "counted" && e.kind === "hit") parts.push(p === "clock" ? "bit set" : `usage ${n.from} → ${n.to}`);
     else if (n.kind === "joined_ring") parts.push("frame joins the scan's ring");
@@ -558,13 +575,17 @@ function describe(p, e) {
     else if (n.kind === "inserted") parts.push("enters at the midpoint (old)");
     else if (n.kind === "promoted") parts.push("seen again in a later query: promoted to young");
     else if (n.kind === "stays_old") parts.push("seen again in the same query: stays old");
+    else if (n.kind === "first_use") parts.push("first use of a page read ahead: stays old, its clock starts now");
   }
   if (e.kind === "hit" && p === "lru") parts.push("now most recent");
   if (e.kind === "hit" && p === "innodb" && !e.notes.length) parts.push("moves to the head");
   if (e.kind === "hit" && p === "pg" && e.scan && !e.notes.length) parts.push("a scan's hit leaves usage as is");
   if (e.kind === "hit" && !parts.length) parts.push("already in memory");
   if (e.kind === "miss" && !ev) parts.push("into an empty frame");
-  return parts.join(" · ");
+  /* a request that reads ahead repeats a step per page: say it once with a count */
+  const merged = [];
+  for (const t of parts) { const last = merged.at(-1); if (last && last.t === t) last.n++; else merged.push({t, n: 1}); }
+  return merged.map(m => m.n > 1 ? `${m.t} (×${m.n})` : m.t).join(" · ");
 }
 
 /* ---------- drawing pools ---------- */
@@ -638,8 +659,11 @@ function paintLane(p, at) {
   const t = totals(p, at);
   L.score.querySelector(".t").textContent = at < 0 ? "0" : fmtMs(t.cost);
   const left = at === K - 1 ? RUN[p].summary.dirty_at_end : 0;
-  L.score.querySelector(".s").textContent = at < 0 ? "nothing yet" : `${t.hits}/${at + 1} hits` + (left ? ` · ${left} still modified` : "");
-  L.score.title = left ? `${left} modified page${left > 1 ? "s" : ""} still in memory at the end; a checkpoint would write ${left > 1 ? "them" : "it"} (not counted)` : "";
+  L.score.querySelector(".s").textContent = at < 0 ? "nothing yet" :
+    `${t.hits}/${at + 1} hits · ${t.req} request${t.req === 1 ? "" : "s"}` + (left ? ` · ${left} still modified` : "");
+  L.score.title = at < 0 ? "" : [
+    `${t.hits} hits, ${t.early} of them on pages read ahead; ${t.req} disk request${t.req === 1 ? "" : "s"} waited on`,
+    left ? `${left} modified page${left > 1 ? "s" : ""} still in memory at the end; a checkpoint would write ${left > 1 ? "them" : "it"} (not counted)` : ""].filter(Boolean).join(". ");
   L.sayEl.replaceChildren();
   if (e && mode === "step") L.sayEl.append(el("span", "k " + e.kind, e.kind), describe(p, e));
   paintBand(p, at);
@@ -670,6 +694,11 @@ function buildMoments() {
   if (real.length > 1) for (let i = 0; i < K; i++) {
     const acts = real.map(p => { const e = E(p)[i]; return e.kind === "hit" ? "keeps it" : e.evicted ? "evicts p" + e.evicted.page : "uses a free frame"; });
     if (new Set(acts).size > 1) { list.push({k: i, t: "The pools disagree", d: real.map((p, j) => `${nameOf(p)} ${acts[j]}`).join(" · ")}); break; }
+  }
+  const ra = real.map(p => [p, E(p).findIndex(e => e.ahead?.length)]).filter(([, i]) => i >= 0).sort((x, y) => x[1] - y[1])[0];
+  if (ra) {
+    const [p, i] = ra, e = E(p)[i], n = e.ahead.length;
+    list.push({k: i, t: "Reading ahead", d: `${nameOf(p)} reads p${e.page} and the ${n > 1 ? `next ${n} pages` : "next page"} of ${objLabel(PAGE[e.page]?.object)} in one request; when the query gets to them they are already in memory.`});
   }
   if (RUN.opt) {
     const regrets = {};

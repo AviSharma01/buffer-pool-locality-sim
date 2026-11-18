@@ -1,6 +1,6 @@
 //! The buffer pool and the simulation loop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -81,18 +81,43 @@ impl BufferPool {
             return (f, Outcome::Hit);
         }
 
+        let (f, evicted) = self.place(a.page, a.write, ctx, log);
+        self.policy.on_load(f, ctx, log);
+        (f, Outcome::Miss { evicted })
+    }
+
+    /// Whether `page` is in the pool.
+    pub fn contains(&self, page: PageId) -> bool {
+        self.page_table.contains_key(&page)
+    }
+
+    /// Load `page`, which no query asked for yet, as part of a read-ahead.
+    pub fn read_ahead(&mut self, page: PageId, ctx: Ctx, log: &mut Log) -> Option<Evicted> {
+        debug_assert!(!self.contains(page));
+        let (f, evicted) = self.place(page, false, ctx, log);
+        self.policy.on_read_ahead(f, ctx, log);
+        evicted
+    }
+
+    /// Put `page` in a free frame, or in a victim's.
+    fn place(
+        &mut self,
+        page: PageId,
+        dirty: bool,
+        ctx: Ctx,
+        log: &mut Log,
+    ) -> (FrameIdx, Option<Evicted>) {
         let f = if self.next_free < self.frames.len() {
             self.next_free += 1;
             self.next_free - 1
         } else {
             self.policy.victim(ctx, log)
         };
-
         let old = std::mem::replace(
             &mut self.frames[f],
             Frame {
-                page: Some(a.page),
-                dirty: a.write,
+                page: Some(page),
+                dirty,
             },
         );
         let evicted = old.page.map(|page| {
@@ -102,9 +127,8 @@ impl BufferPool {
                 dirty: old.dirty,
             }
         });
-        self.page_table.insert(a.page, f);
-        self.policy.on_load(f, ctx, log);
-        (f, Outcome::Miss { evicted })
+        self.page_table.insert(page, f);
+        (f, evicted)
     }
 
     pub fn policy(&self) -> &dyn Policy {
@@ -147,12 +171,53 @@ impl BufferPool {
     }
 }
 
+/// How far to read ahead when a policy decides to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadAhead {
+    #[default]
+    Off,
+    /// A quarter of the pool, at most 8 pages: real systems read ahead far
+    /// less than 1% of their pool, and a bigger share would flush this one.
+    Auto,
+    /// Up to this many pages (still at most a quarter of the pool).
+    Pages(u32),
+}
+
+impl ReadAhead {
+    /// Most pages one read-ahead may load into a pool of `frames`.
+    pub fn cap(self, frames: usize) -> usize {
+        let quarter = frames / 4;
+        match self {
+            ReadAhead::Off => 0,
+            ReadAhead::Auto => quarter.min(8),
+            ReadAhead::Pages(n) => quarter.min(n as usize),
+        }
+    }
+}
+
+impl std::str::FromStr for ReadAhead {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "off" | "0" => Ok(ReadAhead::Off),
+            "auto" => Ok(ReadAhead::Auto),
+            n => n.parse().map(ReadAhead::Pages).map_err(|_| {
+                format!("unknown read-ahead {s:?} (expected auto, off or a page count)")
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SimConfig {
     pub frames: usize,
     pub policy: PolicyKind,
     /// Prices the run; never changes what is cached.
     pub storage: StorageKind,
+    /// Off by default here, so policy tests see only the pages queries ask
+    /// for; the command line defaults to auto.
+    pub read_ahead: ReadAhead,
 }
 
 impl Default for SimConfig {
@@ -161,6 +226,7 @@ impl Default for SimConfig {
             frames: 64,
             policy: PolicyKind::Clock,
             storage: StorageKind::Ssd,
+            read_ahead: ReadAhead::Off,
         }
     }
 }
@@ -177,6 +243,12 @@ pub struct Metrics {
     pub jump_reads: u64,
     /// Misses on pages SQLite wrote without reading: no disk read.
     pub fresh_pages: u64,
+    /// Pages loaded by read-ahead, in the same request as a missed page.
+    pub pages_read_ahead: u64,
+    /// Hits on a page read ahead, at its first use.
+    pub read_ahead_hits: u64,
+    /// Pages read ahead and evicted before anyone used them.
+    pub read_ahead_unused: u64,
     pub evictions: u64,
     pub dirty_evictions: u64,
     pub total_ms: f64,
@@ -204,6 +276,16 @@ pub struct FrameView {
 /// One access, explained: what the pool did, how the page came off the
 /// device and what the policy looked at. Its time follows from `read` and
 /// `outcome` (a dirty eviction is a write-back) under any storage profile. Recorded only after [`Simulator::record_events`].
+/// What serving one access did, for its event.
+#[derive(Default)]
+struct Done {
+    ms: f64,
+    read: Option<Read>,
+    ahead: Vec<PageId>,
+    ahead_evicted: Vec<Evicted>,
+    read_ahead_hit: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Event {
     #[serde(flatten)]
@@ -219,6 +301,15 @@ pub struct Event {
     /// a page SQLite wrote without reading.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub read: Option<Read>,
+    /// Pages read ahead in the same request as this miss, in order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ahead: Vec<PageId>,
+    /// Pages those read-ahead loads evicted (written back first if dirty).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ahead_evicted: Vec<Evicted>,
+    /// A hit on a page that was read ahead and not used until now.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub read_ahead_hit: bool,
     /// In the order the policy did them.
     pub notes: Vec<Note>,
     /// Every frame after the access.
@@ -234,6 +325,10 @@ pub struct Simulator {
     /// The last page read from the device: where the read stream is. Pages
     /// sit on disk in id order.
     last_read: Option<PageId>,
+    /// Last page accessed in each table or index, to spot streams.
+    streams: HashMap<u32, PageId>,
+    /// Pages read ahead that nobody has used yet.
+    waiting: HashSet<PageId>,
     metrics: Metrics,
     log: Log,
     events: Option<Vec<Event>>,
@@ -249,6 +344,8 @@ impl Simulator {
             cfg,
             next_query: 0,
             last_read: None,
+            streams: HashMap::new(),
+            waiting: HashSet::new(),
             metrics: Metrics::default(),
             log: Log::default(),
             events: None,
@@ -321,53 +418,99 @@ impl Simulator {
 
     /// Serve one access; returns its time in milliseconds.
     fn access(&mut self, a: Access, ctx: Ctx) -> f64 {
+        // Each table or index is its own stream: does this access follow the
+        // previous access to the same object?
+        let owner = self.trace.owner_of(a.page);
+        let continues = owner
+            .and_then(|o| self.streams.insert(o, a.page))
+            .is_some_and(|last| last.checked_add(1) == Some(a.page));
         let (frame, outcome) = self.pool.access(a, ctx, &mut self.log);
         let profile = self.cfg.storage.profile();
-        let (read, ms) = match outcome {
+        let mut done = Done::default();
+        match outcome {
             Outcome::Hit => {
                 self.metrics.hits += 1;
-                (None, profile.hit_ms)
+                done.ms = profile.hit_ms;
+                done.read_ahead_hit = self.waiting.remove(&a.page);
+                self.metrics.read_ahead_hits += u64::from(done.read_ahead_hit);
             }
             Outcome::Miss { evicted } => {
                 self.metrics.misses += 1;
-                let mut ms = 0.0;
-                if let Some(e) = evicted {
-                    self.metrics.evictions += 1;
-                    // The modified page goes out first, as its own write
-                    // request; the read stream carries on where it was.
-                    if e.dirty {
-                        self.metrics.dirty_evictions += 1;
-                        ms += profile.write_ms();
-                    }
-                }
+                self.evicted(evicted, &mut done.ms);
                 if a.fresh {
                     // SQLite overwrites the whole page: the frame is filled
                     // in memory and the disk is not touched.
                     self.metrics.fresh_pages += 1;
-                    return self.record(a, ctx, frame, outcome, None, ms);
+                } else {
+                    self.read(a, ctx, owner, continues, &mut done);
                 }
-                let read = Read::of(a.page, self.last_read);
-                match read {
-                    Read::Next => self.metrics.next_page_reads += 1,
-                    Read::Ahead { .. } => self.metrics.ahead_reads += 1,
-                    Read::Jump => self.metrics.jump_reads += 1,
-                }
-                self.last_read = Some(a.page);
-                (Some(read), ms + profile.read_ms(read, 1))
             }
-        };
-        self.record(a, ctx, frame, outcome, read, ms)
+        }
+        self.record(a, ctx, frame, outcome, done)
     }
 
-    /// Keep the event if events are being recorded; returns `ms`.
+    /// Count an eviction and price its write-back: a separate write request
+    /// that leaves the read stream where it was.
+    fn evicted(&mut self, evicted: Option<Evicted>, ms: &mut f64) {
+        if let Some(e) = evicted {
+            self.metrics.evictions += 1;
+            if e.dirty {
+                self.metrics.dirty_evictions += 1;
+                *ms += self.cfg.storage.profile().write_ms();
+            }
+            if self.waiting.remove(&e.page) {
+                self.metrics.read_ahead_unused += 1;
+            }
+        }
+    }
+
+    /// Read a missed page, and the pages after it if the policy reads
+    /// ahead, in one request.
+    fn read(&mut self, a: Access, ctx: Ctx, owner: Option<u32>, continues: bool, done: &mut Done) {
+        let read = Read::of(a.page, self.last_read);
+        match read {
+            Read::Next => self.metrics.next_page_reads += 1,
+            Read::Ahead { .. } => self.metrics.ahead_reads += 1,
+            Read::Jump => self.metrics.jump_reads += 1,
+        }
+        let policy = self.pool.policy();
+        let cap = policy.read_ahead_cap(ctx, self.cfg.read_ahead.cap(self.cfg.frames));
+        if cap > 0 && owner.is_some() && policy.reads_ahead(ctx, continues) {
+            // Same table or index only, stopping at another object's page, a
+            // free page, the end of the file or a page already in the pool.
+            let mut page = a.page + 1;
+            while done.ahead.len() < cap
+                && self.trace.owner_of(page) == owner
+                && !self.pool.contains(page)
+            {
+                let evicted = self.pool.read_ahead(page, ctx, &mut self.log);
+                self.evicted(evicted, &mut done.ms);
+                done.ahead_evicted.extend(evicted);
+                self.waiting.insert(page);
+                done.ahead.push(page);
+                page += 1;
+            }
+            assert!(
+                self.pool.contains(a.page),
+                "read-ahead evicted page {} it was reading for",
+                a.page
+            );
+        }
+        let pages = done.ahead.len() as u32;
+        self.metrics.pages_read_ahead += u64::from(pages);
+        self.last_read = Some(a.page + pages);
+        done.read = Some(read);
+        done.ms += self.cfg.storage.profile().read_ms(read, 1 + pages);
+    }
+
+    /// Keep the event if events are being recorded; returns its time.
     fn record(
         &mut self,
         a: Access,
         ctx: Ctx,
         frame: FrameIdx,
         outcome: Outcome,
-        read: Option<Read>,
-        ms: f64,
+        done: Done,
     ) -> f64 {
         if let Some(events) = &mut self.events {
             events.push(Event {
@@ -376,13 +519,16 @@ impl Simulator {
                 write: a.write,
                 frame,
                 outcome,
-                read,
+                read: done.read,
+                ahead: done.ahead,
+                ahead_evicted: done.ahead_evicted,
+                read_ahead_hit: done.read_ahead_hit,
                 notes: self.log.take(),
                 frames: self.pool.frame_views(),
                 hand: self.pool.policy().hand(),
             });
         }
-        ms
+        done.ms
     }
 
     pub fn summary(&self) -> RunSummary {
@@ -401,6 +547,15 @@ impl Simulator {
             ahead_reads: m.ahead_reads,
             jump_reads: m.jump_reads,
             fresh_pages: m.fresh_pages,
+            read_requests: m.next_page_reads + m.ahead_reads + m.jump_reads,
+            read_ahead_cap: if self.cfg.policy == PolicyKind::Opt {
+                0
+            } else {
+                self.cfg.read_ahead.cap(self.cfg.frames) as u32
+            },
+            pages_read_ahead: m.pages_read_ahead,
+            read_ahead_hits: m.read_ahead_hits,
+            read_ahead_unused: m.read_ahead_unused,
             dirty_at_end: self.pool.frame_views().iter().filter(|f| f.dirty).count() as u64,
             evictions: m.evictions,
             dirty_evictions: m.dirty_evictions,
@@ -435,6 +590,7 @@ mod tests {
             frames: 1,
             policy: PolicyKind::Lru,
             storage: StorageKind::Hdd,
+            ..SimConfig::default()
         };
         let mut sim = Simulator::new(Trace::from_queries(1, 32, queries), cfg);
         sim.record_events();
@@ -499,6 +655,7 @@ mod tests {
             frames: 4,
             policy: PolicyKind::Lru,
             storage: StorageKind::Hdd,
+            ..SimConfig::default()
         };
         let queries = vec![vec![a(5, false), a(6, true), a(7, false)]];
         let mut sim = Simulator::new(Trace::from_queries(1, 32, queries), cfg);
@@ -533,6 +690,7 @@ mod tests {
             frames: 2,
             policy: PolicyKind::Lru,
             storage: StorageKind::Hdd,
+            ..SimConfig::default()
         };
         let queries = vec![vec![a(10, true), a(20, false), a(21, false)]];
         let mut sim = Simulator::new(Trace::from_queries(1, 32, queries), cfg);
@@ -548,6 +706,119 @@ mod tests {
             ]
         );
         assert_eq!(sim.metrics().dirty_evictions, 1);
+    }
+
+    /// Two tables: pages 1-10 and 11-20.
+    fn two_tables(queries: Vec<Vec<PageId>>) -> Trace {
+        let owners = (0..=20)
+            .map(|p| (p >= 1).then(|| u32::from(p > 10)))
+            .collect();
+        let queries = queries
+            .into_iter()
+            .map(|q| {
+                q.into_iter()
+                    .map(|page| Access {
+                        page,
+                        write: false,
+                        fresh: false,
+                        scan: None,
+                    })
+                    .collect()
+            })
+            .collect();
+        Trace::from_queries(1, 21, queries).with_owners(owners)
+    }
+
+    fn replay_ahead(trace: Trace, read_ahead: ReadAhead) -> Simulator {
+        let cfg = SimConfig {
+            frames: 16,
+            policy: PolicyKind::Lru,
+            storage: StorageKind::Ssd,
+            read_ahead,
+        };
+        let mut sim = Simulator::new(trace, cfg);
+        sim.record_events();
+        while sim.step().is_some() {}
+        sim
+    }
+
+    /// The second page in a row of a table triggers read-ahead of up to a
+    /// quarter of the pool (4 pages here), all in the missed page's request;
+    /// it never crosses into the next table.
+    #[test]
+    fn read_ahead_follows_a_table_and_stops_at_its_edge() {
+        let sim = replay_ahead(two_tables(vec![(3..=12).collect()]), ReadAhead::Auto);
+        let ahead: Vec<_> = sim.events().iter().map(|e| e.ahead.clone()).collect();
+        let none = Vec::new;
+        // 3 starts the stream; 4 continues it and reads 5-8 ahead; 5-8 are
+        // hits; 9 continues and reads 10, the table's last page; 11 starts
+        // the next table, 12 continues it.
+        assert_eq!(
+            ahead,
+            [
+                none(),
+                vec![5, 6, 7, 8],
+                none(),
+                none(),
+                none(),
+                none(),
+                vec![10],
+                none(),
+                none(),
+                vec![13, 14, 15, 16]
+            ]
+        );
+        let hits: Vec<_> = sim.events().iter().map(|e| e.read_ahead_hit).collect();
+        assert_eq!(
+            hits,
+            [
+                false, false, true, true, true, true, false, true, false, false
+            ]
+        );
+        let m = sim.metrics();
+        assert_eq!(
+            (m.pages_read_ahead, m.read_ahead_hits, m.read_ahead_unused),
+            (9, 5, 0)
+        );
+        // Five requests: 3; 4 with 5-8; 9 with 10; 11; 12 with 13-16.
+        let s = sim.summary();
+        assert_eq!(s.read_requests, 5);
+        let p = StorageKind::Ssd.profile();
+        let ms = p.read_ms(Read::Jump, 1)
+            + p.read_ms(Read::Next, 5)
+            + 4.0 * p.hit_ms
+            + p.read_ms(Read::Next, 2)
+            + p.hit_ms
+            + p.read_ms(Read::Next, 1)
+            + p.read_ms(Read::Next, 5);
+        assert!((m.total_ms - ms).abs() < 1e-12, "{} vs {ms}", m.total_ms);
+    }
+
+    #[test]
+    fn read_ahead_stops_at_a_page_already_in_the_pool() {
+        let sim = replay_ahead(two_tables(vec![vec![6], vec![3, 4]]), ReadAhead::Auto);
+        assert_eq!(sim.events()[2].ahead, [5]);
+    }
+
+    #[test]
+    fn off_or_lookups_read_nothing_ahead() {
+        let sim = replay_ahead(two_tables(vec![(3..=12).collect()]), ReadAhead::Off);
+        assert_eq!(sim.metrics().pages_read_ahead, 0);
+        // Lookups that jump around never continue a table.
+        let sim = replay_ahead(two_tables(vec![vec![3, 7, 2, 9, 4]]), ReadAhead::Auto);
+        assert_eq!(sim.metrics().pages_read_ahead, 0);
+    }
+
+    #[test]
+    fn read_ahead_is_capped_at_a_quarter_of_the_pool_and_eight_pages() {
+        assert_eq!(ReadAhead::Auto.cap(3), 0);
+        assert_eq!(ReadAhead::Auto.cap(8), 2);
+        assert_eq!(ReadAhead::Auto.cap(100), 8);
+        assert_eq!(ReadAhead::Pages(3).cap(8), 2);
+        assert_eq!(ReadAhead::Pages(3).cap(100), 3);
+        assert_eq!("off".parse(), Ok(ReadAhead::Off));
+        assert_eq!("5".parse(), Ok(ReadAhead::Pages(5)));
+        assert!("lots".parse::<ReadAhead>().is_err());
     }
 
     #[test]

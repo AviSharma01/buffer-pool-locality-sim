@@ -67,6 +67,9 @@ pub enum Note {
     Promoted { frame: FrameIdx },
     /// InnoDB: touched again within the query that loaded it, so it stays old.
     StaysOld { frame: FrameIdx },
+    /// InnoDB: first use of a page that was read ahead. Its clock starts now,
+    /// so it stays old; a use in a later query would promote it.
+    FirstUse { frame: FrameIdx },
     /// InnoDB: the young/old boundary moved past `frame`.
     Relabeled { frame: FrameIdx, region: Region },
 }
@@ -156,6 +159,21 @@ pub trait Policy {
     fn on_hit(&mut self, frame: FrameIdx, ctx: Ctx, log: &mut Log);
     /// A page was just loaded into `frame` (which was empty or just evicted).
     fn on_load(&mut self, frame: FrameIdx, ctx: Ctx, log: &mut Log);
+    /// A page nobody asked for yet was read ahead into `frame`. By default it
+    /// enters like any loaded page.
+    fn on_read_ahead(&mut self, frame: FrameIdx, ctx: Ctx, log: &mut Log) {
+        self.on_load(frame, ctx, log);
+    }
+    /// Whether a miss should read ahead. `continues` is true when the missed
+    /// page follows the previous access to the same table or index (a stream,
+    /// as Linux and InnoDB detect one). By default that is the trigger.
+    fn reads_ahead(&self, _ctx: Ctx, continues: bool) -> bool {
+        continues
+    }
+    /// How many pages to read ahead at most, given the pool-wide cap.
+    fn read_ahead_cap(&self, _ctx: Ctx, cap: usize) -> usize {
+        cap
+    }
     /// Choose a frame to evict. Only called when all frames are occupied.
     /// Pushes a [`Note::Evict`] for the chosen frame.
     fn victim(&mut self, ctx: Ctx, log: &mut Log) -> FrameIdx;

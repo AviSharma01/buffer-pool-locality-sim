@@ -76,7 +76,18 @@ def sqlite_reads(scenario: cap.Scenario, built: Path, work: Path, n: int) -> int
 def engine_reads(name: str, n: int, out: Path) -> int:
     """Engine LRU misses at n frames, less page-1 misses and fresh pages."""
     trace = TRACES / f"{name}.trace.json"
-    cmd = [str(SIM), "--trace", str(trace), "--policy", "lru", "--frames", str(n)]
+    # SQLite's own cache does not read ahead, so neither may the engine here.
+    cmd = [
+        str(SIM),
+        "--trace",
+        str(trace),
+        "--policy",
+        "lru",
+        "--frames",
+        str(n),
+        "--read-ahead",
+        "off",
+    ]
     done = subprocess.run([*cmd, "--out", str(out)], capture_output=True, text=True, check=True)
     run_dir = Path(done.stdout.strip().splitlines()[-1].removeprefix("Run written to "))
     run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))["runs"][0]

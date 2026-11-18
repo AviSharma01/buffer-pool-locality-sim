@@ -48,12 +48,33 @@ fn same_seed_is_deterministic() {
     }
 }
 
+/// How many seeds a slow test checks: the full count under
+/// `cargo test --release`, a fifth (at least one) in debug builds, where the
+/// engine runs many times slower. Every mutation tried against these tests
+/// fails within the first few seeds, so debug runs lose little.
+const fn seeds(full: u64) -> u64 {
+    if !cfg!(debug_assertions) {
+        full
+    } else if full >= 5 {
+        full / 5
+    } else {
+        1
+    }
+}
+
+#[test]
+fn every_slow_test_checks_at_least_one_seed() {
+    assert_eq!(seeds(1), 1);
+    assert_eq!(seeds(4), if cfg!(debug_assertions) { 1 } else { 4 });
+    assert_eq!(seeds(300), if cfg!(debug_assertions) { 60 } else { 300 });
+}
+
 /// Belady's MIN is optimal: no policy may miss less on the same trace.
 #[test]
 fn opt_is_a_lower_bound() {
     for file in ["default.toml", "scan.toml"] {
         let w = workload(file);
-        for seed in 1..=4 {
+        for seed in 1..=seeds(4) {
             for frames in [8, 64, 200] {
                 let best = misses(&w, seed, 2500, PolicyKind::Opt, frames);
                 for kind in PolicyKind::ALL {
@@ -74,7 +95,8 @@ fn stack_policies_never_get_worse_with_more_frames() {
     let w = Workload::builtin_default();
     for kind in [PolicyKind::Lru, PolicyKind::Opt] {
         let mut prev = u64::MAX;
-        for frames in (8..=256).step_by(8) {
+        // Every 8th size in release, every 40th in debug.
+        for frames in (8..=256).step_by(if cfg!(debug_assertions) { 40 } else { 8 }) {
             let m = misses(&w, 5, 1500, kind, frames);
             assert!(m <= prev, "{kind}: {frames} frames missed {m} > {prev}");
             prev = m;
@@ -226,6 +248,7 @@ fn replay(
         frames,
         policy,
         storage,
+        ..SimConfig::default()
     };
     let mut sim = Simulator::new(trace.clone(), cfg);
     while sim.step().is_some() {}
@@ -275,7 +298,7 @@ fn reference_misses(pages: &[u32], frames: usize) -> (u64, u64) {
 /// never get worse with more memory, and nothing beats OPT on misses.
 #[test]
 fn guarantees_hold_on_random_traces() {
-    for seed in 0..300 {
+    for seed in 0..seeds(300) {
         let (trace, pages) = random_trace(seed);
         let mut sizes: Vec<usize> = [1, 2, 3, 5, 8, 13]
             .into_iter()
@@ -346,4 +369,77 @@ fn guarantees_hold_on_random_traces() {
             }
         }
     }
+}
+
+/// Guarantees that must also hold with read-ahead on, on random traces whose
+/// pages belong to a few tables and indexes (and some to none, like free
+/// pages): no read-ahead evicts the page it reads for (the engine asserts it),
+/// the counts add up, storage only prices, and Optimal ignores read-ahead.
+#[test]
+fn guarantees_hold_with_read_ahead_on_random_traces() {
+    use bpsim::sim::ReadAhead;
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+    let mut read_ahead_pages = 0;
+    for seed in 0..seeds(100) {
+        let (trace, pages) = random_trace(seed);
+        let mut rng = StdRng::seed_from_u64(seed ^ 0x5eed);
+        let owners = (0..=pages + 1)
+            .map(|_| match rng.gen_range(0..6) {
+                0 => None,
+                o => Some(o % 3),
+            })
+            .collect();
+        let trace = trace.with_owners(owners);
+        for frames in [1, 4, 5, 8, 13, 32]
+            .into_iter()
+            .filter(|&f| f <= pages as usize + 4)
+        {
+            for read_ahead in [ReadAhead::Auto, ReadAhead::Pages(1), ReadAhead::Pages(3)] {
+                for kind in PolicyKind::ALL {
+                    let what = format!("seed {seed}, {kind}, {frames} frames, {read_ahead:?}");
+                    let run = |storage, read_ahead| {
+                        let cfg = SimConfig {
+                            frames,
+                            policy: kind,
+                            storage,
+                            read_ahead,
+                        };
+                        let mut sim = Simulator::new(trace.clone(), cfg);
+                        while sim.step().is_some() {}
+                        sim.summary()
+                    };
+                    let [ssd, hdd] = StorageKind::ALL.map(|s| run(s, read_ahead));
+                    assert_eq!(ssd.accesses, trace.accesses().len() as u64, "{what}");
+                    let reads = ssd.next_page_reads + ssd.ahead_reads + ssd.jump_reads;
+                    assert_eq!(reads + ssd.fresh_pages, ssd.misses, "{what}");
+                    assert_eq!(reads, ssd.read_requests, "{what}");
+                    assert!(
+                        ssd.read_ahead_hits + ssd.read_ahead_unused <= ssd.pages_read_ahead,
+                        "{what}"
+                    );
+                    let caching = |s: &bpsim::summary::RunSummary| {
+                        (
+                            s.hits,
+                            s.read_requests,
+                            s.pages_read_ahead,
+                            s.read_ahead_hits,
+                            s.dirty_evictions,
+                        )
+                    };
+                    assert_eq!(caching(&ssd), caching(&hdd), "{what}");
+                    read_ahead_pages += ssd.pages_read_ahead;
+                    if kind == PolicyKind::Opt {
+                        assert_eq!(ssd.pages_read_ahead, 0, "{what}");
+                        assert_eq!(
+                            ssd.hits,
+                            run(StorageKind::Ssd, ReadAhead::Off).hits,
+                            "{what}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // The traces must actually exercise read-ahead.
+    assert!(read_ahead_pages > 50 * seeds(100), "{read_ahead_pages}");
 }

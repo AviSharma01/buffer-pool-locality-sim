@@ -31,6 +31,9 @@ pub struct Trace {
     accesses: Vec<Access>,
     /// Start offset of each query in `accesses`, plus a trailing sentinel.
     query_starts: Vec<usize>,
+    /// For captured traces: the table or index owning each page id (None for
+    /// free pages and ids past the file). Synthetic traces use `table_of`.
+    owners: Option<Vec<Option<u32>>>,
 }
 
 impl Trace {
@@ -47,6 +50,7 @@ impl Trace {
             pages_per_table,
             accesses,
             query_starts,
+            owners: None,
         }
     }
 
@@ -87,6 +91,22 @@ impl Trace {
 
     pub fn table_of(&self, page: PageId) -> TableId {
         (page / self.pages_per_table) as TableId
+    }
+
+    /// Record which table or index owns each page (index = page id).
+    pub fn with_owners(mut self, owners: Vec<Option<u32>>) -> Self {
+        self.owners = Some(owners);
+        self
+    }
+
+    /// The table or index that owns `page`, if any: read-ahead never crosses
+    /// from one to another.
+    pub fn owner_of(&self, page: PageId) -> Option<u32> {
+        match &self.owners {
+            Some(owners) => owners.get(page as usize).copied().flatten(),
+            None => (page < u32::from(self.num_tables) * self.pages_per_table)
+                .then(|| u32::from(self.table_of(page))),
+        }
     }
 
     /// `next_use[i]` is the index of the next access to the same page after

@@ -7,7 +7,7 @@
 //! independent LRU model in Python.
 
 use bpsim::policy::{FrameState, Note, Why};
-use bpsim::sim::{Event, Outcome};
+use bpsim::sim::{Event, Outcome, ReadAhead};
 use bpsim::{CapturedTrace, PolicyKind, SimConfig, Simulator, StorageKind};
 
 fn load(name: &str) -> CapturedTrace {
@@ -28,10 +28,21 @@ fn summary(
     frames: usize,
     storage: StorageKind,
 ) -> bpsim::summary::RunSummary {
+    summary_with(name, policy, frames, storage, ReadAhead::Off)
+}
+
+fn summary_with(
+    name: &str,
+    policy: PolicyKind,
+    frames: usize,
+    storage: StorageKind,
+    read_ahead: ReadAhead,
+) -> bpsim::summary::RunSummary {
     let cfg = SimConfig {
         frames,
         policy,
         storage,
+        read_ahead,
     };
     let mut sim = load(name).simulator(cfg);
     while sim.step().is_some() {}
@@ -490,4 +501,70 @@ fn the_vacuum_lessons_hold_for_any_reasonable_drive_overhead() {
     let hdd = StorageKind::Hdd.profile();
     let engine = summary("checkout", PolicyKind::Pg, 8, StorageKind::Hdd).total_ms;
     assert!((priced_with("checkout", PolicyKind::Pg, 8, hdd) - engine).abs() < 1e-9);
+}
+
+/// LRU with 8 frames and read-ahead on (up to 2 pages): hits, requests,
+/// pages read ahead, and time on SSD and HDD, from the independent model in
+/// the 3.4c check (it agreed with the engine on 2,220 runs).
+#[test]
+fn read_ahead_numbers_match_the_independent_model() {
+    let pinned = [
+        ("shop", (24, 21, 9), 0.9696, 97.6424),
+        ("checkout", (22, 28, 4), 1.4676, 396.5622),
+        ("growth", (3, 95, 0), 4.2373, 100.6803),
+        ("growth-vacuum", (57, 41, 54), 1.8667, 87.5457),
+    ];
+    for (name, counts, ssd_ms, hdd_ms) in pinned {
+        let [ssd, hdd] =
+            StorageKind::ALL.map(|s| summary_with(name, PolicyKind::Lru, 8, s, ReadAhead::Auto));
+        assert_eq!(
+            (ssd.hits, ssd.read_requests, ssd.pages_read_ahead),
+            counts,
+            "{name}"
+        );
+        assert_eq!(
+            ssd.read_ahead_hits, ssd.pages_read_ahead,
+            "{name}: every page read ahead is used"
+        );
+        assert!(
+            (ssd.total_ms - ssd_ms).abs() < 1e-9,
+            "{name}: {}",
+            ssd.total_ms
+        );
+        assert!(
+            (hdd.total_ms - hdd_ms).abs() < 1e-9,
+            "{name}: {}",
+            hdd.total_ms
+        );
+    }
+}
+
+/// The rest of 3.3's story. Rebuilt in one run of pages, a table can be read
+/// in fewer, larger requests, and that is what VACUUM buys on an SSD. Grown
+/// side by side, orders and events have no runs to read ahead.
+#[test]
+fn vacuum_pays_off_on_an_ssd_through_read_ahead() {
+    for kind in PolicyKind::ALL {
+        let [g, v] = ["growth", "growth-vacuum"]
+            .map(|n| summary_with(n, kind, 8, StorageKind::Ssd, ReadAhead::Auto));
+        if kind == PolicyKind::Opt {
+            assert_eq!(g.total_ms, v.total_ms, "Optimal reads nothing ahead");
+            continue;
+        }
+        assert!(
+            v.total_ms < 0.7 * g.total_ms,
+            "{kind}: {} vs {}",
+            v.total_ms,
+            g.total_ms
+        );
+        assert!(
+            v.read_requests < g.read_requests,
+            "{kind}: fewer, larger requests"
+        );
+        if kind != PolicyKind::Pg {
+            // Their trigger needs two pages of a table in a row; PostgreSQL
+            // reads ahead for any scan, so it finds a few short runs.
+            assert_eq!(g.pages_read_ahead, 0, "{kind}");
+        }
+    }
 }

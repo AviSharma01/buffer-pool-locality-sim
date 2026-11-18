@@ -38,6 +38,12 @@ impl Policy for Clock {
         self.reference(frame, log);
     }
 
+    /// A page read ahead enters with its bit clear: unless someone uses it
+    /// before the hand comes round, it is the first to go.
+    fn on_read_ahead(&mut self, frame: FrameIdx, _ctx: Ctx, _log: &mut Log) {
+        self.ref_bits[frame] = false;
+    }
+
     fn victim(&mut self, _ctx: Ctx, log: &mut Log) -> FrameIdx {
         let n = self.ref_bits.len();
         loop {
@@ -102,5 +108,17 @@ mod tests {
         assert_eq!(c.victim(at(5, 0), &mut l), 2);
         assert_eq!(c.hand(), Some(0));
         assert_eq!(c.state(1), FrameState::Clock { referenced: false });
+    }
+
+    /// A page read ahead enters with its bit clear, so the hand takes it
+    /// first unless someone uses it.
+    #[test]
+    fn a_page_read_ahead_has_no_second_chance() {
+        let mut c = Clock::new(3);
+        c.on_load(0, at(0, 0), &mut log());
+        c.on_load(1, at(1, 0), &mut log());
+        c.on_read_ahead(2, at(1, 0), &mut log());
+        assert_eq!(c.state(2), FrameState::Clock { referenced: false });
+        assert_eq!(c.victim(at(2, 0), &mut log()), 2);
     }
 }

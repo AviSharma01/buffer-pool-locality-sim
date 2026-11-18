@@ -26,6 +26,12 @@ fn never_as_none(pos: usize) -> Option<usize> {
 }
 
 impl Policy for Opt {
+    /// Optimal is the bound on misses for the pages queries ask for; it does
+    /// not read ahead (a pool that prefetches can beat it on misses).
+    fn reads_ahead(&self, _ctx: Ctx, _continues: bool) -> bool {
+        false
+    }
+
     fn on_hit(&mut self, frame: FrameIdx, ctx: Ctx, _log: &mut Log) {
         self.frame_next[frame] = self.next_use[ctx.pos];
     }

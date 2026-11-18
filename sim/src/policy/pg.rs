@@ -114,6 +114,23 @@ impl Policy for Pg {
         }
     }
 
+    /// PostgreSQL reads ahead for scans, which ask for their pages in order
+    /// (read streams); a lookup reads just its page.
+    fn reads_ahead(&self, ctx: Ctx, _continues: bool) -> bool {
+        ctx.scan.is_some()
+    }
+
+    /// A big scan's request must fit its ring with a slot to spare, or the
+    /// last page read ahead would recycle the slot of the page asked for.
+    fn read_ahead_cap(&self, ctx: Ctx, cap: usize) -> usize {
+        let big_scan = matches!(ctx.scan, Some(pages) if pages as usize > self.usage.len() / 4);
+        if big_scan {
+            cap.min(self.ring.len().saturating_sub(1))
+        } else {
+            cap
+        }
+    }
+
     fn victim(&mut self, ctx: Ctx, log: &mut Log) -> FrameIdx {
         if self.ring_applies(ctx) {
             if let Some(frame) = self.ring[self.next_slot()] {
@@ -256,5 +273,27 @@ mod tests {
         let h = p.victim(scan(16, 2, 100), &mut l);
         assert_eq!(l.take()[0], Note::RingBusy { frame: f, usage: 4 });
         assert_ne!(h, f);
+    }
+
+    /// PostgreSQL reads ahead only for scans; a big scan's request must
+    /// leave its ring a slot to spare, and pages read ahead join the ring
+    /// with usage 1 like any page the scan loads.
+    #[test]
+    fn read_ahead_is_for_scans_and_fits_the_ring() {
+        let p = Pg::new(16); // ring of 4
+        assert!(!p.reads_ahead(at(0, 0), true));
+        assert!(p.reads_ahead(scan(0, 0, 2), false));
+        assert_eq!(p.read_ahead_cap(scan(0, 0, 100), 4), 3);
+        assert_eq!(p.read_ahead_cap(scan(0, 0, 2), 4), 4);
+        let mut p = Pg::new(16);
+        p.on_load(0, scan(0, 0, 100), &mut log());
+        p.on_read_ahead(1, scan(0, 0, 100), &mut log());
+        assert_eq!(
+            p.state(1),
+            FrameState::Pg {
+                usage: 1,
+                in_ring: true
+            }
+        );
     }
 }
