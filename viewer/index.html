@@ -272,19 +272,27 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
 <script id="run" type="application/json">__BPSIM_RUN__</script>
 <script>
 "use strict";
-const FORMAT = "bpsim-run", VERSION = 5;
+/* ---------- format, names and small helpers ---------- */
+const FORMAT = "bpsim-run",
+  VERSION = 5;
 const INFO = {
-  fifo:   {name: "FIFO", how: "oldest load out", textbook: true},
-  lru:    {name: "LRU", how: "least recent out"},
-  clock:  {name: "Clock", how: "second chance", textbook: true},
-  pg:     {name: "PostgreSQL-style", how: "usage counts + scan ring"},
+  fifo: {name: "FIFO", how: "oldest load out", textbook: true},
+  lru: {name: "LRU", how: "least recent out"},
+  clock: {name: "Clock", how: "second chance", textbook: true},
+  pg: {name: "PostgreSQL-style", how: "usage counts + scan ring"},
   innodb: {name: "InnoDB-style", how: "midpoint insertion"},
-  opt:    {name: "Optimal", how: "fewest misses, not always fastest"},
+  opt: {name: "Optimal", how: "fewest misses, not always fastest"}
 };
 const $ = id => document.getElementById(id);
-const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
+const el = (tag, cls, text) => {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+};
 const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
-const nameOf = p => p === "opt" && READS_AHEAD ? "Optimal (no read-ahead)" : INFO[p]?.name || p;
+const nameOf = p => (p === "opt" && state.readsAhead ? "Optimal (no read-ahead)" : INFO[p]?.name || p);
+/* ---------- pricing: what one access costs on a given drive ---------- */
 /* Time for one access under a storage profile, from what the engine recorded.
    A read request costs a fixed part plus one page. Where the page sits
    relative to the last page read sets the fixed part: the next page or a few
@@ -296,354 +304,754 @@ function readMs(e, P) {
   if (e.kind === "hit") return P.hit_ms;
   const near = n => Math.min(P.near_request_ms + n * P.page_ms, P.read_request_ms) + P.page_ms;
   const extra = (e.ahead?.length || 0) * P.page_ms; // pages read ahead ride in the same request
-  return extra + (e.read === "next" ? near(0) : e.read === "ahead" ? near(e.skipped) : e.read === "jump" ? P.read_request_ms + P.page_ms : 0);
+  return (
+    extra +
+    (e.read === "next"
+      ? near(0)
+      : e.read === "ahead"
+        ? near(e.skipped)
+        : e.read === "jump"
+          ? P.read_request_ms + P.page_ms
+          : 0)
+  );
 }
 const writeMs = P => P.write_request_ms + P.page_ms;
 const writeBacks = e => (e.evicted?.dirty ? 1 : 0) + (e.ahead_evicted || []).filter(v => v.dirty).length;
 const msOf = (e, P) => readMs(e, P) + writeBacks(e) * writeMs(P);
-const costOf = e => msOf(e, PROFILE);
+const costOf = e => msOf(e, state.profile);
 function fmtMs(ms) {
-  if (ms < 1) { const us = ms * 1000; return `${us < 10 ? us.toFixed(1) : us.toFixed(0)} µs`; }
+  if (ms < 1) {
+    const us = ms * 1000;
+    return `${us < 10 ? us.toFixed(1) : us.toFixed(0)} µs`;
+  }
   if (ms < 1000) return `${ms < 10 ? ms.toFixed(2) : ms.toFixed(1)} ms`;
   return `${(ms / 1000).toFixed(2)} s`;
 }
 
 /* everything about the loaded run; replaced when a run.json is dropped */
-let D, RUN, EV0, K, N, PAGE, OBJ, BARS, CUM, KIND, LANES, POS, MOMENTS = [], STORAGE, PROFILE, READS_AHEAD = false;
-let visible = [], focus = null, mode = "step", k = -1, playing = false, raceId = 0;
+/* ---------- state ---------- */
+/* The loaded run: replaced whole when a run.json is dropped on the page. */
+const state = {
+  data: null, // the run file
+  byPolicy: {}, // policy -> its run (events and summary)
+  events: [], // the first run's events: every pool sees the same accesses
+  accesses: 0, // how many accesses
+  frames: 0, // pool size
+  pages: {}, // page number -> its description from the trace
+  objectColor: {}, // table or index -> its colour
+  bars: {}, // policy -> residency bars for the chart
+  running: {}, // policy -> running totals per access (time, hits, read-ahead hits, requests)
+  shape: {}, // policy -> the kind of frame state it draws (clock, pg, innodb, ...)
+  lanes: {}, // policy -> its lane's DOM nodes
+  lanePos: {}, // policy -> the access its lane last showed
+  moments: [], // moments worth a look, in access order
+  storage: null, // "ssd" or "hdd": the profile prices are shown in
+  profile: null, // that profile's prices
+  readsAhead: false // whether any pool reads ahead
+};
+/* What is on screen. */
+const view = {
+  pools: [], // the pools shown, in order
+  focus: null, // the pool opened in its own shape
+  mode: "step", // "step" or "race"
+  at: -1, // the access shown; -1 before the first
+  playing: false,
+  raceId: 0, // bumped to cancel a running race or step animation
+  diskCells: {} // page -> its cell in the disk strip
+};
+
 const speed = () => +$("speed").value;
 const sleep = ms => new Promise(r => setTimeout(r, ms * speed()));
 
-const colorOf = page => PAGE[page] && PAGE[page].object == null ? "var(--free)" : OBJ[PAGE[page]?.object] || "var(--o-schema)";
-const objLabel = o => o === "sqlite_schema" ? "schema" : (o || "free");
-const pageDesc = page => !PAGE[page] ? (page === 1 ? "header" : "not described") : PAGE[page].object == null ? "free page" : `${objLabel(PAGE[page].object)} ${kindLabel(page)}`;
-const kindLabel = page => page === 1 ? "header" : PAGE[page]?.kind === "internal" ? "interior" : (PAGE[page]?.kind || "page");
-const isScanQ = q => EV0.slice(q.accesses[0], q.accesses[1]).some(e => e.scan);
+/* ---------- pages and objects: names, colours, descriptions ---------- */
+const colorOf = page =>
+  state.pages[page] && state.pages[page].object == null
+    ? "var(--free)"
+    : state.objectColor[state.pages[page]?.object] || "var(--o-schema)";
+const objLabel = o => (o === "sqlite_schema" ? "schema" : o || "free");
+const pageDesc = page =>
+  !state.pages[page]
+    ? page === 1
+      ? "header"
+      : "not described"
+    : state.pages[page].object == null
+      ? "free page"
+      : `${objLabel(state.pages[page].object)} ${kindLabel(page)}`;
+const kindLabel = page =>
+  page === 1
+    ? "header"
+    : state.pages[page]?.kind === "internal"
+      ? "interior"
+      : state.pages[page]?.kind || "page";
+const isScanQ = q => state.events.slice(q.accesses[0], q.accesses[1]).some(e => e.scan);
 
+/* ---------- starting a run: checks, running totals, page model ---------- */
 function start(data) {
-  if (data.format !== FORMAT || data.version !== VERSION) throw new Error(`expected ${FORMAT} v${VERSION}, got ${data.format} v${data.version}`);
+  if (data.format !== FORMAT || data.version !== VERSION)
+    throw new Error(`expected ${FORMAT} v${VERSION}, got ${data.format} v${data.version}`);
   if (!data.runs?.length || !data.runs[0].events.length) throw new Error("the run file has no events");
-  stopRace(); playing = false;
-  D = data; N = D.frames; EV0 = D.runs[0].events; K = EV0.length;
-  RUN = {}; BARS = {}; KIND = {}; LANES = {}; POS = {};
-  for (const r of D.runs) {
-    RUN[r.policy] = r; BARS[r.policy] = residency(r.events);
-    KIND[r.policy] = r.events[0].frames[r.events[0].frame].state.kind;
+  stopRace();
+  view.playing = false;
+  state.data = data;
+  state.frames = state.data.frames;
+  state.events = state.data.runs[0].events;
+  state.accesses = state.events.length;
+  state.byPolicy = {};
+  state.bars = {};
+  state.shape = {};
+  state.lanes = {};
+  state.lanePos = {};
+  for (const r of state.data.runs) {
+    state.byPolicy[r.policy] = r;
+    state.bars[r.policy] = residency(r.events);
+    state.shape[r.policy] = r.events[0].frames[r.events[0].frame].state.kind;
   }
-  READS_AHEAD = D.runs.some(r => r.summary.read_ahead_cap > 0);
-  setStorage(D.storage, false);
-  PAGE = {}; for (const p of D.pages) PAGE[p.page] = p;
-  OBJ = {sqlite_schema: "var(--o-schema)"};
-  D.objects.forEach((o, i) => { OBJ[o.name] = `var(--o${i % 6})`; });
+  state.readsAhead = state.data.runs.some(r => r.summary.read_ahead_cap > 0);
+  setStorage(state.data.storage, false);
+  state.pages = {};
+  for (const p of state.data.pages) state.pages[p.page] = p;
+  state.objectColor = {sqlite_schema: "var(--o-schema)"};
+  state.data.objects.forEach((o, i) => {
+    state.objectColor[o.name] = `var(--o${i % 6})`;
+  });
 
-  const all = D.runs.map(r => r.policy), real = all.filter(p => !INFO[p]?.textbook);
-  visible = real.length ? real : all;
-  focus = ["pg", "innodb"].find(p => visible.includes(p)) || visible[0];
-  mode = "step"; k = -1;
+  const all = state.data.runs.map(r => r.policy),
+    real = all.filter(p => !INFO[p]?.textbook);
+  view.pools = real.length ? real : all;
+  view.focus = ["pg", "innodb"].find(p => view.pools.includes(p)) || view.pools[0];
+  view.mode = "step";
+  view.at = -1;
 
-  $("drop").hidden = true; $("error").hidden = true; $("app").hidden = false;
-  $("title").textContent = `${D.scenario}.db`;
-  const cap = Math.max(...D.runs.map(r => r.summary.read_ahead_cap));
-  $("sub").textContent = `${D.queries.length} quer${D.queries.length === 1 ? "y" : "ies"} · ${K} page accesses · ${N} frame${N === 1 ? "" : "s"} · ` +
+  $("drop").hidden = true;
+  $("error").hidden = true;
+  $("app").hidden = false;
+  $("title").textContent = `${state.data.scenario}.db`;
+  const cap = Math.max(...state.data.runs.map(r => r.summary.read_ahead_cap));
+  $("sub").textContent =
+    `${state.data.queries.length} quer${state.data.queries.length === 1 ? "y" : "ies"} · ${state.accesses} page accesses · ${state.frames} frame${state.frames === 1 ? "" : "s"} · ` +
     (cap ? `read-ahead up to ${cap} page${cap > 1 ? "s" : ""}` : "no read-ahead");
-  $("scrub").max = K - 1;
-  const bad = D.runs.filter(r => !addsUp(r)).map(r => nameOf(r.policy));
+  $("scrub").max = state.accesses - 1;
+  const bad = state.data.runs.filter(r => !addsUp(r)).map(r => nameOf(r.policy));
   $("warn").hidden = !bad.length;
-  $("warn").textContent = bad.length ? `This run file does not add up for ${bad.join(", ")}: its events and its summary disagree, so the numbers below may be wrong.` : "";
+  $("warn").textContent = bad.length
+    ? `This run file does not add up for ${bad.join(", ")}: its events and its summary disagree, so the numbers below may be wrong.`
+    : "";
 
-  buildDisk(); buildFooter(); buildHelp(); buildLanes();
+  buildDisk();
+  buildFooter();
+  buildHelp();
+  buildLanes();
   setModeUI();
-  jump(MOMENTS.length && MOMENTS[0].k > 0 ? MOMENTS[0].k - 1 : -1);
+  jump(state.moments.length && state.moments[0].k > 0 ? state.moments[0].k - 1 : -1);
 }
 
 /* each event list must recount to its own summary, priced as the summary was */
 function addsUp(run) {
-  const P = D.profiles[run.summary.storage];
-  let hits = 0, next = 0, ahead = 0, jump = 0, fresh = 0, dirty = 0, ms = 0, early = 0, earlyHits = 0;
+  const P = state.data.profiles[run.summary.storage];
+  let hits = 0,
+    nextReads = 0,
+    aheadReads = 0,
+    jumpReads = 0,
+    fresh = 0,
+    dirty = 0,
+    ms = 0,
+    early = 0,
+    earlyHits = 0;
   for (const e of run.events) {
-    if (e.kind === "hit") hits++; else if (e.read === "next") next++; else if (e.read === "ahead") ahead++; else if (e.read === "jump") jump++; else fresh++;
-    dirty += writeBacks(e); ms += msOf(e, P); early += e.ahead?.length || 0; if (e.read_ahead_hit) earlyHits++;
+    if (e.kind === "hit") hits++;
+    else if (e.read === "next") nextReads++;
+    else if (e.read === "ahead") aheadReads++;
+    else if (e.read === "jump") jumpReads++;
+    else fresh++;
+    dirty += writeBacks(e);
+    ms += msOf(e, P);
+    early += e.ahead?.length || 0;
+    if (e.read_ahead_hit) earlyHits++;
   }
   const s = run.summary;
-  return P && hits === s.hits && next === s.next_page_reads && ahead === s.ahead_reads && jump === s.jump_reads && fresh === s.fresh_pages && dirty === s.dirty_evictions &&
-    early === s.pages_read_ahead && earlyHits === s.read_ahead_hits && next + ahead + jump === s.read_requests &&
-    Math.abs(ms - s.total_ms) < 1e-9 * Math.max(1, s.total_ms);
+  return (
+    P &&
+    hits === s.hits &&
+    nextReads === s.next_page_reads &&
+    aheadReads === s.ahead_reads &&
+    jumpReads === s.jump_reads &&
+    fresh === s.fresh_pages &&
+    dirty === s.dirty_evictions &&
+    early === s.pages_read_ahead &&
+    earlyHits === s.read_ahead_hits &&
+    nextReads + aheadReads + jumpReads === s.read_requests &&
+    Math.abs(ms - s.total_ms) < 1e-9 * Math.max(1, s.total_ms)
+  );
 }
 
 /* switching storage reprices the same events; nothing cached changes */
 function setStorage(kind, redraw = true) {
-  if (!D.profiles[kind]) return;
-  STORAGE = kind; PROFILE = D.profiles[kind]; CUM = {};
-  for (const r of D.runs) {
-    let ms = 0, hits = 0, early = 0, req = 0; const c = [], h = [], a = [], q = [];
+  if (!state.data.profiles[kind]) return;
+  state.storage = kind;
+  state.profile = state.data.profiles[kind];
+  state.running = {};
+  for (const r of state.data.runs) {
+    let ms = 0,
+      hits = 0,
+      early = 0,
+      req = 0;
+    const c = [],
+      h = [],
+      a = [],
+      q = [];
     for (const e of r.events) {
-      ms += costOf(e); if (e.kind === "hit") hits++; if (e.read_ahead_hit) early++; if (e.read) req++;
-      c.push(ms); h.push(hits); a.push(early); q.push(req);
+      ms += costOf(e);
+      if (e.kind === "hit") hits++;
+      if (e.read_ahead_hit) early++;
+      if (e.read) req++;
+      c.push(ms);
+      h.push(hits);
+      a.push(early);
+      q.push(req);
     }
-    CUM[r.policy] = {c, h, a, q};
+    state.running[r.policy] = {c, h, a, q};
   }
-  $("sSsd").setAttribute("aria-pressed", kind === "ssd"); $("sHdd").setAttribute("aria-pressed", kind === "hdd");
-  if (redraw) { buildHelp(); buildMoments(); renderAll(k); }
+  $("sSsd").setAttribute("aria-pressed", kind === "ssd");
+  $("sHdd").setAttribute("aria-pressed", kind === "hdd");
+  if (redraw) {
+    buildHelp();
+    buildMoments();
+    renderAll(view.at);
+  }
 }
 
 /* one bar per (frame, page): the reads it stayed for, and its hits */
 function residency(evs) {
-  const bars = [], open = new Array(N).fill(null);
-  for (let i = 0; i < K; i++) {
+  const bars = [],
+    open = new Array(state.frames).fill(null);
+  for (let i = 0; i < state.accesses; i++) {
     const fr = evs[i].frames;
-    for (let f = 0; f < N; f++) {
-      const pg = fr[f].page, o = open[f];
-      if (o && o.page !== pg) { o.e = i - 1; bars.push(o); open[f] = null; }
+    for (let f = 0; f < state.frames; f++) {
+      const pg = fr[f].page,
+        o = open[f];
+      if (o && o.page !== pg) {
+        o.e = i - 1;
+        bars.push(o);
+        open[f] = null;
+      }
       if (pg != null && !open[f]) open[f] = {f, page: pg, s: i, e: i, hits: []};
     }
     if (evs[i].kind === "hit" && open[evs[i].frame]) open[evs[i].frame].hits.push(i);
   }
-  for (const o of open) if (o) { o.e = K - 1; bars.push(o); }
+  for (const o of open)
+    if (o) {
+      o.e = state.accesses - 1;
+      bars.push(o);
+    }
   return bars;
 }
 
 /* ---------- database file strip, footer ---------- */
-let cellEls = {};
+
 function buildDisk() {
-  const cells = $("cells"); cells.replaceChildren(); cellEls = {};
-  const cols = Math.min(D.page_count, D.page_count > 400 ? 100 : 80);
+  const cells = $("cells");
+  cells.replaceChildren();
+  view.diskCells = {};
+  const cols = Math.min(state.data.page_count, state.data.page_count > 400 ? 100 : 80);
   cells.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
-  cells.classList.toggle("dense", D.page_count > 4 * cols);
-  for (let p = 1; p <= D.page_count; p++) {
-    const c = el("i"); c.style.setProperty("--c", colorOf(p));
-    if (PAGE[p]?.kind === "internal" || p === 1) c.className = "int";
+  cells.classList.toggle("dense", state.data.page_count > 4 * cols);
+  for (let p = 1; p <= state.data.page_count; p++) {
+    const c = el("i");
+    c.style.setProperty("--c", colorOf(p));
+    if (state.pages[p]?.kind === "internal" || p === 1) c.className = "int";
     c.title = `page ${p} · ${pageDesc(p)}`;
-    cells.append(c); cellEls[p] = c;
+    cells.append(c);
+    view.diskCells[p] = c;
   }
-  const legend = $("legend"); legend.replaceChildren(el("span", "", `${D.scenario}.db on disk, ${D.page_count} pages`));
-  for (const o of ["sqlite_schema", ...D.objects.map(o => o.name)]) {
-    const s = el("span"); const sw = el("i"); s.style.setProperty("--c", OBJ[o]); s.append(sw, objLabel(o)); legend.append(s);
+  const legend = $("legend");
+  legend.replaceChildren(el("span", "", `${state.data.scenario}.db on disk, ${state.data.page_count} pages`));
+  for (const o of ["sqlite_schema", ...state.data.objects.map(o => o.name)]) {
+    const s = el("span");
+    const sw = el("i");
+    s.style.setProperty("--c", state.objectColor[o]);
+    s.append(sw, objLabel(o));
+    legend.append(s);
   }
-  if (D.pages.some(p => p.object == null)) {
-    const s = el("span"); const sw = el("i"); s.style.setProperty("--c", "var(--free)"); s.append(sw, "free (on the freelist)"); legend.append(s);
+  if (state.data.pages.some(p => p.object == null)) {
+    const s = el("span");
+    const sw = el("i");
+    s.style.setProperty("--c", "var(--free)");
+    s.append(sw, "free (on the freelist)");
+    legend.append(s);
   }
-  const m = el("span"); const dot = el("i"); dot.style.cssText = "background:var(--accent);border-radius:50%"; m.append(dot, "modified in memory"); legend.append(m);
+  const m = el("span");
+  const dot = el("i");
+  dot.style.cssText = "background:var(--accent);border-radius:50%";
+  m.append(dot, "modified in memory");
+  legend.append(m);
 }
 function buildFooter() {
-  const f = $("footer"); f.replaceChildren(el("span", "", "pools"));
-  for (const r of D.runs) {
-    const p = r.policy, b = el("button", "pt", nameOf(p)); b.type = "button"; b.dataset.p = p;
+  const f = $("footer");
+  f.replaceChildren(el("span", "", "pools"));
+  for (const r of state.data.runs) {
+    const p = r.policy,
+      b = el("button", "pt", nameOf(p));
+    b.type = "button";
+    b.dataset.p = p;
     b.addEventListener("click", () => {
-      visible = visible.includes(p) ? visible.filter(x => x !== p) : D.runs.map(r => r.policy).filter(x => x === p || visible.includes(x));
-      if (!visible.length) visible = [p];
-      if (!visible.includes(focus)) focus = visible[0];
-      buildLanes(); renderAll(k);
+      view.pools = view.pools.includes(p)
+        ? view.pools.filter(x => x !== p)
+        : state.data.runs.map(r => r.policy).filter(x => x === p || view.pools.includes(x));
+      if (!view.pools.length) view.pools = [p];
+      if (!view.pools.includes(view.focus)) view.focus = view.pools[0];
+      buildLanes();
+      renderAll(view.at);
     });
     f.append(b);
   }
 }
 function buildHelp() {
-  const key = $("key"); key.replaceChildren();
-  const item = (cls, text) => { const sp = el("span"); sp.append(el("i", cls), text); key.append(sp); };
+  const key = $("key");
+  key.replaceChildren();
+  const item = (cls, text) => {
+    const sp = el("span");
+    sp.append(el("i", cls), text);
+    key.append(sp);
+  };
   item("kb", "a page held in memory; the dark edge is its disk read");
   item("kh", "a hit");
   item("kf", "not read yet");
-  if (D.queries.some(isScanQ)) item("ks", "a scan");
+  if (state.data.queries.some(isScanQ)) item("ks", "a scan");
   item("km", "a moment worth a look");
 
-  const help = $("help"); help.replaceChildren();
-  const tip = (lead, text) => { const p = el("p"); p.append(el("b", "", lead + " "), text); help.append(p); };
-  tip("Rows.", `Each row is one buffer pool serving the same ${K} page accesses with ${N} frame${N === 1 ? "" : "s"} of memory. They differ only in what they evict.`);
-  tip("Bars.", "A bar is one page staying in one frame. Long bars mean the pool kept the page. Many short bars mean it keeps throwing pages out.");
-  tip("Moving.", "Drag on the chart, or use the left and right arrow keys, to move through the accesses. Click a query number or a diamond to jump.");
-  tip("Opening a pool.", "Click a pool's name to open it and see how it decides what to evict. One pool is open at a time.");
-  const P = PROFILE, label = STORAGE === "hdd" ? "a hard drive" : "an SSD";
-  tip("Time.", STORAGE === "hdd"
-    ? `Rough time on a hard drive: ${fmtMs(P.hit_ms)} for a hit. A read after a jump (backwards, or the first) is a seek and half a turn of the platter: ${fmtMs(P.read_request_ms + P.page_ms)}. Reading further on is cheap, since the head is already moving that way: ${fmtMs(P.near_request_ms + P.page_ms)} for the next page plus ${fmtMs(P.page_ms)} for each page skipped (${fmtMs(P.near_request_ms)} of that is an assumed overhead). Writing a modified page back is a separate ${fmtMs(writeMs(P))}. Switch SSD and HDD at the top; what is cached stays the same.`
-    : `Rough time on an SSD: ${fmtMs(P.hit_ms)} for a hit, ${fmtMs(P.read_request_ms + P.page_ms)} for any read, wherever the page is (there is no head to move; some drives prefetch the next pages themselves, which is left out), and ${fmtMs(writeMs(P))} to write a modified page back (the drive's cache takes it). So on an SSD, layout only matters once pages are read in fewer, larger requests. Switch SSD and HDD at the top; what is cached stays the same.`);
-  tip("Race.", "Replays every pool at the pace of its time, on a squashed scale so hits stay visible next to slow reads. Optimal has the fewest misses, but not always the least time: it ignores what a miss costs.");
-  if (READS_AHEAD) tip("Read-ahead.", "When a miss continues a table or index (its previous access was the page before), the pool also reads the next few pages of that table in the same request, up to a quarter of the pool. PostgreSQL-style reads ahead for scans instead, and only as far as its scan ring allows. Read-ahead pages enter cold: Clock leaves their bit clear, InnoDB-style puts them at the head of old and starts their clock at first use. Hits on them show as \"read ahead\". Requests count how often a query waited on the disk. Optimal never reads ahead, so others can beat its misses.");
+  const help = $("help");
+  help.replaceChildren();
+  const tip = (lead, text) => {
+    const p = el("p");
+    p.append(el("b", "", lead + " "), text);
+    help.append(p);
+  };
+  tip(
+    "Rows.",
+    `Each row is one buffer pool serving the same ${state.accesses} page accesses with ${state.frames} frame${state.frames === 1 ? "" : "s"} of memory. They differ only in what they evict.`
+  );
+  tip(
+    "Bars.",
+    "A bar is one page staying in one frame. Long bars mean the pool kept the page. Many short bars mean it keeps throwing pages out."
+  );
+  tip(
+    "Moving.",
+    "Drag on the chart, or use the left and right arrow keys, to move through the accesses. Click a query number or a diamond to jump."
+  );
+  tip(
+    "Opening a pool.",
+    "Click a pool's name to open it and see how it decides what to evict. One pool is open at a time."
+  );
+  const P = state.profile;
+  tip(
+    "Time.",
+    state.storage === "hdd"
+      ? `Rough time on a hard drive: ${fmtMs(P.hit_ms)} for a hit. A read after a jump (backwards, or the first) is a seek and half a turn of the platter: ${fmtMs(P.read_request_ms + P.page_ms)}. Reading further on is cheap, since the head is already moving that way: ${fmtMs(P.near_request_ms + P.page_ms)} for the next page plus ${fmtMs(P.page_ms)} for each page skipped (${fmtMs(P.near_request_ms)} of that is an assumed overhead). Writing a modified page back is a separate ${fmtMs(writeMs(P))}. Switch SSD and HDD at the top; what is cached stays the same.`
+      : `Rough time on an SSD: ${fmtMs(P.hit_ms)} for a hit, ${fmtMs(P.read_request_ms + P.page_ms)} for any read, wherever the page is (there is no head to move; some drives prefetch the next pages themselves, which is left out), and ${fmtMs(writeMs(P))} to write a modified page back (the drive's cache takes it). So on an SSD, layout only matters once pages are read in fewer, larger requests. Switch SSD and HDD at the top; what is cached stays the same.`
+  );
+  tip(
+    "Race.",
+    "Replays every pool at the pace of its time, on a squashed scale so hits stay visible next to slow reads. Optimal has the fewest misses, but not always the least time: it ignores what a miss costs."
+  );
+  if (state.readsAhead)
+    tip(
+      "Read-ahead.",
+      'When a miss continues a table or index (its previous access was the page before), the pool also reads the next few pages of that table in the same request, up to a quarter of the pool. PostgreSQL-style reads ahead for scans instead, and only as far as its scan ring allows. Read-ahead pages enter cold: Clock leaves their bit clear, InnoDB-style puts them at the head of old and starts their clock at first use. Hits on them show as "read ahead". Requests count how often a query waited on the disk. Optimal never reads ahead, so others can beat its misses.'
+    );
   const mini = [];
-  if (RUN.pg) mini.push("the PostgreSQL-style scan ring is a quarter of the pool (real: 32 pages)");
-  if (RUN.innodb) mini.push("InnoDB-style promotes a page on a hit in a later query (real: after 1 second)");
-  help.append(el("p", "foot", `Page reads were captured from SQLite ${D.sqlite_version} and replayed through miniature policies` + (mini.length ? `: ${mini.join("; ")}` : "") +
-    ". Every pool sees SQLite's reads; another database would read different pages for the same query. Times come from one datasheet per drive (a Samsung 990 Pro SSD, a 7,200 rpm enterprise hard drive); the operating system's file cache and overlapping I/O with work are left out. The layout is SQLite's: tables share one file page by page." +
-    (READS_AHEAD ? " Read-ahead here is a simple rule (two pages of a table in a row; scans for PostgreSQL-style); real InnoDB reads a whole 64-page extent once 56 of its pages were read in order, and would not read ahead tables this small at all." : "")));
+  if (state.byPolicy.pg)
+    mini.push("the PostgreSQL-style scan ring is a quarter of the pool (real: 32 pages)");
+  if (state.byPolicy.innodb)
+    mini.push("InnoDB-style promotes a page on a hit in a later query (real: after 1 second)");
+  help.append(
+    el(
+      "p",
+      "foot",
+      `Page reads were captured from SQLite ${state.data.sqlite_version} and replayed through miniature policies` +
+        (mini.length ? `: ${mini.join("; ")}` : "") +
+        ". Every pool sees SQLite's reads; another database would read different pages for the same query. Times come from one datasheet per drive (a Samsung 990 Pro SSD, a 7,200 rpm enterprise hard drive); the operating system's file cache and overlapping I/O with work are left out. The layout is SQLite's: tables share one file page by page." +
+        (state.readsAhead
+          ? " Read-ahead here is a simple rule (two pages of a table in a row; scans for PostgreSQL-style); real InnoDB reads a whole 64-page extent once 56 of its pages were read in order, and would not read ahead tables this small at all."
+          : "")
+    )
+  );
 }
 
 /* ---------- chart + pools for the visible set ---------- */
 function buildLanes() {
   stopRace();
-  for (const b of $("footer").querySelectorAll(".pt")) b.setAttribute("aria-pressed", visible.includes(b.dataset.p));
-  const pools = $("pools"); pools.replaceChildren(); LANES = {};
-  for (const p of D.runs.map(r => r.policy).filter(p => visible.includes(p))) {
-    const lane = el("section", "pool crow"); lane.setAttribute("aria-label", nameOf(p));
-    const pn = el("button", "pname"); pn.type = "button"; pn.append(el("span", "", nameOf(p)), el("small", "", INFO[p]?.how || ""));
+  for (const b of $("footer").querySelectorAll(".pt"))
+    b.setAttribute("aria-pressed", view.pools.includes(b.dataset.p));
+  const pools = $("pools");
+  pools.replaceChildren();
+  state.lanes = {};
+  for (const p of state.data.runs.map(r => r.policy).filter(p => view.pools.includes(p))) {
+    const lane = el("section", "pool crow");
+    lane.setAttribute("aria-label", nameOf(p));
+    const pn = el("button", "pname");
+    pn.type = "button";
+    pn.append(el("span", "", nameOf(p)), el("small", "", INFO[p]?.how || ""));
     pn.addEventListener("click", () => setFocus(p));
-    const track = el("div", "ctrack band"), score = el("div", "score"), fig = el("div", "fig"), sayEl = el("div", "say");
+    const track = el("div", "ctrack band"),
+      score = el("div", "score"),
+      fig = el("div", "fig"),
+      sayEl = el("div", "say");
     score.append(el("span", "place"), el("div", "t", "0"), el("div", "s"));
-    lane.append(pn, track, score, fig, sayEl); pools.append(lane);
-    LANES[p] = {lane, pn, track, score, fig, sayEl};
-    if (POS[p] === undefined) POS[p] = k;
+    lane.append(pn, track, score, fig, sayEl);
+    pools.append(lane);
+    state.lanes[p] = {lane, pn, track, score, fig, sayEl};
+    if (state.lanePos[p] === undefined) state.lanePos[p] = view.at;
   }
-  markFocus(); buildMoments(); buildChart();
+  markFocus();
+  buildMoments();
+  buildChart();
 }
 function markFocus() {
-  for (const p of visible) { const L = LANES[p], on = p === focus; L.lane.classList.toggle("focus", on); L.pn.setAttribute("aria-expanded", on); L.fig.hidden = !on; }
+  for (const p of view.pools) {
+    const L = state.lanes[p],
+      on = p === view.focus;
+    L.lane.classList.toggle("focus", on);
+    L.pn.setAttribute("aria-expanded", on);
+    L.fig.hidden = !on;
+  }
 }
-function setFocus(p) { if (p === focus) return; focus = p; markFocus(); buildChart(); for (const q of visible) paintLane(q, POS[q]); }
+function setFocus(p) {
+  if (p === view.focus) return;
+  view.focus = p;
+  markFocus();
+  buildChart();
+  for (const q of view.pools) paintLane(q, state.lanePos[q]);
+}
 
 function buildChart() {
-  const axis = $("axis"); axis.replaceChildren();
+  const axis = $("axis");
+  axis.replaceChildren();
   const W = axis.clientWidth || 600;
-  $("chartNote").textContent = `${N} frame${N === 1 ? "" : "s"} × ${K} accesses`;
+  $("chartNote").textContent =
+    `${state.frames} frame${state.frames === 1 ? "" : "s"} × ${state.accesses} accesses`;
   const seen = new Set();
-  for (const m of MOMENTS) {
-    if (seen.has(m.k)) continue; seen.add(m.k);
-    const b = el("button", "mk"); b.type = "button"; b.dataset.k = m.k; b.style.left = `${100 * (m.k + .5) / K}%`;
-    b.title = MOMENTS.filter(x => x.k === m.k).map(x => x.t).join(" · "); b.setAttribute("aria-label", "Moment: " + b.title);
-    b.addEventListener("click", () => { toStep(); jump(m.k); }); axis.append(b);
+  for (const m of state.moments) {
+    if (seen.has(m.k)) continue;
+    seen.add(m.k);
+    const b = el("button", "mk");
+    b.type = "button";
+    b.dataset.k = m.k;
+    b.style.left = `${(100 * (m.k + 0.5)) / state.accesses}%`;
+    b.title = state.moments
+      .filter(x => x.k === m.k)
+      .map(x => x.t)
+      .join(" · ");
+    b.setAttribute("aria-label", "Moment: " + b.title);
+    b.addEventListener("click", () => {
+      toStep();
+      jump(m.k);
+    });
+    axis.append(b);
   }
-  D.queries.forEach((q, i) => {
-    const [a, b] = q.accesses, px = W * (b - a) / K;
-    const s = el("button", "qs"); s.type = "button"; s.dataset.q = i;
-    s.style.left = `${100 * a / K}%`; s.style.width = `calc(${100 * (b - a) / K}% - 3px)`;
-    s.textContent = px >= 150 ? `${i + 1} · ${q.title}${isScanQ(q) ? " (scan)" : ""}` : px >= 8 * String(i + 1).length + 6 ? i + 1 : "";
-    s.title = `Query ${i + 1}: ${q.title}`; s.setAttribute("aria-label", s.title);
-    s.addEventListener("click", () => { toStep(); jump(a); }); axis.append(s);
+  state.data.queries.forEach((q, i) => {
+    const [a, b] = q.accesses,
+      px = (W * (b - a)) / state.accesses;
+    const s = el("button", "qs");
+    s.type = "button";
+    s.dataset.q = i;
+    s.style.left = `${(100 * a) / state.accesses}%`;
+    s.style.width = `calc(${(100 * (b - a)) / state.accesses}% - 3px)`;
+    s.textContent =
+      px >= 150
+        ? `${i + 1} · ${q.title}${isScanQ(q) ? " (scan)" : ""}`
+        : px >= 8 * String(i + 1).length + 6
+          ? i + 1
+          : "";
+    s.title = `Query ${i + 1}: ${q.title}`;
+    s.setAttribute("aria-label", s.title);
+    s.addEventListener("click", () => {
+      toStep();
+      jump(a);
+    });
+    axis.append(s);
   });
 
-  const colW = W / K;
-  for (const p of visible) {
+  const colW = W / state.accesses;
+  for (const p of view.pools) {
     // the pool in focus gets rows tall enough to label; the others stay slim
-    const H = p === focus ? Math.max(30, Math.min(120, N * 15)) : Math.max(24, Math.min(56, N * 6)), rowH = H / N, gap = rowH >= 8 ? 2 : rowH >= 3 ? 1 : 0;
-    const tr = LANES[p].track; tr.replaceChildren(); tr.style.height = H + "px";
-    D.queries.forEach(q => {
-      const [a, b] = q.accesses, scan = EV0.slice(a, b).find(e => e.scan);
-      if (scan) { const t = el("span", "tint"); t.style.left = `${100 * a / K}%`; t.style.width = `${100 * (b - a) / K}%`; t.style.setProperty("--c", colorOf(scan.page)); tr.append(t); }
-      if (a && colW >= 2) { const l = el("span", "qb"); l.style.left = `${100 * a / K}%`; tr.append(l); }
+    const H =
+        p === view.focus
+          ? Math.max(30, Math.min(120, state.frames * 15))
+          : Math.max(24, Math.min(56, state.frames * 6)),
+      rowH = H / state.frames,
+      gap = rowH >= 8 ? 2 : rowH >= 3 ? 1 : 0;
+    const tr = state.lanes[p].track;
+    tr.replaceChildren();
+    tr.style.height = H + "px";
+    state.data.queries.forEach(q => {
+      const [a, b] = q.accesses,
+        scan = state.events.slice(a, b).find(e => e.scan);
+      if (scan) {
+        const t = el("span", "tint");
+        t.style.left = `${(100 * a) / state.accesses}%`;
+        t.style.width = `${(100 * (b - a)) / state.accesses}%`;
+        t.style.setProperty("--c", colorOf(scan.page));
+        tr.append(t);
+      }
+      if (a && colW >= 2) {
+        const l = el("span", "qb");
+        l.style.left = `${(100 * a) / state.accesses}%`;
+        tr.append(l);
+      }
     });
-    for (const bar of BARS[p]) {
-      const span = bar.e - bar.s + 1, d = el("div", "bar" + (colW >= 5 ? " edge" : ""));
-      d.style.cssText = `left:${100 * bar.s / K}%;width:calc(${100 * span / K}% - ${colW >= 3 ? 1 : 0}px);top:${bar.f * rowH}px;height:${Math.max(1, rowH - gap)}px;line-height:${Math.max(1, rowH - gap)}px`;
+    for (const bar of state.bars[p]) {
+      const span = bar.e - bar.s + 1,
+        d = el("div", "bar" + (colW >= 5 ? " edge" : ""));
+      d.style.cssText = `left:${(100 * bar.s) / state.accesses}%;width:calc(${(100 * span) / state.accesses}% - ${colW >= 3 ? 1 : 0}px);top:${bar.f * rowH}px;height:${Math.max(1, rowH - gap)}px;line-height:${Math.max(1, rowH - gap)}px`;
       d.style.setProperty("--c", colorOf(bar.page));
-      if (rowH - gap >= 12 && span * colW >= 30) { d.textContent = "p" + bar.page; d.classList.add("lab"); }
-      if (rowH - gap >= 7 && colW >= 7) for (const h of bar.hits) { const dot = el("i"); dot.style.left = `${100 * (h - bar.s + .5) / span}%`; d.append(dot); }
+      if (rowH - gap >= 12 && span * colW >= 30) {
+        d.textContent = "p" + bar.page;
+        d.classList.add("lab");
+      }
+      if (rowH - gap >= 7 && colW >= 7)
+        for (const h of bar.hits) {
+          const dot = el("i");
+          dot.style.left = `${(100 * (h - bar.s + 0.5)) / span}%`;
+          d.append(dot);
+        }
       tr.append(d);
     }
     tr.append(el("span", "veil"), el("span", "ph"));
-    paintBand(p, POS[p]);
+    paintBand(p, state.lanePos[p]);
   }
-  markAxis(k);
+  markAxis(view.at);
 }
 function markAxis(at) {
-  const q = at >= 0 ? EV0[at].query : -1;
-  for (const s of $("axis").querySelectorAll(".qs")) { const i = +s.dataset.q; s.classList.toggle("cur", i === q); s.classList.toggle("done", q >= 0 && D.queries[i].accesses[0] <= at); }
-  for (const b of $("axis").querySelectorAll(".mk")) b.classList.toggle("cur", mode === "step" && +b.dataset.k === at);
+  const q = at >= 0 ? state.events[at].query : -1;
+  for (const s of $("axis").querySelectorAll(".qs")) {
+    const i = +s.dataset.q;
+    s.classList.toggle("cur", i === q);
+    s.classList.toggle("done", q >= 0 && state.data.queries[i].accesses[0] <= at);
+  }
+  for (const b of $("axis").querySelectorAll(".mk"))
+    b.classList.toggle("cur", view.mode === "step" && +b.dataset.k === at);
 }
-const totals = (p, at) => at < 0 ? {cost: 0, hits: 0, early: 0, req: 0} : {cost: CUM[p].c[at], hits: CUM[p].h[at], early: CUM[p].a[at], req: CUM[p].q[at]};
+const totals = (p, at) =>
+  at < 0
+    ? {cost: 0, hits: 0, early: 0, req: 0}
+    : {
+        cost: state.running[p].c[at],
+        hits: state.running[p].h[at],
+        early: state.running[p].a[at],
+        req: state.running[p].q[at]
+      };
 function paintBand(p, at) {
-  const L = LANES[p], x = `${100 * (at + 1) / K}%`;
+  const L = state.lanes[p],
+    x = `${(100 * (at + 1)) / state.accesses}%`;
   L.track.querySelector(".veil").style.left = x;
-  const ph = L.track.querySelector(".ph"); ph.style.left = x; ph.hidden = at < 0;
+  const ph = L.track.querySelector(".ph");
+  ph.style.left = x;
+  ph.hidden = at < 0;
 }
 
 /* ---------- one access in words ---------- */
 function describe(p, e) {
-  const ev = e.evicted, parts = [], sweeps = e.notes.filter(n => n.kind === "swept").length;
+  const ev = e.evicted,
+    parts = [],
+    sweeps = e.notes.filter(n => n.kind === "swept").length;
   if (e.read === "next") parts.push("reads the next page on disk");
   else if (e.read === "ahead") parts.push(`reads ${e.skipped + 1} page${e.skipped ? "s" : ""} further on`);
   else if (e.read === "jump") parts.push("jumps on disk: a full request");
   else if (e.kind === "miss") parts.push("a page SQLite writes without reading: nothing to read from disk");
-  if (e.ahead?.length) parts.push(`reads ${e.ahead.length > 1 ? `p${e.ahead[0]}–p${e.ahead.at(-1)}` : `p${e.ahead[0]}`} ahead in the same request`);
+  if (e.ahead?.length)
+    parts.push(
+      `reads ${e.ahead.length > 1 ? `p${e.ahead[0]}–p${e.ahead.at(-1)}` : `p${e.ahead[0]}`} ahead in the same request`
+    );
   if (e.read_ahead_hit) parts.push("read ahead earlier: no wait");
   /* evict notes come in order: the missed page's victim (if any), then the read-ahead's */
-  const victims = [ev, ...(e.ahead_evicted || [])].filter(Boolean); let vi = 0;
+  const victims = [ev, ...(e.ahead_evicted || [])].filter(Boolean);
+  let vi = 0;
   for (const n of e.notes) {
     if (n.kind === "evict") {
-      const vic = victims[vi++] || {page: "?", dirty: false}, early = vic !== ev;
-      const w = n.why, v = `p${vic.page}`;
+      const vic = victims[vi++] || {page: "?", dirty: false},
+        early = vic !== ev;
+      const w = n.why,
+        v = `p${vic.page}`;
       if (early) parts.push("for the read-ahead");
       if (sweeps) parts.push(`hand passes ${sweeps} frame${sweeps > 1 ? "s" : ""}`);
       parts.push(
-        w.kind === "least_recent" ? `evicts ${v}, used least recently` :
-        w.kind === "loaded_first" ? `evicts ${v}, loaded first` :
-        w.kind === "count_zero" ? `evicts ${v}, ${p === "clock" ? "its bit was clear" : "its usage was 0"}` :
-        w.kind === "ring_reuse" ? `the scan reuses its ring frame, evicting ${v}` :
-        w.kind === "old_tail" ? `evicts ${v} from the old tail` :
-        w.kind === "furthest_next_use" ? (w.next_use == null ? `evicts ${v}, never needed again` : `evicts ${v}, needed last (read ${w.next_use + 1})`) : `evicts ${v}`);
+        w.kind === "least_recent"
+          ? `evicts ${v}, used least recently`
+          : w.kind === "loaded_first"
+            ? `evicts ${v}, loaded first`
+            : w.kind === "count_zero"
+              ? `evicts ${v}, ${p === "clock" ? "its bit was clear" : "its usage was 0"}`
+              : w.kind === "ring_reuse"
+                ? `the scan reuses its ring frame, evicting ${v}`
+                : w.kind === "old_tail"
+                  ? `evicts ${v} from the old tail`
+                  : w.kind === "furthest_next_use"
+                    ? w.next_use == null
+                      ? `evicts ${v}, never needed again`
+                      : `evicts ${v}, needed last (read ${w.next_use + 1})`
+                    : `evicts ${v}`
+      );
       if (vic.dirty) parts.push(`${v} was modified: written back first`);
-    }
-    else if (n.kind === "counted" && e.kind === "hit") parts.push(p === "clock" ? "bit set" : `usage ${n.from} → ${n.to}`);
+    } else if (n.kind === "counted" && e.kind === "hit")
+      parts.push(p === "clock" ? "bit set" : `usage ${n.from} → ${n.to}`);
     else if (n.kind === "joined_ring") parts.push("frame joins the scan's ring");
     else if (n.kind === "ring_busy") parts.push(`ring frame is hot (usage ${n.usage}), sweeps instead`);
     else if (n.kind === "inserted") parts.push("enters at the midpoint (old)");
     else if (n.kind === "promoted") parts.push("seen again in a later query: promoted to young");
     else if (n.kind === "stays_old") parts.push("seen again in the same query: stays old");
-    else if (n.kind === "first_use") parts.push("first use of a page read ahead: stays old, its clock starts now");
+    else if (n.kind === "first_use")
+      parts.push("first use of a page read ahead: stays old, its clock starts now");
   }
   if (e.kind === "hit" && p === "lru") parts.push("now most recent");
   if (e.kind === "hit" && p === "innodb" && !e.notes.length) parts.push("moves to the head");
-  if (e.kind === "hit" && p === "pg" && e.scan && !e.notes.length) parts.push("a scan's hit leaves usage as is");
+  if (e.kind === "hit" && p === "pg" && e.scan && !e.notes.length)
+    parts.push("a scan's hit leaves usage as is");
   if (e.kind === "hit" && !parts.length) parts.push("already in memory");
   if (e.kind === "miss" && !ev) parts.push("into an empty frame");
   /* a request that reads ahead repeats a step per page: say it once with a count */
   const merged = [];
-  for (const t of parts) { const last = merged.at(-1); if (last && last.t === t) last.n++; else merged.push({t, n: 1}); }
-  return merged.map(m => m.n > 1 ? `${m.t} (×${m.n})` : m.t).join(" · ");
+  for (const t of parts) {
+    const last = merged.at(-1);
+    if (last && last.t === t) last.n++;
+    else merged.push({t, n: 1});
+  }
+  return merged.map(m => (m.n > 1 ? `${m.t} (×${m.n})` : m.t)).join(" · ");
 }
 
 /* ---------- drawing pools ---------- */
-function pips(n) { const d = el("span", "dots"); for (let i = 0; i < 5; i++) d.append(el("i", i < n ? "on" : "")); return d; }
+function pips(n) {
+  const d = el("span", "dots");
+  for (let i = 0; i < 5; i++) d.append(el("i", i < n ? "on" : ""));
+  return d;
+}
 function tile(f, at, touched, badge) {
   if (f.page == null) return el("div", "slot");
-  const st = f.state, t = el("div", "tile" + (f.dirty ? " dirty" : "") + (st.kind === "innodb" && st.region === "old" ? " old" : "") + (st.kind === "pg" && st.in_ring ? " ring" : "") + (touched ? " touched" : ""));
-  t.dataset.page = f.page; t.style.setProperty("--c", colorOf(f.page)); t.title = `page ${f.page} · ${pageDesc(f.page)}`;
+  const st = f.state,
+    t = el(
+      "div",
+      "tile" +
+        (f.dirty ? " dirty" : "") +
+        (st.kind === "innodb" && st.region === "old" ? " old" : "") +
+        (st.kind === "pg" && st.in_ring ? " ring" : "") +
+        (touched ? " touched" : "")
+    );
+  t.dataset.page = f.page;
+  t.style.setProperty("--c", colorOf(f.page));
+  t.title = `page ${f.page} · ${pageDesc(f.page)}`;
   t.append(el("span", "pg", "p" + f.page));
   const b = el("span", "bd");
   if (st.kind === "pg") b.append(pips(st.usage));
   else if (st.kind === "clock") b.textContent = st.referenced ? "●" : "";
   else if (badge === "next" && st.rank === 0) b.textContent = "next";
-  else if (st.kind === "opt" && badge) b.textContent = st.next_use == null ? "never" : `in ${st.next_use - at}`;
-  t.append(b); return t;
+  else if (st.kind === "opt" && badge)
+    b.textContent = st.next_use == null ? "never" : `in ${st.next_use - at}`;
+  t.append(b);
+  return t;
 }
-function axisLine(a, b) { const d = el("div", "axisline"); d.append(el("span", "", a), el("i"), el("span", "", b)); return d; }
-function row(frames, at, hit, badge) { const d = el("div", "tiles"); frames.forEach(f => d.append(tile(f, at, f === hit, badge))); return d; }
+function axisLine(a, b) {
+  const d = el("div", "axisline");
+  d.append(el("span", "", a), el("i"), el("span", "", b));
+  return d;
+}
+function row(frames, at, hit, badge) {
+  const d = el("div", "tiles");
+  frames.forEach(f => d.append(tile(f, at, f === hit, badge)));
+  return d;
+}
 
 function drawFocus(p, e, at, touched) {
-  const out = el("div"), fr = e.frames, hit = touched >= 0 ? fr[touched] : null, kind = KIND[p];
-  const live = fr.filter(f => f.page != null), empty = fr.filter(f => f.page == null);
-  const ts = N <= 10 ? 56 : N <= 16 ? 46 : N <= 32 ? 36 : 20;
-  const ringOk = (kind === "pg" || kind === "clock") && N >= 3 && N <= 16;
-  const fig = LANES[p].fig; fig.style.setProperty("--ts", (ringOk ? 44 : ts) + "px"); fig.classList.toggle("small", !ringOk && ts < 30);
+  const out = el("div"),
+    fr = e.frames,
+    hit = touched >= 0 ? fr[touched] : null,
+    kind = state.shape[p];
+  const live = fr.filter(f => f.page != null),
+    empty = fr.filter(f => f.page == null);
+  const ts = state.frames <= 10 ? 56 : state.frames <= 16 ? 46 : state.frames <= 32 ? 36 : 20;
+  const ringOk = (kind === "pg" || kind === "clock") && state.frames >= 3 && state.frames <= 16;
+  const fig = state.lanes[p].fig;
+  fig.style.setProperty("--ts", (ringOk ? 44 : ts) + "px");
+  fig.classList.toggle("small", !ringOk && ts < 30);
 
   if (kind === "lru" || kind === "fifo") {
-    out.append(axisLine(kind === "lru" ? "used most recently" : "loaded last", "next out"),
-      row([...live].sort((a, b) => b.state.rank - a.state.rank).concat(empty), at, hit));
+    out.append(
+      axisLine(kind === "lru" ? "used most recently" : "loaded last", "next out"),
+      row([...live].sort((a, b) => b.state.rank - a.state.rank).concat(empty), at, hit)
+    );
   } else if (kind === "opt") {
-    const key = f => f.state.next_use == null ? Infinity : f.state.next_use;
-    out.append(axisLine("needed soonest", "needed last: next out"), row([...live].sort((a, b) => key(a) - key(b)).concat(empty), at, hit, true));
+    const key = f => (f.state.next_use == null ? Infinity : f.state.next_use);
+    out.append(
+      axisLine("needed soonest", "needed last: next out"),
+      row([...live].sort((a, b) => key(a) - key(b)).concat(empty), at, hit, true)
+    );
   } else if (kind === "innodb") {
     const by = r => live.filter(f => f.state.region === r).sort((a, b) => b.state.rank - a.state.rank);
-    const young = by("young"), old = by("old"), s = el("div", "split");
-    const grp = (label, fs) => { const g = el("div", "grp"); g.append(el("span", "lbl", label), row(fs, at, hit)); return g; };
+    const young = by("young"),
+      old = by("old"),
+      s = el("div", "split");
+    const grp = (label, fs) => {
+      const g = el("div", "grp");
+      g.append(el("span", "lbl", label), row(fs, at, hit));
+      return g;
+    };
     if (young.length) s.append(grp(`young · ${young.length}, protected`, young));
-    s.append(el("span", "mid"), grp(`old · ${old.length}, on probation${empty.length ? ` · ${empty.length} empty` : ""}`, old.concat(empty)), el("span", "lbl", "next out"));
-    out.append(s, el("div", "hint", "New pages enter at the bar. Only a hit in a later query moves one into young."));
+    s.append(
+      el("span", "mid"),
+      grp(
+        `old · ${old.length}, on probation${empty.length ? ` · ${empty.length} empty` : ""}`,
+        old.concat(empty)
+      ),
+      el("span", "lbl", "next out")
+    );
+    out.append(
+      s,
+      el("div", "hint", "New pages enter at the bar. Only a hit in a later query moves one into young.")
+    );
   } else if (ringOk) {
-    const r = Math.max(58, N * 44 * 1.2 / (2 * Math.PI)), box = 2 * r + 44, ring = el("div", "ringbox"); ring.style.width = ring.style.height = box + "px";
+    const r = Math.max(58, (state.frames * 44 * 1.2) / (2 * Math.PI)),
+      box = 2 * r + 44,
+      ring = el("div", "ringbox");
+    ring.style.width = ring.style.height = box + "px";
     fr.forEach((f, i) => {
-      const a = i * 2 * Math.PI / N, t = tile(f, at, f === hit);
-      t.style.left = `${box / 2 + r * Math.sin(a) - 22}px`; t.style.top = `${box / 2 - r * Math.cos(a) - 22}px`; ring.append(t);
+      const a = (i * 2 * Math.PI) / state.frames,
+        t = tile(f, at, f === hit);
+      t.style.left = `${box / 2 + r * Math.sin(a) - 22}px`;
+      t.style.top = `${box / 2 - r * Math.cos(a) - 22}px`;
+      ring.append(t);
     });
     if (e.hand != null) {
-      const len = r - 30, h = el("span", "hand"); h.style.cssText = `left:${box / 2 - 1}px;top:${box / 2 - len}px;height:${len}px;transform:rotate(${e.hand * 360 / N}deg)`;
-      const hub = el("span", "hub"); hub.style.cssText = `left:${box / 2 - 4}px;top:${box / 2 - 4}px`; ring.append(h, hub);
+      const len = r - 30,
+        h = el("span", "hand");
+      h.style.cssText = `left:${box / 2 - 1}px;top:${box / 2 - len}px;height:${len}px;transform:rotate(${(e.hand * 360) / state.frames}deg)`;
+      const hub = el("span", "hub");
+      hub.style.cssText = `left:${box / 2 - 4}px;top:${box / 2 - 4}px`;
+      ring.append(h, hub);
     }
-    const keys = el("div", "keys"), key = (glyph, text) => { const d = el("div"), g = el("span", "g"); g.append(glyph); d.append(g, el("span", "", text)); keys.append(d); };
-    const hand = el("span"); hand.style.cssText = "width:2px;height:16px;background:var(--accent)";
-    key(hand, kind === "pg" ? "Hand: sweeps clockwise, taking one from each count until it finds a 0." : "Hand: sweeps clockwise, clearing bits until it finds a clear one.");
+    const keys = el("div", "keys"),
+      key = (glyph, text) => {
+        const d = el("div"),
+          g = el("span", "g");
+        g.append(glyph);
+        d.append(g, el("span", "", text));
+        keys.append(d);
+      };
+    const hand = el("span");
+    hand.style.cssText = "width:2px;height:16px;background:var(--accent)";
+    key(
+      hand,
+      kind === "pg"
+        ? "Hand: sweeps clockwise, taking one from each count until it finds a 0."
+        : "Hand: sweeps clockwise, clearing bits until it finds a clear one."
+    );
     if (kind === "pg") {
       key(pips(3), "Usage count, 0 to 5. A hit adds one.");
-      const rg = el("span"); rg.style.cssText = "width:14px;height:14px;border-radius:4px;box-shadow:inset 0 0 0 1.5px var(--accent)";
+      const rg = el("span");
+      rg.style.cssText =
+        "width:14px;height:14px;border-radius:4px;box-shadow:inset 0 0 0 1.5px var(--accent)";
       key(rg, "Scan ring: the only frames a big scan may recycle.");
     } else key(el("span", "", "●"), "Reference bit: set on every use, buys one more lap.");
-    const s = el("div", "shape"); s.append(ring, keys); out.append(s);
+    const s = el("div", "shape");
+    s.append(ring, keys);
+    out.append(s);
   } else {
     const d = row(fr, at, hit, "next");
     if (e.hand != null && d.children[e.hand] && ts >= 30) d.children[e.hand].append(el("span", "handmark"));
@@ -652,238 +1060,595 @@ function drawFocus(p, e, at, touched) {
   return out;
 }
 function paintLane(p, at) {
-  const L = LANES[p]; if (!L) return; POS[p] = at;
-  const e = at >= 0 ? RUN[p].events[at] : null, touched = e && mode === "step" ? e.frame : -1;
-  const shown = e || {frames: Array.from({length: N}, () => ({page: null, dirty: false, state: {kind: "empty"}})), hand: null};
-  if (p === focus) L.fig.replaceChildren(drawFocus(p, shown, at, touched)); else L.fig.replaceChildren();
+  const L = state.lanes[p];
+  if (!L) return;
+  state.lanePos[p] = at;
+  const e = at >= 0 ? state.byPolicy[p].events[at] : null,
+    touched = e && view.mode === "step" ? e.frame : -1;
+  const shown = e || {
+    frames: Array.from({length: state.frames}, () => ({page: null, dirty: false, state: {kind: "empty"}})),
+    hand: null
+  };
+  if (p === view.focus) L.fig.replaceChildren(drawFocus(p, shown, at, touched));
+  else L.fig.replaceChildren();
   const t = totals(p, at);
   L.score.querySelector(".t").textContent = at < 0 ? "0" : fmtMs(t.cost);
-  const left = at === K - 1 ? RUN[p].summary.dirty_at_end : 0;
-  L.score.querySelector(".s").textContent = at < 0 ? "nothing yet" :
-    `${t.hits}/${at + 1} hits · ${t.req} request${t.req === 1 ? "" : "s"}` + (left ? ` · ${left} still modified` : "");
-  L.score.title = at < 0 ? "" : [
-    `${t.hits} hits, ${t.early} of them on pages read ahead; ${t.req} disk request${t.req === 1 ? "" : "s"} waited on`,
-    left ? `${left} modified page${left > 1 ? "s" : ""} still in memory at the end; a checkpoint would write ${left > 1 ? "them" : "it"} (not counted)` : ""].filter(Boolean).join(". ");
+  const left = at === state.accesses - 1 ? state.byPolicy[p].summary.dirty_at_end : 0;
+  L.score.querySelector(".s").textContent =
+    at < 0
+      ? "nothing yet"
+      : `${t.hits}/${at + 1} hits · ${t.req} request${t.req === 1 ? "" : "s"}` +
+        (left ? ` · ${left} still modified` : "");
+  L.score.title =
+    at < 0
+      ? ""
+      : [
+          `${t.hits} hits, ${t.early} of them on pages read ahead; ${t.req} disk request${t.req === 1 ? "" : "s"} waited on`,
+          left
+            ? `${left} modified page${left > 1 ? "s" : ""} still in memory at the end; a checkpoint would write ${left > 1 ? "them" : "it"} (not counted)`
+            : ""
+        ]
+          .filter(Boolean)
+          .join(". ");
   L.sayEl.replaceChildren();
-  if (e && mode === "step") L.sayEl.append(el("span", "k " + e.kind, e.kind), describe(p, e));
+  if (e && view.mode === "step") L.sayEl.append(el("span", "k " + e.kind, e.kind), describe(p, e));
   paintBand(p, at);
 }
-function renderAll(at) { for (const p of visible) paintLane(p, at); renderChrome(at); }
+function renderAll(at) {
+  for (const p of view.pools) paintLane(p, at);
+  renderChrome(at);
+}
 function renderChrome(at) {
-  for (const c of Object.values(cellEls)) c.classList.remove("now");
-  if (at >= 0 && mode === "step") cellEls[EV0[at].page]?.classList.add("now");
-  $("scrub").value = at; markAxis(at);
-  const q = at >= 0 ? EV0[at].query : -1, query = D.queries[Math.max(0, q)];
-  if (mode === "race") { $("qTitle").textContent = "Race"; $("qSql").textContent = ""; $("pos").textContent = `${K} accesses each`; }
-  else {
+  for (const c of Object.values(view.diskCells)) c.classList.remove("now");
+  if (at >= 0 && view.mode === "step") view.diskCells[state.events[at].page]?.classList.add("now");
+  $("scrub").value = at;
+  markAxis(at);
+  const q = at >= 0 ? state.events[at].query : -1,
+    query = state.data.queries[Math.max(0, q)];
+  if (view.mode === "race") {
+    $("qTitle").textContent = "Race";
+    $("qSql").textContent = "";
+    $("pos").textContent = `${state.accesses} accesses each`;
+  } else {
     $("qTitle").textContent = q < 0 ? "Before the first query" : `${q + 1}. ${query.title}`;
     $("qSql").textContent = q < 0 ? "" : query.sql;
-    $("pos").textContent = at < 0 ? `${K} accesses ahead` : `access ${at + 1}/${K} · p${EV0[at].page} ${pageDesc(EV0[at].page)}`;
+    $("pos").textContent =
+      at < 0
+        ? `${state.accesses} accesses ahead`
+        : `access ${at + 1}/${state.accesses} · p${state.events[at].page} ${pageDesc(state.events[at].page)}`;
   }
-  renderMoment(at); renderFold(at);
+  renderMoment(at);
+  renderFold(at);
 }
 
 /* ---------- moments, found from the events ---------- */
 function buildMoments() {
-  const list = [], real = visible.filter(p => p !== "opt"), E = p => RUN[p].events;
-  const and = xs => xs.length > 1 ? xs.slice(0, -1).join(", ") + " and " + xs.at(-1) : xs[0];
-  D.queries.forEach(q => {
-    const s = EV0.slice(q.accesses[0], q.accesses[1]).find(e => e.scan);
-    if (s) list.push({k: s.pos, t: "A scan starts", d: `${q.title} reads all ${s.scan} pages of ${objLabel(PAGE[s.page]?.object)}. Watch what each pool keeps.`});
+  const list = [],
+    real = view.pools.filter(p => p !== "opt"),
+    E = p => state.byPolicy[p].events;
+  const and = xs => (xs.length > 1 ? xs.slice(0, -1).join(", ") + " and " + xs.at(-1) : xs[0]);
+  state.data.queries.forEach(q => {
+    const s = state.events.slice(q.accesses[0], q.accesses[1]).find(e => e.scan);
+    if (s)
+      list.push({
+        k: s.pos,
+        t: "A scan starts",
+        d: `${q.title} reads all ${s.scan} pages of ${objLabel(state.pages[s.page]?.object)}. Watch what each pool keeps.`
+      });
   });
-  if (real.length > 1) for (let i = 0; i < K; i++) {
-    const acts = real.map(p => { const e = E(p)[i]; return e.kind === "hit" ? "keeps it" : e.evicted ? "evicts p" + e.evicted.page : "uses a free frame"; });
-    if (new Set(acts).size > 1) { list.push({k: i, t: "The pools disagree", d: real.map((p, j) => `${nameOf(p)} ${acts[j]}`).join(" · ")}); break; }
-  }
-  const ra = real.map(p => [p, E(p).findIndex(e => e.ahead?.length)]).filter(([, i]) => i >= 0).sort((x, y) => x[1] - y[1])[0];
+  if (real.length > 1)
+    for (let i = 0; i < state.accesses; i++) {
+      const acts = real.map(p => {
+        const e = E(p)[i];
+        return e.kind === "hit" ? "keeps it" : e.evicted ? "evicts p" + e.evicted.page : "uses a free frame";
+      });
+      if (new Set(acts).size > 1) {
+        list.push({
+          k: i,
+          t: "The pools disagree",
+          d: real.map((p, j) => `${nameOf(p)} ${acts[j]}`).join(" · ")
+        });
+        break;
+      }
+    }
+  const ra = real
+    .map(p => [p, E(p).findIndex(e => e.ahead?.length)])
+    .filter(([, i]) => i >= 0)
+    .sort((x, y) => x[1] - y[1])[0];
   if (ra) {
-    const [p, i] = ra, e = E(p)[i], n = e.ahead.length;
-    list.push({k: i, t: "Reading ahead", d: `${nameOf(p)} reads p${e.page} and the ${n > 1 ? `next ${n} pages` : "next page"} of ${objLabel(PAGE[e.page]?.object)} in one request; when the query gets to them they are already in memory.`});
+    const [p, i] = ra,
+      e = E(p)[i],
+      n = e.ahead.length;
+    list.push({
+      k: i,
+      t: "Reading ahead",
+      d: `${nameOf(p)} reads p${e.page} and the ${n > 1 ? `next ${n} pages` : "next page"} of ${objLabel(state.pages[e.page]?.object)} in one request; when the query gets to them they are already in memory.`
+    });
   }
-  if (RUN.opt) {
+  if (state.byPolicy.opt) {
     const regrets = {};
     for (const p of real) {
-      const ev = E(p), last = {};
-      for (let i = 0; i < K; i++) {
+      const ev = E(p),
+        last = {};
+      for (let i = 0; i < state.accesses; i++) {
         const e = ev[i];
-        if (e.kind === "miss" && last[e.page] !== undefined && RUN.opt.events[i].kind === "hit") { (regrets[i] ||= {k: i, page: e.page, who: []}).who.push(nameOf(p)); break; }
+        if (e.kind === "miss" && last[e.page] !== undefined && state.byPolicy.opt.events[i].kind === "hit") {
+          (regrets[i] ||= {k: i, page: e.page, who: []}).who.push(nameOf(p));
+          break;
+        }
         if (e.evicted) last[e.evicted.page] = i;
       }
     }
-    for (const r of Object.values(regrets)) list.push({k: r.k, t: "Paying for an eviction", d: `${and(r.who)} evicted p${r.page} earlier and must now read it back from disk. Optimal kept it.`});
+    for (const r of Object.values(regrets))
+      list.push({
+        k: r.k,
+        t: "Paying for an eviction",
+        d: `${and(r.who)} evicted p${r.page} earlier and must now read it back from disk. Optimal kept it.`
+      });
   }
   for (const p of real) {
     const i = E(p).findIndex(e => e.evicted?.dirty);
-    if (i >= 0) { list.push({k: i, t: "A modified page goes back to disk", d: `${nameOf(p)} writes p${E(p)[i].evicted.page} back before reusing the frame, so this access takes ${fmtMs(writeMs(PROFILE))} longer.`}); break; }
+    if (i >= 0) {
+      list.push({
+        k: i,
+        t: "A modified page goes back to disk",
+        d: `${nameOf(p)} writes p${E(p)[i].evicted.page} back before reusing the frame, so this access takes ${fmtMs(writeMs(state.profile))} longer.`
+      });
+      break;
+    }
   }
   if (real.length > 1) {
     let best = null;
-    D.queries.forEach((q, i) => {
-      const h = real.map(p => E(p).slice(q.accesses[0], q.accesses[1]).filter(e => e.kind === "hit").length), gap = Math.max(...h) - Math.min(...h);
+    state.data.queries.forEach((q, i) => {
+      const h = real.map(
+          p =>
+            E(p)
+              .slice(q.accesses[0], q.accesses[1])
+              .filter(e => e.kind === "hit").length
+        ),
+        gap = Math.max(...h) - Math.min(...h);
       if (gap > 0 && (!best || gap > best.gap)) best = {gap, i, h};
     });
-    if (best) { const q = D.queries[best.i], n = q.accesses[1] - q.accesses[0]; list.push({k: q.accesses[0], t: "Same query, different hits", d: real.map((p, j) => `${nameOf(p)} ${best.h[j]}/${n} hits`).join(" · ")}); }
+    if (best) {
+      const q = state.data.queries[best.i],
+        n = q.accesses[1] - q.accesses[0];
+      list.push({
+        k: q.accesses[0],
+        t: "Same query, different hits",
+        d: real.map((p, j) => `${nameOf(p)} ${best.h[j]}/${n} hits`).join(" · ")
+      });
+    }
   }
-  MOMENTS = list.sort((a, b) => a.k - b.k);
+  state.moments = list.sort((a, b) => a.k - b.k);
 }
 function renderMoment(at) {
-  const box = $("moment"); box.replaceChildren();
-  if (mode === "race") { box.append(el("span", "d", "Each pool runs at its own pace: hits are quick, disk reads take visible time, write-backs longer.")); return; }
-  const here = MOMENTS.filter(m => m.k === at), next = MOMENTS.find(m => m.k > at);
-  if (here.length) box.append(el("span", "tag", "◆ " + here.map(m => m.t).join(" · ")), el("span", "d", here.map(m => m.d).join(" ")));
+  const box = $("moment");
+  box.replaceChildren();
+  if (view.mode === "race") {
+    box.append(
+      el(
+        "span",
+        "d",
+        "Each pool runs at its own pace: hits are quick, disk reads take visible time, write-backs longer."
+      )
+    );
+    return;
+  }
+  const here = state.moments.filter(m => m.k === at),
+    next = state.moments.find(m => m.k > at);
+  if (here.length)
+    box.append(
+      el("span", "tag", "◆ " + here.map(m => m.t).join(" · ")),
+      el("span", "d", here.map(m => m.d).join(" "))
+    );
   else box.append(el("span", "d", at < 0 && next ? "Press Play, or jump to the first moment." : ""));
-  if (next) { const b = el("button", "", `next: ${next.t.toLowerCase()} →`); b.type = "button"; b.addEventListener("click", () => { stop(); jump(next.k); }); box.append(b); }
+  if (next) {
+    const b = el("button", "", `next: ${next.t.toLowerCase()} →`);
+    b.type = "button";
+    b.addEventListener("click", () => {
+      stopPlaying();
+      jump(next.k);
+    });
+    box.append(b);
+  }
 }
 
 /* ---------- the query's path, rows and cost ---------- */
 function renderFold(at) {
-  const sum = $("foldSum"), body = $("foldBody"); sum.replaceChildren(); body.replaceChildren();
-  if (at < 0 || mode === "race") { sum.append(el("b", "", "Query path and rows"), "shown while stepping"); return; }
-  const e = EV0[at], q = D.queries[e.query], rows = D.rows[e.page], [a, b] = q.accesses;
-  sum.append(el("b", "", "Query path and rows"), `p${e.page} · ${pageDesc(e.page)}` + (rows ? ` · ${rows.rows.length} entries` : ""));
+  const sum = $("foldSum"),
+    body = $("foldBody");
+  sum.replaceChildren();
+  body.replaceChildren();
+  if (at < 0 || view.mode === "race") {
+    sum.append(el("b", "", "Query path and rows"), "shown while stepping");
+    return;
+  }
+  const e = state.events[at],
+    q = state.data.queries[e.query],
+    rows = state.data.rows[e.page],
+    [a, b] = q.accesses;
+  sum.append(
+    el("b", "", "Query path and rows"),
+    `p${e.page} · ${pageDesc(e.page)}` + (rows ? ` · ${rows.rows.length} entries` : "")
+  );
   if (!$("fold").open) return;
 
   const cq = el("div", "col q");
-  cq.append(el("span", "eyebrow", `the query · ${e.query + 1} of ${D.queries.length}`), el("h2", "", q.title), el("div", "sql", q.sql));
+  cq.append(
+    el("span", "eyebrow", `the query · ${e.query + 1} of ${state.data.queries.length}`),
+    el("h2", "", q.title),
+    el("div", "sql", q.sql)
+  );
   if (q.plan.length) cq.append(el("div", "plan", "plan: " + q.plan.join(" · ")));
   cq.append(el("div", "why", `${b - a} page read${b - a === 1 ? "" : "s"}.`));
 
-  const cp = el("div", "col p"), path = el("div", "path");
-  const lo = Math.max(a, Math.min(at - 6, b - 14)), hi = Math.min(b, Math.max(lo + 14, at + 2));
+  const cp = el("div", "col p"),
+    path = el("div", "path");
+  const lo = Math.max(a, Math.min(at - 6, b - 14)),
+    hi = Math.min(b, Math.max(lo + 14, at + 2));
   if (lo > a) path.append("…");
   for (let i = lo; i < hi; i++) {
-    const x = el("button", i === at ? "now" : i > at ? "later" : "", "p" + EV0[i].page); x.type = "button"; x.style.setProperty("--c", colorOf(EV0[i].page));
-    x.title = `read ${i + 1}: ${pageDesc(EV0[i].page)}`; x.addEventListener("click", () => { stop(); jump(i); });
-    path.append(x); if (i < hi - 1) path.append("→");
+    const x = el("button", i === at ? "now" : i > at ? "later" : "", "p" + state.events[i].page);
+    x.type = "button";
+    x.style.setProperty("--c", colorOf(state.events[i].page));
+    x.title = `read ${i + 1}: ${pageDesc(state.events[i].page)}`;
+    x.addEventListener("click", () => {
+      stopPlaying();
+      jump(i);
+    });
+    path.append(x);
+    if (i < hi - 1) path.append("→");
   }
   if (hi < b) path.append("…");
-  const hd = el("div", "pagehd", pageDesc(e.page)); if (rows) hd.append(el("span", "", `${rows.rows.length} entries on p${e.page}`));
+  const hd = el("div", "pagehd", pageDesc(e.page));
+  if (rows) hd.append(el("span", "", `${rows.rows.length} entries on p${e.page}`));
   cp.append(el("span", "eyebrow", "the pages it reads"), path, hd);
-  if (!rows) cp.append(el("div", "why", e.page === 1 ? "Page 1 holds the file header and schema. SQLite reads it at the start of every statement." : "No rows were captured for this page."));
+  if (!rows)
+    cp.append(
+      el(
+        "div",
+        "why",
+        e.page === 1
+          ? "Page 1 holds the file header and schema. SQLite reads it at the start of every statement."
+          : "No rows were captured for this page."
+      )
+    );
   else {
-    const ci = c => rows.columns.indexOf(c), next = at + 1 < b ? EV0[at + 1].page : null;
-    const w = q.sql.split(/\bWHERE\b/i)[1], lits = w ? [...w.matchAll(/(\w+)\s*=\s*(?:'([^']*)'|(\d+(?:\.\d+)?))/g)].map(m => ({col: m[1], val: m[2] ?? m[3]})) : [];
+    const ci = c => rows.columns.indexOf(c),
+      next = at + 1 < b ? state.events[at + 1].page : null;
+    const w = q.sql.split(/\bWHERE\b/i)[1],
+      lits = w
+        ? [...w.matchAll(/(\w+)\s*=\s*(?:'([^']*)'|(\d+(?:\.\d+)?))/g)].map(m => ({
+            col: m[1],
+            val: m[2] ?? m[3]
+          }))
+        : [];
     let reason = "";
     const marked = rows.rows.map(r => {
-      if (ci("child_page") >= 0) { if (next != null && r[ci("child_page")] === next) { reason = `Highlighted: the entry SQLite follows down to p${next}.`; return true; } return false; }
+      if (ci("child_page") >= 0) {
+        if (next != null && r[ci("child_page")] === next) {
+          reason = `Highlighted: the entry SQLite follows down to p${next}.`;
+          return true;
+        }
+        return false;
+      }
       const hitLits = lits.filter(l => ci(l.col) >= 0 && String(r[ci(l.col)]) === l.val);
-      if (hitLits.length) { reason = `Highlighted: ${hitLits.map(l => `${l.col} = ${l.val}`).join(", ")}.`; return true; }
+      if (hitLits.length) {
+        reason = `Highlighted: ${hitLits.map(l => `${l.col} = ${l.val}`).join(", ")}.`;
+        return true;
+      }
       return false;
     });
     if (!reason && e.scan) reason = "The scan reads every entry on this page.";
-    const wrap = el("div", "rows"), table = el("table"), head = el("tr"); rows.columns.forEach(c => head.append(el("th", "", c))); table.append(head);
+    const wrap = el("div", "rows"),
+      table = el("table"),
+      head = el("tr");
+    rows.columns.forEach(c => head.append(el("th", "", c)));
+    table.append(head);
     let first = null;
-    rows.rows.forEach((r, i) => { const tr = el("tr", marked[i] ? "mark" : ""); if (marked[i]) first ||= tr; r.forEach(v => tr.append(el("td", "", v ?? "–"))); table.append(tr); });
-    wrap.append(table); cp.append(wrap); if (reason) cp.append(el("div", "why", reason));
-    if (first) requestAnimationFrame(() => { wrap.scrollTop = Math.max(0, first.offsetTop - 60); });
+    rows.rows.forEach((r, i) => {
+      const tr = el("tr", marked[i] ? "mark" : "");
+      if (marked[i]) first ||= tr;
+      r.forEach(v => tr.append(el("td", "", v ?? "–")));
+      table.append(tr);
+    });
+    wrap.append(table);
+    cp.append(wrap);
+    if (reason) cp.append(el("div", "why", reason));
+    if (first)
+      requestAnimationFrame(() => {
+        wrap.scrollTop = Math.max(0, first.offsetTop - 60);
+      });
   }
 
-  const cc = el("div", "col c"); cc.append(el("span", "eyebrow", "this query in each pool, so far"));
+  const cc = el("div", "col c");
+  cc.append(el("span", "eyebrow", "this query in each pool, so far"));
   const list = el("div");
-  for (const p of visible) {
-    const evs = RUN[p].events, row = el("div", "qcost"), l = el("div", "l"), ticks = el("div", "ticks");
-    let cost = 0, hits = 0;
-    for (let i = a; i < b; i++) { const done = i <= at; if (done) { cost += costOf(evs[i]); if (evs[i].kind === "hit") hits++; } ticks.append(el("i", done ? evs[i].kind : "")); }
-    l.append(nameOf(p), el("span", "", `${hits}/${at - a + 1} hits · ${fmtMs(cost)}`)); row.append(l, ticks); list.append(row);
+  for (const p of view.pools) {
+    const evs = state.byPolicy[p].events,
+      row = el("div", "qcost"),
+      l = el("div", "l"),
+      ticks = el("div", "ticks");
+    let cost = 0,
+      hits = 0;
+    for (let i = a; i < b; i++) {
+      const done = i <= at;
+      if (done) {
+        cost += costOf(evs[i]);
+        if (evs[i].kind === "hit") hits++;
+      }
+      ticks.append(el("i", done ? evs[i].kind : ""));
+    }
+    l.append(nameOf(p), el("span", "", `${hits}/${at - a + 1} hits · ${fmtMs(cost)}`));
+    row.append(l, ticks);
+    list.append(row);
   }
   cc.append(list);
   body.append(cq, cp, cc);
 }
 
 /* ---------- motion ---------- */
-function centerIn(node) { const a = node.getBoundingClientRect(), b = $("app").getBoundingClientRect(); return {x: a.left - b.left + a.width / 2, y: a.top - b.top + a.height / 2}; }
+function centerIn(node) {
+  const a = node.getBoundingClientRect(),
+    b = $("app").getBoundingClientRect();
+  return {x: a.left - b.left + a.width / 2, y: a.top - b.top + a.height / 2};
+}
 async function fly(from, to, label, c, wb, ms) {
   if (reduce || !from || !to) return;
-  const t = el("div", "fly" + (wb ? " wb" : ""), label); t.style.setProperty("--c", c); $("app").append(t);
-  const A = centerIn(from), B = centerIn(to);
-  const a = t.animate([{transform: `translate(${A.x - 14}px,${A.y - 14}px) scale(.7)`, opacity: .2},
-    {transform: `translate(${(A.x + B.x) / 2 - 14}px,${Math.min(A.y, B.y) - 26}px)`, opacity: 1, offset: .5},
-    {transform: `translate(${B.x - 14}px,${B.y - 14}px)`, opacity: 1}], {duration: ms * speed(), easing: "cubic-bezier(.3,.7,.3,1)"});
-  await a.finished.catch(() => {}); t.remove();
+  const t = el("div", "fly" + (wb ? " wb" : ""), label);
+  t.style.setProperty("--c", c);
+  $("app").append(t);
+  const A = centerIn(from),
+    B = centerIn(to);
+  const a = t.animate(
+    [
+      {transform: `translate(${A.x - 14}px,${A.y - 14}px) scale(.7)`, opacity: 0.2},
+      {
+        transform: `translate(${(A.x + B.x) / 2 - 14}px,${Math.min(A.y, B.y) - 26}px)`,
+        opacity: 1,
+        offset: 0.5
+      },
+      {transform: `translate(${B.x - 14}px,${B.y - 14}px)`, opacity: 1}
+    ],
+    {duration: ms * speed(), easing: "cubic-bezier(.3,.7,.3,1)"}
+  );
+  await a.finished.catch(() => {});
+  t.remove();
 }
-const tileOf = (p, page) => LANES[p]?.fig.querySelector(`[data-page="${page}"]`);
+const tileOf = (p, page) => state.lanes[p]?.fig.querySelector(`[data-page="${page}"]`);
 /* `id` is the epoch the step belongs to; a jump or a newer step makes it stale */
 async function animateStep(p, at, id) {
-  const e = RUN[p].events[at]; if (!LANES[p]) return;
-  if (e.kind === "hit") { paintLane(p, at); const t = tileOf(p, e.page); if (!reduce) { t?.classList.add("pulse"); await sleep(130); t?.classList.remove("pulse"); } return; }
-  if (reduce) { paintLane(p, at); return; }
-  if (e.evicted?.dirty) { const from = tileOf(p, e.evicted.page); if (from) await fly(from, cellEls[e.evicted.page], "p" + e.evicted.page, colorOf(e.evicted.page), true, 360); else await sleep(360); }
-  if (id !== raceId || !LANES[p]) return;
+  const e = state.byPolicy[p].events[at];
+  if (!state.lanes[p]) return;
+  if (e.kind === "hit") {
+    paintLane(p, at);
+    const t = tileOf(p, e.page);
+    if (!reduce) {
+      t?.classList.add("pulse");
+      await sleep(130);
+      t?.classList.remove("pulse");
+    }
+    return;
+  }
+  if (reduce) {
+    paintLane(p, at);
+    return;
+  }
+  if (e.evicted?.dirty) {
+    const from = tileOf(p, e.evicted.page);
+    if (from)
+      await fly(
+        from,
+        view.diskCells[e.evicted.page],
+        "p" + e.evicted.page,
+        colorOf(e.evicted.page),
+        true,
+        360
+      );
+    else await sleep(360);
+  }
+  if (id !== view.raceId || !state.lanes[p]) return;
   paintLane(p, at);
   const t = tileOf(p, e.page);
-  if (t) { t.style.visibility = "hidden"; await fly(cellEls[e.page], t, "p" + e.page, colorOf(e.page), false, 400); t.style.visibility = ""; } else await sleep(400);
+  if (t) {
+    t.style.visibility = "hidden";
+    await fly(view.diskCells[e.page], t, "p" + e.page, colorOf(e.page), false, 400);
+    t.style.visibility = "";
+  } else await sleep(400);
 }
 
 /* ---------- controls ---------- */
 function setModeUI() {
-  $("mStep").setAttribute("aria-pressed", mode === "step"); $("mRace").setAttribute("aria-pressed", mode === "race");
-  $("prev").disabled = $("next").disabled = mode === "race";
-  $("play").textContent = mode === "race" ? "Race" : "Play";
+  $("mStep").setAttribute("aria-pressed", view.mode === "step");
+  $("mRace").setAttribute("aria-pressed", view.mode === "race");
+  $("prev").disabled = $("next").disabled = view.mode === "race";
+  $("play").textContent = view.mode === "race" ? "Race" : "Play";
 }
-function clearPlaces() { for (const p of visible) LANES[p]?.score.querySelector(".place").classList.remove("on"); }
-function setMode(m) { if (m === mode) return; stopRace(); stop(); mode = m; if (m === "race") k = -1; setModeUI(); clearPlaces(); renderAll(k); }
-function toStep() { if (mode !== "step") setMode("step"); stop(); }
-function jump(i) { stopRace(); k = Math.max(-1, Math.min(K - 1, i)); clearPlaces(); renderAll(k); }
+function clearPlaces() {
+  for (const p of view.pools) state.lanes[p]?.score.querySelector(".place").classList.remove("on");
+}
+function setMode(m) {
+  if (m === view.mode) return;
+  stopRace();
+  stopPlaying();
+  view.mode = m;
+  if (m === "race") view.at = -1;
+  setModeUI();
+  clearPlaces();
+  renderAll(view.at);
+}
+function toStep() {
+  if (view.mode !== "step") setMode("step");
+  stopPlaying();
+}
+function jump(i) {
+  stopRace();
+  view.at = Math.max(-1, Math.min(state.accesses - 1, i));
+  clearPlaces();
+  renderAll(view.at);
+}
 async function stepForward() {
-  if (k >= K - 1) return false;
-  for (const p of visible) if (POS[p] !== k) paintLane(p, k);
-  k++; const at = k, id = ++raceId; document.querySelectorAll(".fly").forEach(f => f.remove());
-  renderChrome(at); await Promise.all(visible.map(p => animateStep(p, at, id))); return id === raceId;
+  if (view.at >= state.accesses - 1) return false;
+  for (const p of view.pools) if (state.lanePos[p] !== view.at) paintLane(p, view.at);
+  view.at++;
+  const at = view.at,
+    id = ++view.raceId;
+  document.querySelectorAll(".fly").forEach(f => f.remove());
+  renderChrome(at);
+  await Promise.all(view.pools.map(p => animateStep(p, at, id)));
+  return id === view.raceId;
 }
-function stop() { playing = false; if (mode === "step") $("play").textContent = "Play"; }
+function stopPlaying() {
+  view.playing = false;
+  if (view.mode === "step") $("play").textContent = "Play";
+}
 async function play() {
-  playing = true; $("play").textContent = "Pause"; if (k >= K - 1) jump(-1);
-  while (playing && await stepForward()) await sleep(MOMENTS.some(m => m.k === k) ? 1400 : 280);
-  stop();
+  view.playing = true;
+  $("play").textContent = "Pause";
+  if (view.at >= state.accesses - 1) jump(-1);
+  while (view.playing && (await stepForward()))
+    await sleep(state.moments.some(m => m.k === view.at) ? 1400 : 280);
+  stopPlaying();
 }
-function stopRace() { raceId++; if (mode === "race") { playing = false; $("play").textContent = "Race"; } document.querySelectorAll(".fly").forEach(f => f.remove()); }
+function stopRace() {
+  view.raceId++;
+  if (view.mode === "race") {
+    view.playing = false;
+    $("play").textContent = "Race";
+  }
+  document.querySelectorAll(".fly").forEach(f => f.remove());
+}
 async function race() {
-  stopRace(); const id = raceId; playing = true; $("play").textContent = "Stop"; k = -1; clearPlaces(); renderAll(-1); let place = 0;
-  await Promise.all(visible.map(async p => {
-    for (let i = 0; i < K; i++) { if (id !== raceId) return; await animateStep(p, i, id); if (id !== raceId) return; await sleep(30 + 60 * Math.log10(1 + costOf(RUN[p].events[i]) / PROFILE.hit_ms)); }
-    if (id !== raceId) return; place++;
-    const pl = LANES[p].score.querySelector(".place"); pl.textContent = ["1st", "2nd", "3rd"][place - 1] || place + "th"; pl.classList.add("on");
-  }));
-  if (id === raceId) { playing = false; $("play").textContent = "Race again"; }
+  stopRace();
+  const id = view.raceId;
+  view.playing = true;
+  $("play").textContent = "Stop";
+  view.at = -1;
+  clearPlaces();
+  renderAll(-1);
+  let place = 0;
+  await Promise.all(
+    view.pools.map(async p => {
+      for (let i = 0; i < state.accesses; i++) {
+        if (id !== view.raceId) return;
+        await animateStep(p, i, id);
+        if (id !== view.raceId) return;
+        await sleep(30 + 60 * Math.log10(1 + costOf(state.byPolicy[p].events[i]) / state.profile.hit_ms));
+      }
+      if (id !== view.raceId) return;
+      place++;
+      const pl = state.lanes[p].score.querySelector(".place");
+      pl.textContent = ["1st", "2nd", "3rd"][place - 1] || place + "th";
+      pl.classList.add("on");
+    })
+  );
+  if (id === view.raceId) {
+    view.playing = false;
+    $("play").textContent = "Race again";
+  }
 }
-$("play").addEventListener("click", () => mode === "race" ? (playing ? stopRace() : race()) : (playing ? stop() : play()));
+$("play").addEventListener("click", () =>
+  view.mode === "race" ? (view.playing ? stopRace() : race()) : view.playing ? stopPlaying() : play()
+);
 $("mStep").addEventListener("click", () => setMode("step"));
-$("sSsd").addEventListener("click", () => { stopRace(); setStorage("ssd"); });
-$("sHdd").addEventListener("click", () => { stopRace(); setStorage("hdd"); });
+$("sSsd").addEventListener("click", () => {
+  stopRace();
+  setStorage("ssd");
+});
+$("sHdd").addEventListener("click", () => {
+  stopRace();
+  setStorage("hdd");
+});
 $("mRace").addEventListener("click", () => setMode("race"));
-$("prev").addEventListener("click", () => { stop(); jump(k - 1); });
-$("next").addEventListener("click", () => { stop(); stepForward(); });
-$("scrub").addEventListener("input", () => { toStep(); jump(+$("scrub").value); });
-$("fold").addEventListener("toggle", () => { if (D) renderFold(k); });
-$("helpBtn").addEventListener("click", () => { const open = $("help").hidden; $("help").hidden = !open; $("helpBtn").setAttribute("aria-expanded", open); });
+$("prev").addEventListener("click", () => {
+  stopPlaying();
+  jump(view.at - 1);
+});
+$("next").addEventListener("click", () => {
+  stopPlaying();
+  stepForward();
+});
+$("scrub").addEventListener("input", () => {
+  toStep();
+  jump(+$("scrub").value);
+});
+$("fold").addEventListener("toggle", () => {
+  if (state.data) renderFold(view.at);
+});
+$("helpBtn").addEventListener("click", () => {
+  const open = $("help").hidden;
+  $("help").hidden = !open;
+  $("helpBtn").setAttribute("aria-expanded", open);
+});
 document.addEventListener("keydown", e => {
-  if (!D || mode !== "step" || e.target.closest("input,select,summary")) return;
-  if (e.key === "ArrowRight") { e.preventDefault(); stop(); stepForward(); }
-  if (e.key === "ArrowLeft") { e.preventDefault(); stop(); jump(k - 1); }
+  if (!state.data || view.mode !== "step" || e.target.closest("input,select,summary")) return;
+  if (e.key === "ArrowRight") {
+    e.preventDefault();
+    stopPlaying();
+    stepForward();
+  }
+  if (e.key === "ArrowLeft") {
+    e.preventDefault();
+    stopPlaying();
+    jump(view.at - 1);
+  }
 });
 
 /* drag on the chart to move through the run */
 let dragging = null;
-const scrubTo = ev => { const r = dragging.getBoundingClientRect(); jump(Math.floor((ev.clientX - r.left) / r.width * K)); };
+const scrubTo = ev => {
+  const r = dragging.getBoundingClientRect();
+  jump(Math.floor(((ev.clientX - r.left) / r.width) * state.accesses));
+};
 $("chart").addEventListener("pointerdown", ev => {
-  const tr = ev.target.closest(".ctrack"); if (!tr || ev.target.closest("button") || ev.button) return;
-  toStep(); dragging = tr; tr.setPointerCapture(ev.pointerId); scrubTo(ev);
+  const tr = ev.target.closest(".ctrack");
+  if (!tr || ev.target.closest("button") || ev.button) return;
+  toStep();
+  dragging = tr;
+  tr.setPointerCapture(ev.pointerId);
+  scrubTo(ev);
 });
-$("chart").addEventListener("pointermove", ev => { if (dragging) scrubTo(ev); });
-for (const type of ["pointerup", "pointercancel"]) $("chart").addEventListener(type, () => { dragging = null; });
+$("chart").addEventListener("pointermove", ev => {
+  if (dragging) scrubTo(ev);
+});
+for (const type of ["pointerup", "pointercancel"])
+  $("chart").addEventListener(type, () => {
+    dragging = null;
+  });
 let resizeTimer = 0;
-addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { if (D) buildChart(); }, 150); });
+addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    if (state.data) buildChart();
+  }, 150);
+});
 
 /* ---------- loading ---------- */
-function fail(err) { const p = $("error"); p.textContent = `Could not show this run: ${err.message}`; p.hidden = false; }
-function load(text) { try { start(JSON.parse(text)); } catch (err) { fail(err); } }
+function fail(err) {
+  const p = $("error");
+  p.textContent = `Could not show this run: ${err.message}`;
+  p.hidden = false;
+}
+function load(text) {
+  try {
+    start(JSON.parse(text));
+  } catch (err) {
+    fail(err);
+  }
+}
 const embedded = $("run").textContent.trim();
-if (embedded === "__BPSIM" + "_RUN__") $("drop").hidden = false; else load(embedded);
-document.addEventListener("dragover", e => { e.preventDefault(); document.body.classList.add("dragging"); });
+if (embedded === "__BPSIM" + "_RUN__") $("drop").hidden = false;
+else load(embedded);
+document.addEventListener("dragover", e => {
+  e.preventDefault();
+  document.body.classList.add("dragging");
+});
 document.addEventListener("dragleave", () => document.body.classList.remove("dragging"));
 document.addEventListener("drop", async e => {
-  e.preventDefault(); document.body.classList.remove("dragging");
-  const file = e.dataTransfer.files[0]; if (file) load(await file.text());
+  e.preventDefault();
+  document.body.classList.remove("dragging");
+  const file = e.dataTransfer.files[0];
+  if (file) load(await file.text());
 });
 </script>
 </body>

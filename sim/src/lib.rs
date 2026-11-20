@@ -12,6 +12,8 @@
 
 pub mod capture;
 pub mod policy;
+pub mod pool;
+pub mod readahead;
 pub mod run;
 pub mod sim;
 pub mod storage;

@@ -1,4 +1,5 @@
-//! The buffer pool and the simulation loop.
+//! The simulation loop: serves each access through the buffer pool, reads
+//! ahead when the policy says so, prices the result and records events.
 
 use std::collections::{HashMap, HashSet};
 
@@ -6,7 +7,9 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::Serialize;
 
-use crate::policy::{Ctx, FrameState, Log, Note, Policy, PolicyKind};
+use crate::policy::{Ctx, Log, Note, PolicyKind};
+pub use crate::pool::{BufferPool, Evicted, FrameView, Outcome};
+pub use crate::readahead::ReadAhead;
 use crate::storage::{Read, StorageKind};
 use crate::summary::RunSummary;
 use crate::trace::{Access, Trace};
@@ -24,189 +27,6 @@ pub fn build_scenario(w: &Workload, seed: u64, ticks: u64) -> Trace {
         rng.gen_range(0..=i);
     }
     Trace::generate(w, &mut rng, ticks)
-}
-
-#[derive(Clone, Debug)]
-struct Frame {
-    page: Option<PageId>,
-    dirty: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Outcome {
-    Hit,
-    Miss { evicted: Option<Evicted> },
-}
-
-/// The page a miss pushed out of its frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct Evicted {
-    pub page: PageId,
-    pub dirty: bool,
-}
-
-/// Fixed-size page cache. Owns frames and the page table; delegates victim
-/// choice to a [`Policy`].
-pub struct BufferPool {
-    frames: Vec<Frame>,
-    page_table: HashMap<PageId, FrameIdx>,
-    next_free: usize,
-    policy: Box<dyn Policy>,
-}
-
-impl BufferPool {
-    pub fn new(num_frames: usize, policy: Box<dyn Policy>) -> Self {
-        Self {
-            frames: vec![
-                Frame {
-                    page: None,
-                    dirty: false
-                };
-                num_frames
-            ],
-            page_table: HashMap::new(),
-            next_free: 0,
-            policy,
-        }
-    }
-
-    /// Serve one access; returns the frame that now holds the page.
-    pub fn access(&mut self, a: Access, ctx: Ctx, log: &mut Log) -> (FrameIdx, Outcome) {
-        if let Some(&f) = self.page_table.get(&a.page) {
-            if a.write {
-                self.frames[f].dirty = true;
-            }
-            self.policy.on_hit(f, ctx, log);
-            return (f, Outcome::Hit);
-        }
-
-        let (f, evicted) = self.place(a.page, a.write, ctx, log);
-        self.policy.on_load(f, ctx, log);
-        (f, Outcome::Miss { evicted })
-    }
-
-    /// Whether `page` is in the pool.
-    pub fn contains(&self, page: PageId) -> bool {
-        self.page_table.contains_key(&page)
-    }
-
-    /// Load `page`, which no query asked for yet, as part of a read-ahead.
-    pub fn read_ahead(&mut self, page: PageId, ctx: Ctx, log: &mut Log) -> Option<Evicted> {
-        debug_assert!(!self.contains(page));
-        let (f, evicted) = self.place(page, false, ctx, log);
-        self.policy.on_read_ahead(f, ctx, log);
-        evicted
-    }
-
-    /// Put `page` in a free frame, or in a victim's.
-    fn place(
-        &mut self,
-        page: PageId,
-        dirty: bool,
-        ctx: Ctx,
-        log: &mut Log,
-    ) -> (FrameIdx, Option<Evicted>) {
-        let f = if self.next_free < self.frames.len() {
-            self.next_free += 1;
-            self.next_free - 1
-        } else {
-            self.policy.victim(ctx, log)
-        };
-        let old = std::mem::replace(
-            &mut self.frames[f],
-            Frame {
-                page: Some(page),
-                dirty,
-            },
-        );
-        let evicted = old.page.map(|page| {
-            self.page_table.remove(&page);
-            Evicted {
-                page,
-                dirty: old.dirty,
-            }
-        });
-        self.page_table.insert(page, f);
-        (f, evicted)
-    }
-
-    pub fn policy(&self) -> &dyn Policy {
-        self.policy.as_ref()
-    }
-
-    /// Every frame: its page, and the policy's view of it.
-    pub fn frame_views(&self) -> Vec<FrameView> {
-        self.frames
-            .iter()
-            .enumerate()
-            .map(|(i, f)| FrameView {
-                page: f.page,
-                dirty: f.dirty,
-                state: match f.page {
-                    Some(_) => self.policy.state(i),
-                    None => FrameState::Empty,
-                },
-            })
-            .collect()
-    }
-
-    /// Check that frames and the page table agree. For tests.
-    pub fn check_consistency(&self) -> Result<(), String> {
-        let mut seen = HashMap::new();
-        for (i, f) in self.frames.iter().enumerate() {
-            if let Some(p) = f.page {
-                if let Some(j) = seen.insert(p, i) {
-                    return Err(format!("page {p} in frames {j} and {i}"));
-                }
-                if self.page_table.get(&p) != Some(&i) {
-                    return Err(format!("page table disagrees for page {p}"));
-                }
-            }
-        }
-        if seen.len() != self.page_table.len() {
-            return Err("page table has entries for non-resident pages".into());
-        }
-        Ok(())
-    }
-}
-
-/// How far to read ahead when a policy decides to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReadAhead {
-    #[default]
-    Off,
-    /// A quarter of the pool, at most 8 pages: real systems read ahead far
-    /// less than 1% of their pool, and a bigger share would flush this one.
-    Auto,
-    /// Up to this many pages (still at most a quarter of the pool).
-    Pages(u32),
-}
-
-impl ReadAhead {
-    /// Most pages one read-ahead may load into a pool of `frames`.
-    pub fn cap(self, frames: usize) -> usize {
-        let quarter = frames / 4;
-        match self {
-            ReadAhead::Off => 0,
-            ReadAhead::Auto => quarter.min(8),
-            ReadAhead::Pages(n) => quarter.min(n as usize),
-        }
-    }
-}
-
-impl std::str::FromStr for ReadAhead {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s {
-            "off" | "0" => Ok(ReadAhead::Off),
-            "auto" => Ok(ReadAhead::Auto),
-            n => n.parse().map(ReadAhead::Pages).map_err(|_| {
-                format!("unknown read-ahead {s:?} (expected auto, off or a page count)")
-            }),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -265,17 +85,6 @@ impl Metrics {
     }
 }
 
-/// One frame as an event sees it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct FrameView {
-    pub page: Option<PageId>,
-    pub dirty: bool,
-    pub state: FrameState,
-}
-
-/// One access, explained: what the pool did, how the page came off the
-/// device and what the policy looked at. Its time follows from `read` and
-/// `outcome` (a dirty eviction is a write-back) under any storage profile. Recorded only after [`Simulator::record_events`].
 /// What serving one access did, for its event.
 #[derive(Default)]
 struct Done {
@@ -286,6 +95,10 @@ struct Done {
     read_ahead_hit: bool,
 }
 
+/// One access, explained: what the pool did, how the page came off the
+/// device and what the policy looked at. Its time follows from `read`,
+/// `ahead` and the evictions (a dirty one is a write-back) under any storage
+/// profile. Recorded only after [`Simulator::record_events`].
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Event {
     #[serde(flatten)]
@@ -807,18 +620,6 @@ mod tests {
         // Lookups that jump around never continue a table.
         let sim = replay_ahead(two_tables(vec![vec![3, 7, 2, 9, 4]]), ReadAhead::Auto);
         assert_eq!(sim.metrics().pages_read_ahead, 0);
-    }
-
-    #[test]
-    fn read_ahead_is_capped_at_a_quarter_of_the_pool_and_eight_pages() {
-        assert_eq!(ReadAhead::Auto.cap(3), 0);
-        assert_eq!(ReadAhead::Auto.cap(8), 2);
-        assert_eq!(ReadAhead::Auto.cap(100), 8);
-        assert_eq!(ReadAhead::Pages(3).cap(8), 2);
-        assert_eq!(ReadAhead::Pages(3).cap(100), 3);
-        assert_eq!("off".parse(), Ok(ReadAhead::Off));
-        assert_eq!("5".parse(), Ok(ReadAhead::Pages(5)));
-        assert!("lots".parse::<ReadAhead>().is_err());
     }
 
     #[test]
