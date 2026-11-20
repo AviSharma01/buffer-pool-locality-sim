@@ -64,7 +64,7 @@ impl BufferPool {
             return (f, Outcome::Hit);
         }
 
-        let (f, evicted) = self.place(a.page, a.write, ctx, log);
+        let (f, evicted) = self.place(a.page, a.write, None, ctx, log);
         self.policy.on_load(f, ctx, log);
         (f, Outcome::Miss { evicted })
     }
@@ -74,12 +74,29 @@ impl BufferPool {
         self.page_table.contains_key(&page)
     }
 
-    /// Load `page`, which no query asked for yet, as part of a read-ahead.
-    pub fn read_ahead(&mut self, page: PageId, ctx: Ctx, log: &mut Log) -> Option<Evicted> {
+    /// Load `page`, which no query asked for yet, as part of the read for
+    /// `requested`. The requested page stays pinned: no victim is its frame.
+    pub fn read_ahead(
+        &mut self,
+        page: PageId,
+        requested: PageId,
+        ctx: Ctx,
+        log: &mut Log,
+    ) -> Option<Evicted> {
         debug_assert!(!self.contains(page));
-        let (f, evicted) = self.place(page, false, ctx, log);
+        let pinned = *self
+            .page_table
+            .get(&requested)
+            .expect("the requested page is loaded before its read-ahead");
+        let (f, evicted) = self.place(page, false, Some(pinned), ctx, log);
         self.policy.on_read_ahead(f, ctx, log);
         evicted
+    }
+
+    /// The read for `requested` is done, read-ahead included.
+    pub fn request_done(&mut self, requested: PageId) {
+        let f = self.page_table[&requested];
+        self.policy.on_request_done(f);
     }
 
     /// Put `page` in a free frame, or in a victim's.
@@ -87,6 +104,7 @@ impl BufferPool {
         &mut self,
         page: PageId,
         dirty: bool,
+        pinned: Option<FrameIdx>,
         ctx: Ctx,
         log: &mut Log,
     ) -> (FrameIdx, Option<Evicted>) {
@@ -94,7 +112,7 @@ impl BufferPool {
             self.next_free += 1;
             self.next_free - 1
         } else {
-            self.policy.victim(ctx, log)
+            self.policy.victim(ctx, pinned, log)
         };
         let old = std::mem::replace(
             &mut self.frames[f],

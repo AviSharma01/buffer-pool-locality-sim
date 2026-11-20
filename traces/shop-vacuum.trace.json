@@ -1,6 +1,6 @@
 {
  "format": "bpsim-trace",
- "version": 1,
+ "version": 2,
  "scenario": "shop-vacuum",
  "sqlite_version": "3.54.1",
  "page_size": 4096,
@@ -91,15 +91,15 @@
   {"page":78,"object":"orders","kind":"leaf"}
  ],
  "queries": [
-  {"title":"Look up user 42","sql":"SELECT * FROM users WHERE id = 42;","plan":["SEARCH users USING INTEGER PRIMARY KEY (rowid=?)"],"io":[["r",1],["r",2],["r",5]]},
-  {"title":"Look up user 2077","sql":"SELECT * FROM users WHERE id = 2077;","plan":["SEARCH users USING INTEGER PRIMARY KEY (rowid=?)"],"io":[["r",1],["r",2],["r",32]]},
-  {"title":"Find user by email","sql":"SELECT * FROM users WHERE email = 'user1234@mail.com';","plan":["SEARCH users USING INDEX users_email (email=?)"],"io":[["r",1],["r",4],["r",52],["r",2],["r",21]]},
-  {"title":"Update user 42","sql":"UPDATE users SET city = 'Toronto' WHERE id = 42;","plan":["SEARCH users USING INTEGER PRIMARY KEY (rowid=?)"],"io":[["r",1],["r",2],["r",5],["w",1],["w",5]]},
-  {"title":"Report on all orders","sql":"SELECT SUM(amount) FROM orders;","plan":["SCAN orders"],"io":[["r",1],["r",3],["r",64],["r",65],["r",66],["r",67],["r",68],["r",69],["r",70],["r",71],["r",72],["r",73],["r",74],["r",75],["r",76],["r",77],["r",78]]},
-  {"title":"Look up user 42","sql":"SELECT * FROM users WHERE id = 42;","plan":["SEARCH users USING INTEGER PRIMARY KEY (rowid=?)"],"io":[["r",1],["r",2],["r",5]]},
-  {"title":"Look up user 2077","sql":"SELECT * FROM users WHERE id = 2077;","plan":["SEARCH users USING INTEGER PRIMARY KEY (rowid=?)"],"io":[["r",1],["r",2],["r",32]]},
-  {"title":"Find user by email","sql":"SELECT * FROM users WHERE email = 'user1234@mail.com';","plan":["SEARCH users USING INDEX users_email (email=?)"],"io":[["r",1],["r",4],["r",52],["r",2],["r",21]]},
-  {"title":"Look up user 42","sql":"SELECT * FROM users WHERE id = 42;","plan":["SEARCH users USING INTEGER PRIMARY KEY (rowid=?)"],"io":[["r",1],["r",2],["r",5]]}
+  {"title":"Look up user 42","sql":"SELECT * FROM users WHERE id = 42;","plan":["SEARCH users USING INTEGER PRIMARY KEY (rowid=?)"],"scans":[],"io":[["r",1],["r",2],["r",5]]},
+  {"title":"Look up user 2077","sql":"SELECT * FROM users WHERE id = 2077;","plan":["SEARCH users USING INTEGER PRIMARY KEY (rowid=?)"],"scans":[],"io":[["r",1],["r",2],["r",32]]},
+  {"title":"Find user by email","sql":"SELECT * FROM users WHERE email = 'user1234@mail.com';","plan":["SEARCH users USING INDEX users_email (email=?)"],"scans":[],"io":[["r",1],["r",4],["r",52],["r",2],["r",21]]},
+  {"title":"Update user 42","sql":"UPDATE users SET city = 'Toronto' WHERE id = 42;","plan":["SEARCH users USING INTEGER PRIMARY KEY (rowid=?)"],"scans":[],"io":[["r",1],["r",2],["r",5],["w",1],["w",5]]},
+  {"title":"Report on all orders","sql":"SELECT SUM(amount) FROM orders;","plan":["SCAN orders"],"scans":["orders"],"io":[["r",1],["r",3],["r",64],["r",65],["r",66],["r",67],["r",68],["r",69],["r",70],["r",71],["r",72],["r",73],["r",74],["r",75],["r",76],["r",77],["r",78]]},
+  {"title":"Look up user 42","sql":"SELECT * FROM users WHERE id = 42;","plan":["SEARCH users USING INTEGER PRIMARY KEY (rowid=?)"],"scans":[],"io":[["r",1],["r",2],["r",5]]},
+  {"title":"Look up user 2077","sql":"SELECT * FROM users WHERE id = 2077;","plan":["SEARCH users USING INTEGER PRIMARY KEY (rowid=?)"],"scans":[],"io":[["r",1],["r",2],["r",32]]},
+  {"title":"Find user by email","sql":"SELECT * FROM users WHERE email = 'user1234@mail.com';","plan":["SEARCH users USING INDEX users_email (email=?)"],"scans":[],"io":[["r",1],["r",4],["r",52],["r",2],["r",21]]},
+  {"title":"Look up user 42","sql":"SELECT * FROM users WHERE id = 42;","plan":["SEARCH users USING INTEGER PRIMARY KEY (rowid=?)"],"scans":[],"io":[["r",1],["r",2],["r",5]]}
  ],
  "rows": {
   "2": {"object":"users","columns":["child_page","rowid_up_to"],"rows":[[5,80],[6,158],[7,235],[8,312],[9,389],[10,466],[11,543],[12,620],[13,697],[14,774],[15,851],[16,928],[17,1005],[18,1080],[19,1155],[20,1230],[21,1305],[22,1380],[23,1455],[24,1530],[25,1605],[26,1680],[27,1755],[28,1830],[29,1905],[30,1980],[31,2055],[32,2130],[33,2205],[34,2280],[35,2355],[36,2430],[37,2505],[38,2580],[39,2655],[40,2730],[41,2805],[42,2880],[43,2955],[44,null]]},

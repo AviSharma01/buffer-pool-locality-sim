@@ -450,7 +450,8 @@ def test_free_pages_and_reused_pages_replay_with_the_engine(tmp_path: Path) -> N
         "INSERT INTO t SELECT id + 1000, v FROM t WHERE id <= 50;\n"
     )
     out = tmp_path / "freed.trace.json"
-    done = cli(scenario, "-o", out, "--view", "--frames", "4", "--policy", "lru")
+    runs = tmp_path / "runs"
+    done = cli(scenario, "-o", out, "--view", "--frames", "4", "--policy", "lru", "--runs", runs)
     assert done.returncode == 0, done.stderr
     trace = json.loads(out.read_text(encoding="utf-8"))
     assert any(p["object"] is None for p in trace["pages"])
@@ -458,7 +459,7 @@ def test_free_pages_and_reused_pages_replay_with_the_engine(tmp_path: Path) -> N
     run = json.loads((viewer.parent / "run.json").read_text(encoding="utf-8"))["runs"][0]
     # The insert reuses freelist pages: SQLite writes them without reading.
     assert run["summary"]["fresh_pages"] >= 1
-    shutil.rmtree(viewer.parent)
+    assert viewer.is_relative_to(runs)
 
 
 @pytest.mark.skipif(
@@ -467,10 +468,11 @@ def test_free_pages_and_reused_pages_replay_with_the_engine(tmp_path: Path) -> N
 def test_view_replays_with_the_engine(tmp_path: Path) -> None:
     out = tmp_path / "people.trace.json"
     args = ["--csv", f"people={PEOPLE}", "--sql", "SELECT * FROM people WHERE id = 9", "-o", out]
-    done = cli(*args, "--view", "--frames", "4", "--policy", "lru,opt")
+    runs = tmp_path / "runs"
+    done = cli(*args, "--view", "--frames", "4", "--policy", "lru,opt", "--runs", runs)
     assert done.returncode == 0, done.stderr
     viewer = Path(done.stdout.strip().splitlines()[-1].removeprefix("viewer -> "))
     assert viewer.name == "viewer.html" and "bpsim-run" in viewer.read_text(encoding="utf-8")
-    shutil.rmtree(viewer.parent)
-    too_many = cli(*args, "--view", "--frames", "4", "--policy", "nope")
+    assert viewer.is_relative_to(runs)
+    too_many = cli(*args, "--view", "--frames", "4", "--policy", "nope", "--runs", runs)
     assert too_many.returncode == 1 and "unknown policy" in too_many.stderr

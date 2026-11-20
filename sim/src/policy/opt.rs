@@ -40,12 +40,13 @@ impl Policy for Opt {
         self.frame_next[frame] = self.next_use[ctx.pos];
     }
 
-    fn victim(&mut self, _ctx: Ctx, log: &mut Log) -> FrameIdx {
+    fn victim(&mut self, _ctx: Ctx, pinned: Option<FrameIdx>, log: &mut Log) -> FrameIdx {
         // Furthest next use; ties (e.g. several never-used-again) -> lowest index.
         let (frame, &next) = self
             .frame_next
             .iter()
             .enumerate()
+            .filter(|&(i, _)| Some(i) != pinned)
             .max_by_key(|&(i, &next)| (next, std::cmp::Reverse(i)))
             .expect("pool has frames");
         log.push(Note::Evict {
@@ -79,7 +80,7 @@ mod tests {
             p.on_load(f, at(f, 0), &mut l);
         }
         assert_eq!(p.state(2), FrameState::Opt { next_use: Some(5) });
-        assert_eq!(p.victim(at(3, 0), &mut l), 1);
+        assert_eq!(p.victim(at(3, 0), None, &mut l), 1);
         assert_eq!(
             l.take(),
             [Note::Evict {

@@ -1,5 +1,5 @@
 //! Traces captured from SQLite by `capture/capture.py` (format `bpsim-trace`,
-//! version 1). The engine replays `queries`; the other fields describe the
+//! version 2). The engine replays `queries`; the other fields describe the
 //! database for the viewer and are passed through to the run file.
 //!
 //! The captured database file is modelled as a single "table" whose page ids
@@ -13,10 +13,10 @@
 //! that page ("read, then modify", like synthetic workloads); a write to a page
 //! the query never read stays a write access.
 //!
-//! A query whose plan has `SCAN <table>` reads that table's b-tree in order, so
-//! its accesses to that table's pages are marked as a scan of a relation that
-//! many pages long. With `USING [COVERING] INDEX <index>` the index is what is
-//! read in order, so its pages are marked instead.
+//! Each query lists the tables and indexes it reads end to end (`scans`,
+//! worked out by the capture from the statement's bytecode). Its accesses to
+//! those objects' pages are marked as a scan of a relation that many pages
+//! long.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -26,7 +26,11 @@ use crate::sim::{SimConfig, Simulator};
 use crate::trace::{Access, Trace};
 
 pub const FORMAT: &str = "bpsim-trace";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
+/// The most pages a trace may describe: 40 GB of 4 KB pages, far beyond what
+/// a capture produces, but small enough that replaying it cannot exhaust
+/// memory before its first access.
+pub const MAX_PAGES: u32 = 10_000_000;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CapturedTrace {
@@ -76,6 +80,8 @@ pub struct CapturedQuery {
     pub title: String,
     pub sql: String,
     pub plan: Vec<String>,
+    /// Tables and indexes this query reads end to end.
+    pub scans: Vec<String>,
     pub io: Vec<(IoOp, u32)>,
 }
 
@@ -98,6 +104,13 @@ impl CapturedTrace {
         if self.format != FORMAT {
             return Err(format!("expected format {FORMAT:?}, got {:?}", self.format));
         }
+        if self.version == 1 {
+            return Err(
+                "trace version 1 predates scan detection; capture it again with \
+                 capture/capture.py"
+                    .into(),
+            );
+        }
         if self.version != VERSION {
             return Err(format!(
                 "unsupported trace version {} (this build reads version {VERSION})",
@@ -115,8 +128,23 @@ impl CapturedTrace {
                 self.scenario
             ));
         }
-        if self.page_count == 0 {
-            return Err("page_count must be at least 1".into());
+        if self.page_count == 0 || self.page_count > MAX_PAGES {
+            return Err(format!(
+                "page_count must be between 1 and {MAX_PAGES}, got {}",
+                self.page_count
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for p in &self.pages {
+            if p.page == 0 || p.page > self.page_count {
+                return Err(format!(
+                    "the page map lists page {}, outside 1..={}",
+                    p.page, self.page_count
+                ));
+            }
+            if !seen.insert(p.page) {
+                return Err(format!("the page map lists page {} twice", p.page));
+            }
         }
         if self.queries.is_empty() {
             return Err("trace has no queries".into());
@@ -148,10 +176,9 @@ impl CapturedTrace {
             .queries
             .iter()
             .map(|q| {
-                let scanned: Vec<&str> = q.plan.iter().filter_map(|l| scanned_object(l)).collect();
                 let scan_of = |page: u32| {
                     let object = *owner.get(&page)?;
-                    scanned.contains(&object).then(|| size[object])
+                    q.scans.iter().any(|s| s == object).then(|| size[object])
                 };
                 fold_writes(q, scan_of)
             })
@@ -176,18 +203,6 @@ impl CapturedTrace {
     }
 }
 
-/// The table or index a `SCAN` plan line reads in order, if any.
-fn scanned_object(plan_line: &str) -> Option<&str> {
-    let rest = plan_line.strip_prefix("SCAN ")?;
-    let mut words = rest.split_whitespace();
-    let table = words.next()?;
-    let index = rest
-        .split_once("USING COVERING INDEX ")
-        .or_else(|| rest.split_once("USING INDEX "))
-        .and_then(|(_, after)| after.split_whitespace().next());
-    Some(index.unwrap_or(table))
-}
-
 fn fold_writes(q: &CapturedQuery, scan_of: impl Fn(u32) -> Option<u32>) -> Vec<Access> {
     let mut accesses: Vec<Access> = Vec::with_capacity(q.io.len());
     for &(op, page) in &q.io {
@@ -210,18 +225,25 @@ mod tests {
     use super::*;
 
     fn trace_json(format: &str, version: u32, io: &str) -> String {
+        trace_with_scans(format, version, io, r#"["t"]"#)
+    }
+
+    /// The plan names an alias, as SQLite's does for `FROM t AS x`: only
+    /// `scans` decides what is read end to end.
+    fn trace_with_scans(format: &str, version: u32, io: &str, scans: &str) -> String {
         format!(
             r#"{{"format":"{format}","version":{version},"scenario":"tiny","sqlite_version":"3.54.1",
                "page_size":4096,"page_count":3,"rows":{{}},"notes":[],"objects":[],
                "pages":[{{"page":1,"object":"sqlite_schema","kind":"leaf"}},
                         {{"page":2,"object":"t","kind":"leaf"}},
                         {{"page":3,"object":"t","kind":"leaf"}}],
-               "queries":[{{"title":"q","sql":"SELECT 1;","plan":["SCAN t"],"io":{io}}}]}}"#
+               "queries":[{{"title":"q","sql":"SELECT 1;","plan":["SCAN x"],"scans":{scans},
+                            "io":{io}}}]}}"#
         )
     }
 
     fn accesses(io: &str) -> Vec<(u32, bool)> {
-        let t = CapturedTrace::from_json(&trace_json(FORMAT, 1, io)).unwrap();
+        let t = CapturedTrace::from_json(&trace_json(FORMAT, VERSION, io)).unwrap();
         let trace = t.to_trace();
         assert_eq!(trace.num_queries(), 1);
         assert_eq!(trace.table_of(3), 0);
@@ -230,27 +252,19 @@ mod tests {
 
     #[test]
     fn scan_marks_only_the_scanned_objects_pages() {
-        let t = CapturedTrace::from_json(&trace_json(FORMAT, 1, r#"[["r",1],["r",2],["r",3]]"#))
-            .unwrap();
-        let scans: Vec<_> = t.to_trace().accesses().iter().map(|a| a.scan).collect();
-        assert_eq!(scans, [None, Some(2), Some(2)]);
+        let io = r#"[["r",1],["r",2],["r",3]]"#;
+        let scans = |list: &str| -> Vec<Option<u32>> {
+            let t = CapturedTrace::from_json(&trace_with_scans(FORMAT, VERSION, io, list)).unwrap();
+            t.to_trace().accesses().iter().map(|a| a.scan).collect()
+        };
+        assert_eq!(scans(r#"["t"]"#), [None, Some(2), Some(2)]);
+        assert_eq!(scans("[]"), [None, None, None], "the plan text is not read");
     }
 
     #[test]
-    fn plan_lines_name_the_object_read_in_order() {
-        assert_eq!(scanned_object("SCAN orders"), Some("orders"));
-        assert_eq!(
-            scanned_object("SCAN users USING COVERING INDEX users_email"),
-            Some("users_email")
-        );
-        assert_eq!(
-            scanned_object("SCAN users USING INDEX users_email"),
-            Some("users_email")
-        );
-        assert_eq!(
-            scanned_object("SEARCH users USING INTEGER PRIMARY KEY (rowid=?)"),
-            None
-        );
+    fn version_1_traces_are_refused_with_a_way_forward() {
+        let err = CapturedTrace::from_json(&trace_json(FORMAT, 1, "[]")).unwrap_err();
+        assert!(err.contains("capture it again"), "{err}");
     }
 
     #[test]
@@ -264,8 +278,9 @@ mod tests {
     #[test]
     fn a_write_without_a_read_stays_a_write_access() {
         assert_eq!(accesses(r#"[["r",1],["w",2]]"#), [(1, false), (2, true)]);
-        let t = CapturedTrace::from_json(&trace_json(FORMAT, 1, r#"[["r",1],["w",2],["w",1]]"#))
-            .unwrap();
+        let t =
+            CapturedTrace::from_json(&trace_json(FORMAT, VERSION, r#"[["r",1],["w",2],["w",1]]"#))
+                .unwrap();
         let fresh: Vec<_> = t.to_trace().accesses().iter().map(|a| a.fresh).collect();
         assert_eq!(fresh, [false, true]);
     }
@@ -274,7 +289,7 @@ mod tests {
     /// size counts only the pages its table owns.
     #[test]
     fn free_pages_belong_to_no_object() {
-        let json = trace_json(FORMAT, 1, r#"[["r",1],["r",2],["r",3]]"#).replace(
+        let json = trace_json(FORMAT, VERSION, r#"[["r",1],["r",2],["r",3]]"#).replace(
             r#"{"page":3,"object":"t","kind":"leaf"}"#,
             r#"{"page":3,"object":null,"kind":"free"}"#,
         );
@@ -289,7 +304,7 @@ mod tests {
         // With two frames, page 1 is evicted before the commit writes it.
         let t = CapturedTrace::from_json(&trace_json(
             FORMAT,
-            1,
+            VERSION,
             r#"[["r",1],["r",2],["r",3],["w",1]]"#,
         ))
         .unwrap();
@@ -307,10 +322,26 @@ mod tests {
     fn rejects_bad_traces() {
         let cases = [
             (trace_json("other", 1, "[]"), "expected format"),
-            (trace_json(FORMAT, 2, "[]"), "unsupported trace version"),
-            (trace_json(FORMAT, 1, r#"[["r",4]]"#), "outside 1..=3"),
-            (trace_json(FORMAT, 1, r#"[["r",0]]"#), "outside 1..=3"),
-            (trace_json(FORMAT, 1, r#"[["x",1]]"#), "unknown variant"),
+            (trace_json(FORMAT, 3, "[]"), "unsupported trace version"),
+            (trace_json(FORMAT, VERSION, r#"[["r",4]]"#), "outside 1..=3"),
+            (trace_json(FORMAT, VERSION, r#"[["r",0]]"#), "outside 1..=3"),
+            (
+                trace_json(FORMAT, VERSION, "[]")
+                    .replace(r#""page_count":3"#, r#""page_count":4000000000"#),
+                "page_count must be between",
+            ),
+            (
+                trace_json(FORMAT, VERSION, "[]").replace(r#"{"page":3,"#, r#"{"page":2,"#),
+                "lists page 2 twice",
+            ),
+            (
+                trace_json(FORMAT, VERSION, "[]").replace(r#"{"page":3,"#, r#"{"page":9,"#),
+                "lists page 9, outside",
+            ),
+            (
+                trace_json(FORMAT, VERSION, r#"[["x",1]]"#),
+                "unknown variant",
+            ),
         ];
         for (json, expect) in cases {
             let err = CapturedTrace::from_json(&json).unwrap_err();

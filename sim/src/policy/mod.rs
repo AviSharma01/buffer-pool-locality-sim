@@ -170,13 +170,18 @@ pub trait Policy {
     fn reads_ahead(&self, _ctx: Ctx, continues: bool) -> bool {
         continues
     }
+    /// The request that loaded `requested` (and any pages read ahead with it)
+    /// is done; the page asked for is used now.
+    fn on_request_done(&mut self, _requested: FrameIdx) {}
     /// How many pages to read ahead at most, given the pool-wide cap.
     fn read_ahead_cap(&self, _ctx: Ctx, cap: usize) -> usize {
         cap
     }
     /// Choose a frame to evict. Only called when all frames are occupied.
     /// Pushes a [`Note::Evict`] for the chosen frame.
-    fn victim(&mut self, ctx: Ctx, log: &mut Log) -> FrameIdx;
+    /// Never returns `pinned`: the frame of the page whose request is being
+    /// served, which read-ahead must not evict (PostgreSQL pins it too).
+    fn victim(&mut self, ctx: Ctx, pinned: Option<FrameIdx>, log: &mut Log) -> FrameIdx;
     /// State of an occupied frame.
     fn state(&self, frame: FrameIdx) -> FrameState;
     /// Where the clock hand points, for clock-based policies.
@@ -249,11 +254,6 @@ impl FromStr for PolicyKind {
     }
 }
 
-/// Index of the smallest value; ties go to the lowest index.
-pub(crate) fn argmin(values: impl Iterator<Item = (FrameIdx, usize)>) -> Option<FrameIdx> {
-    values.min_by_key(|&(i, v)| (v, i)).map(|(i, _)| i)
-}
-
 #[cfg(test)]
 pub(crate) mod test_util {
     use super::{Ctx, Log};
@@ -269,5 +269,59 @@ pub(crate) mod test_util {
 
     pub fn log() -> Log {
         Log::on()
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::test_util::{at, log};
+    use super::*;
+
+    /// A fresh policy of `kind` over 8 full frames, with a few hits.
+    fn primed(kind: PolicyKind, scan: Option<u32>) -> Box<dyn Policy> {
+        let mut p: Box<dyn Policy> = match kind {
+            PolicyKind::Fifo => Box::new(Fifo::new(8)),
+            PolicyKind::Lru => Box::new(Lru::new(8)),
+            PolicyKind::Clock => Box::new(Clock::new(8)),
+            PolicyKind::Pg => Box::new(Pg::new(8)),
+            PolicyKind::InnoDb => Box::new(InnoDb::new(8)),
+            PolicyKind::Opt => Box::new(Opt::new(8, (0..20).map(|i| 30 - i).collect())),
+        };
+        let mut l = log();
+        for f in 0..8 {
+            p.on_load(
+                f,
+                Ctx {
+                    pos: f,
+                    query: 0,
+                    scan,
+                },
+                &mut l,
+            );
+        }
+        // Same query as the eviction, so a scan's ring is still in force.
+        p.on_hit(5, at(8, 0), &mut l);
+        p.on_hit(2, at(9, 0), &mut l);
+        p
+    }
+
+    /// Whatever frame a policy would evict, pinning it makes it pick another.
+    #[test]
+    fn no_policy_evicts_the_pinned_frame() {
+        for kind in PolicyKind::ALL {
+            for scan in [None, Some(100)] {
+                let ctx = Ctx {
+                    pos: 10,
+                    query: 0,
+                    scan,
+                };
+                let first = primed(kind, scan).victim(ctx, None, &mut log());
+                let other = primed(kind, scan).victim(ctx, Some(first), &mut log());
+                assert_ne!(
+                    first, other,
+                    "{kind} (scan {scan:?}) evicted its pinned frame"
+                );
+            }
+        }
     }
 }

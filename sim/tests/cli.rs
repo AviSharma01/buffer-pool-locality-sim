@@ -129,11 +129,11 @@ fn tiny_trace(dir: &Path, reads: usize, cell: &str) -> String {
         .map(|i| format!(r#"["r",{}]"#, i % 100 + 1))
         .collect();
     let json = format!(
-        r#"{{"format":"bpsim-trace","version":1,"scenario":"tiny","sqlite_version":"3",
+        r#"{{"format":"bpsim-trace","version":2,"scenario":"tiny","sqlite_version":"3",
            "page_size":4096,"page_count":100,"objects":[],"notes":[],
            "pages":[{{"page":2,"object":"t","kind":"leaf"}}],
            "rows":{{"2":{{"object":"t","columns":["name"],"rows":[[{cell}]]}}}},
-           "queries":[{{"title":"q","sql":"SELECT 1;","plan":[],"io":[{}]}}]}}"#,
+           "queries":[{{"title":"q","sql":"SELECT 1;","plan":[],"scans":[],"io":[{}]}}]}}"#,
         io.join(",")
     );
     let path = dir.join("tiny.trace.json");
@@ -431,5 +431,39 @@ fn a_reader_that_stops_early_does_not_break_the_run() {
         only_run(&dir.join("shop/compare"))
             .join("viewer.html")
             .is_file()
+    );
+}
+
+#[test]
+fn runs_started_in_the_same_second_get_their_own_folders() {
+    let out = out_dir("same_second");
+    let trace = shop_trace();
+    let args = ["--trace", &trace, "--policy", "lru", "--frames", "8"];
+    for _ in 0..3 {
+        let done = sim(&[&args[..], &["--out", out.to_str().unwrap()]].concat());
+        assert!(done.status.success());
+    }
+    let parent = out.join("shop").join("lru");
+    let runs: Vec<_> = std::fs::read_dir(&parent).unwrap().collect();
+    assert_eq!(runs.len(), 3, "a later run overwrote an earlier one");
+    for run in runs {
+        assert!(run.unwrap().path().join("run.json").is_file());
+    }
+}
+
+/// The viewer refuses run files of another version, so its VERSION must move
+/// with the engine's.
+#[test]
+fn the_viewer_reads_the_run_file_version_the_engine_writes() {
+    let page = include_str!("../../viewer/index.html");
+    let declared: Vec<u32> = page
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("VERSION = "))
+        .map(|v| v.trim_end_matches(';').parse().expect("a number"))
+        .collect();
+    assert_eq!(
+        declared,
+        [bpsim::run::VERSION],
+        "viewer/index.html declares {declared:?}"
     );
 }

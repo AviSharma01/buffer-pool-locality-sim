@@ -57,17 +57,17 @@ def runs(work: Path) -> list[tuple[str, Path, list[str]]]:
 
 def check_page(page: Page, label: str, trace: Path, run: dict, width: int) -> list[str]:
     problems = []
-    accesses = page.evaluate("state.accesses")
+    accesses = page.evaluate("bpsim.accesses()")
     for storage in model.PROFILES:
         page.click("#sSsd" if storage == "ssd" else "#sHdd")
-        page.evaluate("n => { for (let i = -1; i < n; i++) jump(i); }", accesses)
+        page.evaluate("n => { for (let i = -1; i < n; i++) bpsim.jump(i); }", accesses)
         if width < 1000:
             continue
         read_ahead = "off" if run["runs"][0]["summary"]["read_ahead_cap"] == 0 else "auto"
         for r in run["runs"]:
             if r["policy"] not in POLICIES_WITH_A_MODEL:
                 continue
-            shown = page.evaluate("p => state.running[p].c[state.accesses - 1]", r["policy"])
+            shown = page.evaluate("p => bpsim.running(p).c[bpsim.accesses() - 1]", r["policy"])
             want = model.run(trace, r["policy"], run["frames"], storage, read_ahead)["total_ms"]
             if abs(shown - want) > 1e-9 * max(1.0, want):
                 problems.append(
@@ -86,23 +86,23 @@ def check_page(page: Page, label: str, trace: Path, run: dict, width: int) -> li
 
 def check_interaction(page: Page, run_file: Path) -> list[str]:
     problems = []
-    page.evaluate("() => jump(-1)")
+    page.evaluate("() => bpsim.jump(-1)")
     page.keyboard.press("ArrowRight")
     page.keyboard.press("ArrowRight")
-    if page.evaluate("view.at") != 1:
+    if page.evaluate("bpsim.at()") != 1:
         problems.append(
-            f"two right-arrow presses landed on access {page.evaluate('view.at')}, not 1"
+            f"two right-arrow presses landed on access {page.evaluate('bpsim.at()')}, not 1"
         )
     box = page.query_selector("#chart .ctrack").bounding_box()  # a pool's row in the chart
     page.mouse.move(box["x"] + box["width"] * 0.6, box["y"] + box["height"] / 2)
     page.mouse.down()
     page.mouse.up()
-    if page.evaluate("view.at") <= 1:
+    if page.evaluate("bpsim.at()") <= 1:
         problems.append("dragging on the chart did not move")
     page.click("#mRace")
     page.select_option("#speed", index=0)
     page.click("#play")
-    page.wait_for_function("() => !view.playing", timeout=60_000)
+    page.wait_for_function("() => !bpsim.playing()", timeout=60_000)
     if page.query_selector_all(".pool .place:not(:empty)") == []:
         problems.append("the race finished without placing any pool")
     page.click("#mStep")

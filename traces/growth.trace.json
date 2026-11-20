@@ -1,6 +1,6 @@
 {
  "format": "bpsim-trace",
- "version": 1,
+ "version": 2,
  "scenario": "growth",
  "sqlite_version": "3.54.1",
  "page_size": 4096,
@@ -90,11 +90,11 @@
   {"page":77,"object":"events","kind":"leaf"}
  ],
  "queries": [
-  {"title":"Total of all orders","sql":"SELECT SUM(amount) FROM orders;","plan":["SCAN orders"],"io":[["r",1],["r",2],["r",7],["r",8],["r",10],["r",14],["r",17],["r",20],["r",23],["r",26],["r",29],["r",32],["r",35],["r",37],["r",41],["r",43],["r",46],["r",50],["r",52],["r",55],["r",58],["r",61],["r",63],["r",67],["r",70],["r",73],["r",76]]},
-  {"title":"Look up order 1200","sql":"SELECT * FROM orders WHERE id = 1200;","plan":["SEARCH orders USING INTEGER PRIMARY KEY (rowid=?)"],"io":[["r",1],["r",2],["r",37]]},
-  {"title":"Events for order 1200","sql":"SELECT * FROM events WHERE order_id = 1200;","plan":["SEARCH events USING INDEX events_order (order_id=?)"],"io":[["r",1],["r",4],["r",39],["r",3],["r",38]]},
-  {"title":"Count paid events","sql":"SELECT COUNT(*) FROM events WHERE kind = 'paid';","plan":["SCAN events"],"io":[["r",1],["r",3],["r",5],["r",6],["r",9],["r",13],["r",15],["r",16],["r",19],["r",21],["r",22],["r",25],["r",27],["r",30],["r",31],["r",33],["r",36],["r",38],["r",40],["r",42],["r",45],["r",47],["r",48],["r",51],["r",53],["r",56],["r",57],["r",60],["r",62],["r",64],["r",66],["r",68],["r",71],["r",72],["r",75],["r",77]]},
-  {"title":"Total of all orders again","sql":"SELECT SUM(amount) FROM orders;","plan":["SCAN orders"],"io":[["r",1],["r",2],["r",7],["r",8],["r",10],["r",14],["r",17],["r",20],["r",23],["r",26],["r",29],["r",32],["r",35],["r",37],["r",41],["r",43],["r",46],["r",50],["r",52],["r",55],["r",58],["r",61],["r",63],["r",67],["r",70],["r",73],["r",76]]}
+  {"title":"Total of all orders","sql":"SELECT SUM(amount) FROM orders;","plan":["SCAN orders"],"scans":["orders"],"io":[["r",1],["r",2],["r",7],["r",8],["r",10],["r",14],["r",17],["r",20],["r",23],["r",26],["r",29],["r",32],["r",35],["r",37],["r",41],["r",43],["r",46],["r",50],["r",52],["r",55],["r",58],["r",61],["r",63],["r",67],["r",70],["r",73],["r",76]]},
+  {"title":"Look up order 1200","sql":"SELECT * FROM orders WHERE id = 1200;","plan":["SEARCH orders USING INTEGER PRIMARY KEY (rowid=?)"],"scans":[],"io":[["r",1],["r",2],["r",37]]},
+  {"title":"Events for order 1200","sql":"SELECT * FROM events WHERE order_id = 1200;","plan":["SEARCH events USING INDEX events_order (order_id=?)"],"scans":[],"io":[["r",1],["r",4],["r",39],["r",3],["r",38]]},
+  {"title":"Count paid events","sql":"SELECT COUNT(*) FROM events WHERE kind = 'paid';","plan":["SCAN events"],"scans":["events"],"io":[["r",1],["r",3],["r",5],["r",6],["r",9],["r",13],["r",15],["r",16],["r",19],["r",21],["r",22],["r",25],["r",27],["r",30],["r",31],["r",33],["r",36],["r",38],["r",40],["r",42],["r",45],["r",47],["r",48],["r",51],["r",53],["r",56],["r",57],["r",60],["r",62],["r",64],["r",66],["r",68],["r",71],["r",72],["r",75],["r",77]]},
+  {"title":"Total of all orders again","sql":"SELECT SUM(amount) FROM orders;","plan":["SCAN orders"],"scans":["orders"],"io":[["r",1],["r",2],["r",7],["r",8],["r",10],["r",14],["r",17],["r",20],["r",23],["r",26],["r",29],["r",32],["r",35],["r",37],["r",41],["r",43],["r",46],["r",50],["r",52],["r",55],["r",58],["r",61],["r",63],["r",67],["r",70],["r",73],["r",76]]}
  ],
  "rows": {
   "2": {"object":"orders","columns":["child_page","rowid_up_to"],"rows":[[7,105],[8,207],[10,309],[14,411],[17,513],[20,615],[23,717],[26,819],[29,921],[32,1023],[35,1125],[37,1227],[41,1329],[43,1431],[46,1533],[50,1635],[52,1737],[55,1839],[58,1941],[61,2043],[63,2145],[67,2247],[70,2349],[73,2451],[76,null]]},

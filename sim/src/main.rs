@@ -2,7 +2,7 @@ mod cli;
 
 use std::fs;
 use std::io::{ErrorKind, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use bpsim::run::RunFile;
 use bpsim::{CapturedTrace, PolicyKind, SimConfig, Simulator, Workload, build_scenario};
@@ -128,6 +128,25 @@ fn write(path: &Path, contents: &str) -> Result<(), String> {
     fs::write(path, contents).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
+/// A new folder `parent/ts`, or `parent/ts-2`, `-3`, ... if runs started in
+/// the same second: an earlier run is never overwritten.
+fn new_run_dir(parent: &Path, ts: &str) -> Result<PathBuf, String> {
+    create_dir(parent)?;
+    for n in 1.. {
+        let dir = if n == 1 {
+            parent.join(ts)
+        } else {
+            parent.join(format!("{ts}-{n}"))
+        };
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("creating {}: {e}", dir.display())),
+        }
+    }
+    unreachable!("some suffix is free")
+}
+
 fn create_dir(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|e| format!("creating {}: {e}", path.display()))
 }
@@ -155,7 +174,7 @@ fn run(args: Cli) -> Result<(), String> {
     } else {
         policies[0].name()
     };
-    let run_dir = args.out.join(&name).join(folder).join(ts);
+    let run_dir = new_run_dir(&args.out.join(&name).join(folder), &ts)?;
 
     let mut sims = Vec::with_capacity(policies.len());
     for &policy in policies {

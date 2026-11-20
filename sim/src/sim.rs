@@ -296,18 +296,14 @@ impl Simulator {
                 && self.trace.owner_of(page) == owner
                 && !self.pool.contains(page)
             {
-                let evicted = self.pool.read_ahead(page, ctx, &mut self.log);
+                let evicted = self.pool.read_ahead(page, a.page, ctx, &mut self.log);
                 self.evicted(evicted, &mut done.ms);
                 done.ahead_evicted.extend(evicted);
                 self.waiting.insert(page);
                 done.ahead.push(page);
                 page += 1;
             }
-            assert!(
-                self.pool.contains(a.page),
-                "read-ahead evicted page {} it was reading for",
-                a.page
-            );
+            self.pool.request_done(a.page);
         }
         let pages = done.ahead.len() as u32;
         self.metrics.pages_read_ahead += u64::from(pages);

@@ -1,11 +1,13 @@
 # verify
 
-Checks that do not trust the engine's own tests. Run them from the repo root
-after building the engine (`cd sim && cargo build --release`).
+Checks that do not trust the engine's own tests. Run them from the repo root.
+`compare.py` and `fuzz.py` build the release engine first (`cargo build --release`), so they
+never check a stale binary; `browser.py` needs it built.
 
 | Command | What it checks | Time |
 |---|---|---|
 | `python verify/compare.py` | The engine against an independent model (`model.py`) on every shipped trace and a free-page scenario: every policy, pool sizes 1–32, SSD and HDD, read-ahead auto/off/1/3. Also runs inside `pytest` from `capture/`. | ~10 s |
+| `python verify/fuzz.py` | The engine against the model on random small databases (objects in runs of pages, free pages, walks, jumps, writes, random scans): every policy, pool sizes 1–16, both drives, read-ahead auto/off/3. `--seed`, `--traces`, `--keep DIR` for failing traces. A short run is in `pytest`. | ~1 min |
 | `python verify/browser.py` | The viewer in a real browser: desktop and phone, light and dark; no errors or overflow; every access on both drives; totals equal the model's; race, keys, dragging, and refusing an old run file. Needs Playwright. | ~1 min |
 | `python verify/linux_readahead.py` | What real Linux read-ahead does on this machine, to compare with the engine's rule. Linux only; informational. | ~1 s |
 

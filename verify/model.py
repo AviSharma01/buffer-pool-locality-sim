@@ -23,6 +23,12 @@ Rules, in brief:
   to min(8, frames // 4), stopping at another object, a free page or a cached
   page, in the same request. PostgreSQL-style triggers on any scan miss and caps
   a big scan at its ring size minus one. Optimal never reads ahead.
+- While a request reads ahead, the page it was made for is pinned: no policy
+  evicts it (Clock and the PostgreSQL sweep pass over it untouched). LRU then
+  counts that page as used, so the pages read ahead with it are older; FIFO
+  keeps arrival order. A frame sits in PostgreSQL's ring at most once (3.5b).
+- Scans come from the trace's `scans` list, which the capture works out from
+  SQLite's bytecode; the plan text is not read.
 """
 
 from __future__ import annotations
@@ -48,16 +54,7 @@ def load(path: Path | str) -> tuple[dict, list[list[list]], dict[int, str]]:
         size[o] = size.get(o, 0) + 1
     queries = []
     for q in t["queries"]:
-        scanned = []
-        for line in q["plan"]:
-            if line.startswith("SCAN "):
-                rest = line[5:]
-                obj = rest.split()[0]
-                for k in ("USING COVERING INDEX ", "USING INDEX "):
-                    if k in rest:
-                        obj = rest.split(k, 1)[1].split()[0]
-                        break
-                scanned.append(obj)
+        scanned = q["scans"]
         accesses: list[list] = []
         for op, p in q["io"]:
             earlier = [a for a in accesses if a[0] == p]
@@ -70,8 +67,9 @@ def load(path: Path | str) -> tuple[dict, list[list[list]], dict[int, str]]:
     return t, queries, owner
 
 
-# Each policy: load / hit / victim, plus read-ahead hooks (ra, triggers, cap).
-# Arguments: p page, q query index, pos access position, scan scan size or None.
+# Each policy: load / hit / victim, plus read-ahead hooks (ra, triggers, cap,
+# done). Arguments: p page, q query index, pos access position, scan scan size
+# or None. victim never returns `pinned`: the page whose read is in progress.
 
 
 class LRU:
@@ -94,12 +92,23 @@ class LRU:
     def load(s, p, q, pos, scan):
         s.order.append(p)
 
-    def victim(s, q, pos, scan):
-        return s.order.pop(0)
+    def done(s, p):
+        # The page asked for is used once its read finishes; pages read
+        # ahead with it have not been used, so they stay older.
+        s.order.remove(p)
+        s.order.append(p)
+
+    def victim(s, q, pos, scan, pinned=None):
+        p = next(x for x in s.order if x != pinned)
+        s.order.remove(p)
+        return p
 
 
 class FIFO(LRU):
     def hit(s, p, q, pos, scan):
+        pass
+
+    def done(s, p):
         pass
 
 
@@ -130,11 +139,13 @@ class Clock:
     def place(s, slot):
         s._slot = slot
 
-    def victim(s, q, pos, scan):
+    def victim(s, q, pos, scan, pinned=None):
         while True:
             p = s.slots[s.hand]
             slot = s.hand
             s.hand = (s.hand + 1) % s.n
+            if p == pinned:
+                continue
             if s.ref[p]:
                 s.ref[p] = 0
             else:
@@ -192,12 +203,15 @@ class PG:
         s.u[p] = 1
         if s._ring(q, scan):
             s.rpos = (s.rpos + 1) % s.ringlen
-            s.ring[s.rpos] = s._slot
+            if s.ring[s.rpos] != s._slot:
+                # One slot per frame: a frame the sweep found moves here.
+                s.ring = [None if x == s._slot else x for x in s.ring]
+                s.ring[s.rpos] = s._slot
 
-    def victim(s, q, pos, scan):
+    def victim(s, q, pos, scan, pinned=None):
         if s._ring(q, scan):
             slot = s.ring[(s.rpos + 1) % s.ringlen]
-            if slot is not None and s.u[s.slots[slot]] <= 1:
+            if slot is not None and s.slots[slot] != pinned and s.u[s.slots[slot]] <= 1:
                 p = s.slots[slot]
                 del s.u[p]
                 s._slot = slot
@@ -206,6 +220,8 @@ class PG:
             slot = s.hand
             p = s.slots[slot]
             s.hand = (s.hand + 1) % s.n
+            if p == pinned:
+                continue
             if s.u[p] == 0:
                 del s.u[p]
                 s._slot = slot
@@ -251,8 +267,9 @@ class InnoDB:
         s.l.insert(L - s.oldlen(L), p)
         s.lq[p] = q
 
-    def victim(s, q, pos, scan):
-        return s.l.pop()
+    def victim(s, q, pos, scan, pinned=None):
+        i = max(i for i, x in enumerate(s.l) if x != pinned)
+        return s.l.pop(i)
 
 
 class OPT:
@@ -272,8 +289,8 @@ class OPT:
     def load(s, p, q, pos, scan):
         s.f[p] = s.nxt[pos]
 
-    def victim(s, q, pos, scan):
-        p = max(s.f, key=lambda k: s.f[k])
+    def victim(s, q, pos, scan, pinned=None):
+        p = max((k for k in s.f if k != pinned), key=lambda k: s.f[k])
         del s.f[p]
         return p
 
@@ -326,13 +343,13 @@ def run(
     m["total_ms"] = 0.0
     used = [0]
 
-    def make_room(q, pos, scan):
+    def make_room(q, pos, scan, pinned=None):
         if used[0] < frames:
             if hasattr(P, "place"):
                 P.place(used[0])
             used[0] += 1
         else:
-            v = P.victim(q, pos, scan)
+            v = P.victim(q, pos, scan, pinned)
             del res[v]
             if dirty.pop(v):
                 m["dirty_evictions"] += 1
@@ -376,7 +393,7 @@ def run(
         if k > 0 and o is not None and P.triggers(scan, cont):
             r = p + 1
             while len(extra) < k and owner.get(r) == o and r not in res:
-                make_room(qi, pos, scan)
+                make_room(qi, pos, scan, pinned=p)
                 res[r] = 1
                 dirty[r] = False
                 P.ra(r, qi, pos, scan)
@@ -386,6 +403,8 @@ def run(
             assert p in res, (
                 f"read-ahead evicted the page it read for: {path} {policy} {frames} {pos}"
             )
+            if hasattr(P, "done"):
+                P.done(p)
         m["pages_read_ahead"] += len(extra)
         m["read_requests"] += 1
         m["total_ms"] += fixed + (1 + len(extra)) * c["T"]

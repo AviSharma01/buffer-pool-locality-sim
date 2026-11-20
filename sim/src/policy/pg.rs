@@ -69,11 +69,17 @@ impl Pg {
         }
     }
 
-    fn sweep(&mut self, log: &mut Log) -> FrameIdx {
+    /// The clock sweep. A pinned frame is passed over without lowering its
+    /// usage count, as PostgreSQL skips buffers in use.
+    fn sweep(&mut self, pinned: Option<FrameIdx>, log: &mut Log) -> FrameIdx {
         let n = self.usage.len();
+        assert!(n > 1 || pinned.is_none(), "the only frame is pinned");
         loop {
             let frame = self.hand;
             self.hand = (self.hand + 1) % n;
+            if Some(frame) == pinned {
+                continue;
+            }
             let from = self.usage[frame];
             if from == 0 {
                 log.push(Note::Evict {
@@ -108,6 +114,11 @@ impl Policy for Pg {
         if self.ring_applies(ctx) {
             self.cursor = self.next_slot();
             if self.ring[self.cursor] != Some(frame) {
+                // A frame found by the sweep may already sit in another
+                // slot; it moves here, so the ring never lists it twice.
+                for slot in self.ring.iter_mut().filter(|s| **s == Some(frame)) {
+                    *slot = None;
+                }
                 self.ring[self.cursor] = Some(frame);
                 log.push(Note::JoinedRing { frame });
             }
@@ -131,11 +142,11 @@ impl Policy for Pg {
         }
     }
 
-    fn victim(&mut self, ctx: Ctx, log: &mut Log) -> FrameIdx {
+    fn victim(&mut self, ctx: Ctx, pinned: Option<FrameIdx>, log: &mut Log) -> FrameIdx {
         if self.ring_applies(ctx) {
             if let Some(frame) = self.ring[self.next_slot()] {
                 let usage = self.usage[frame];
-                if usage <= 1 {
+                if usage <= 1 && Some(frame) != pinned {
                     log.push(Note::Evict {
                         frame,
                         why: Why::RingReuse { usage },
@@ -145,7 +156,7 @@ impl Policy for Pg {
                 log.push(Note::RingBusy { frame, usage });
             }
         }
-        self.sweep(log)
+        self.sweep(pinned, log)
     }
 
     fn state(&self, frame: FrameIdx) -> FrameState {
@@ -192,7 +203,7 @@ mod tests {
         assert_eq!(usage(&p, 0), MAX_USAGE);
         l.take();
         // Frame 0 (usage 5) outlives frame 1 (usage 1): 5->4, 1->0, 4->3, evict 1.
-        assert_eq!(p.victim(at(10, 0), &mut l), 1);
+        assert_eq!(p.victim(at(10, 0), None, &mut l), 1);
         let notes = l.take();
         assert_eq!(notes.len(), 4);
         assert_eq!(
@@ -216,7 +227,7 @@ mod tests {
         }
         let mut victims = Vec::new();
         for pos in 8..14 {
-            let f = p.victim(scan(pos, 1, 100), &mut l);
+            let f = p.victim(scan(pos, 1, 100), None, &mut l);
             p.on_load(f, scan(pos, 1, 100), &mut l);
             victims.push(f);
         }
@@ -255,7 +266,7 @@ mod tests {
         assert!(!p.ring_applies(scan(8, 1, 2)));
 
         // The first ring frame comes from a sweep, which leaves every count at 0.
-        let f = p.victim(scan(9, 2, 100), &mut l);
+        let f = p.victim(scan(9, 2, 100), None, &mut l);
         p.on_load(f, scan(9, 2, 100), &mut l);
         assert_eq!(usage(&p, 4), 0);
         // A scan hit lifts a count only to 1; normal hits keep adding.
@@ -266,11 +277,11 @@ mod tests {
         for pos in 12..15 {
             p.on_hit(f, at(pos, 2), &mut l);
         }
-        let g = p.victim(scan(15, 2, 100), &mut l);
+        let g = p.victim(scan(15, 2, 100), None, &mut l);
         p.on_load(g, scan(15, 2, 100), &mut l);
         l.take();
         // Back at slot 0, frame f has usage 4: too hot to recycle, so sweep.
-        let h = p.victim(scan(16, 2, 100), &mut l);
+        let h = p.victim(scan(16, 2, 100), None, &mut l);
         assert_eq!(l.take()[0], Note::RingBusy { frame: f, usage: 4 });
         assert_ne!(h, f);
     }

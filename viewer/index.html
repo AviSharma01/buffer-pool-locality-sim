@@ -1650,6 +1650,18 @@ document.addEventListener("drop", async e => {
   const file = e.dataTransfer.files[0];
   if (file) load(await file.text());
 });
+
+/* ---------- for automated checks (verify/browser.py) ---------- */
+/* A small read-only window on the page, so checks do not depend on the
+   names of its internals. */
+window.bpsim = Object.freeze({
+  version: VERSION,
+  accesses: () => state.accesses,
+  at: () => view.at,
+  playing: () => view.playing,
+  running: policy => state.running[policy],
+  jump
+});
 </script>
 </body>
 </html>

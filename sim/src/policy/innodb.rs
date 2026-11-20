@@ -107,8 +107,14 @@ impl Policy for InnoDb {
         self.loaded_in[frame] = None;
     }
 
-    fn victim(&mut self, _ctx: Ctx, log: &mut Log) -> FrameIdx {
-        let frame = self.list.pop().expect("pool has frames");
+    fn victim(&mut self, _ctx: Ctx, pinned: Option<FrameIdx>, log: &mut Log) -> FrameIdx {
+        // The tail, or the frame before it if the tail is pinned.
+        let at = self
+            .list
+            .iter()
+            .rposition(|&f| Some(f) != pinned)
+            .expect("pool has an unpinned frame");
+        let frame = self.list.remove(at);
         log.push(Note::Evict {
             frame,
             why: Why::OldTail,
@@ -150,7 +156,7 @@ mod tests {
             }
         );
         let mut l = log();
-        let v = p.victim(at(8, 1), &mut l);
+        let v = p.victim(at(8, 1), None, &mut l);
         p.on_load(v, at(8, 1), &mut l);
         let notes = l.take();
         assert_eq!(notes[1], Note::Inserted { frame: v });
@@ -203,7 +209,7 @@ mod tests {
         let young_before: Vec<FrameIdx> = p.list[..5].to_vec();
         for pos in 20..40 {
             let ctx = at(pos, 2);
-            let f = p.victim(ctx, &mut log());
+            let f = p.victim(ctx, None, &mut log());
             p.on_load(f, ctx, &mut log());
             p.on_hit(f, ctx, &mut log());
         }
@@ -216,7 +222,7 @@ mod tests {
     #[test]
     fn a_page_read_ahead_is_not_promoted_by_its_first_use() {
         let mut p = filled(8);
-        let v = p.victim(at(8, 1), &mut log());
+        let v = p.victim(at(8, 1), None, &mut log());
         p.on_read_ahead(v, at(8, 1), &mut log());
         let mut l = log();
         p.on_hit(v, at(9, 2), &mut l);

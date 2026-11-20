@@ -2,7 +2,7 @@
 trace plus a free-page scenario: every policy, pool sizes from 1 to 32,
 both drives, read-ahead auto, off, 1 and 3 pages. About 2,200 runs, ~10 s.
 
-    python verify/compare.py            # needs sim/target/release/sim
+    python verify/compare.py            # builds the release engine first
 
 Optimal is compared on hits only: when several pages are never needed again,
 any of them is an optimal victim, and the two may pick different ones (same
@@ -42,6 +42,17 @@ FIELDS = [
 ]
 
 
+def build() -> Path:
+    """Build the release engine, so the check never runs a stale binary.
+    Without cargo, an existing binary is used as it is."""
+    if shutil.which("cargo"):
+        cmd = ["cargo", "build", "--release", "--quiet"]
+        subprocess.run(cmd, cwd=REPO / "sim", check=True)
+    if not SIM.is_file():
+        raise FileNotFoundError(f"no engine at {SIM}: install Rust, or build it with cargo")
+    return SIM
+
+
 def traces(work: Path) -> dict[str, Path]:
     """The shipped traces, plus freed.sql captured fresh."""
     found = {name: REPO / "traces" / f"{name}.trace.json" for name in TRACES}
@@ -71,8 +82,10 @@ def check_run(run_file: Path, path: Path, frames: int, storage: str, read_ahead:
     return mismatches
 
 
-def compare(sim: Path = SIM) -> tuple[int, list[str]]:
-    """Returns (runs compared, mismatch descriptions)."""
+def compare(sim: Path | None = None) -> tuple[int, list[str]]:
+    """Returns (runs compared, mismatch descriptions). Builds the engine
+    unless given one."""
+    sim = sim or build()
     runs, mismatches = 0, []
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
@@ -94,10 +107,12 @@ def compare(sim: Path = SIM) -> tuple[int, list[str]]:
 
 
 def main() -> int:
-    if not SIM.is_file():
-        print(f"build the engine first: cd sim && cargo build --release ({SIM} missing)")
+    try:
+        sim = build()
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        print(f"cannot build the engine: {e}")
         return 2
-    runs, mismatches = compare()
+    runs, mismatches = compare(sim)
     for m in mismatches[:20]:
         print("MISMATCH", m)
     print(f"{runs} runs compared, {len(mismatches)} mismatches (Optimal: hits only)")

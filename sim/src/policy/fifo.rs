@@ -28,11 +28,13 @@ impl Policy for Fifo {
         self.loaded_at[frame] = ctx.pos;
     }
 
-    fn victim(&mut self, _ctx: Ctx, log: &mut Log) -> FrameIdx {
-        let frame = self
+    fn victim(&mut self, _ctx: Ctx, pinned: Option<FrameIdx>, log: &mut Log) -> FrameIdx {
+        let first = self
             .queue
-            .pop_front()
-            .expect("victim called with no resident pages");
+            .iter()
+            .position(|&f| Some(f) != pinned)
+            .expect("victim called with no unpinned resident page");
+        let frame = self.queue.remove(first).expect("in the queue");
         let why = Why::LoadedFirst {
             loaded_at: self.loaded_at[frame],
         };
@@ -62,9 +64,9 @@ mod tests {
         }
         p.on_hit(0, at(3, 0), &mut l);
         assert_eq!(p.state(1), FrameState::Fifo { rank: 1 });
-        assert_eq!(p.victim(at(4, 0), &mut l), 0);
+        assert_eq!(p.victim(at(4, 0), None, &mut l), 0);
         p.on_load(0, at(4, 0), &mut l);
-        assert_eq!(p.victim(at(5, 0), &mut l), 1);
+        assert_eq!(p.victim(at(5, 0), None, &mut l), 1);
         assert_eq!(
             l.take()[1],
             Note::Evict {

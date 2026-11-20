@@ -44,11 +44,16 @@ impl Policy for Clock {
         self.ref_bits[frame] = false;
     }
 
-    fn victim(&mut self, _ctx: Ctx, log: &mut Log) -> FrameIdx {
+    fn victim(&mut self, _ctx: Ctx, pinned: Option<FrameIdx>, log: &mut Log) -> FrameIdx {
         let n = self.ref_bits.len();
+        assert!(n > 1 || pinned.is_none(), "the only frame is pinned");
         loop {
             let frame = self.hand;
             self.hand = (self.hand + 1) % n;
+            if Some(frame) == pinned {
+                // In use: the hand passes without touching it.
+                continue;
+            }
             if self.ref_bits[frame] {
                 self.ref_bits[frame] = false;
                 log.push(Note::Swept {
@@ -91,7 +96,7 @@ mod tests {
         }
         l.take();
         // All bits set: first sweep clears them, then frame 0 is evicted.
-        assert_eq!(c.victim(at(3, 0), &mut l), 0);
+        assert_eq!(c.victim(at(3, 0), None, &mut l), 0);
         let swept = |frame| Note::Swept {
             frame,
             from: 1,
@@ -105,7 +110,7 @@ mod tests {
         c.on_load(0, at(3, 0), &mut l);
         c.on_hit(1, at(4, 0), &mut l);
         // Frame 1 was re-referenced, frame 2 was not.
-        assert_eq!(c.victim(at(5, 0), &mut l), 2);
+        assert_eq!(c.victim(at(5, 0), None, &mut l), 2);
         assert_eq!(c.hand(), Some(0));
         assert_eq!(c.state(1), FrameState::Clock { referenced: false });
     }
@@ -119,6 +124,6 @@ mod tests {
         c.on_load(1, at(1, 0), &mut log());
         c.on_read_ahead(2, at(1, 0), &mut log());
         assert_eq!(c.state(2), FrameState::Clock { referenced: false });
-        assert_eq!(c.victim(at(2, 0), &mut log()), 2);
+        assert_eq!(c.victim(at(2, 0), None, &mut log()), 2);
     }
 }

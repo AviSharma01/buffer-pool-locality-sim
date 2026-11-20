@@ -16,11 +16,12 @@ SQL (--vacuum runs VACUUM itself, on the copy); schemas are not trusted; and
 size and time limits apply. This guards against hostile files and mistakes;
 it is not a sandbox.
 
-Trace format (JSON, version 1):
+Trace format (JSON, version 2):
     format, version, scenario, sqlite_version, page_size, page_count
     objects  [{name, type, table}]                 tables and indexes
     pages    [{page, object, kind}]                kind: internal | leaf | overflow | free
-    queries  [{title, sql, plan, io}]              io: [["r"|"w", page], ...] in order
+    queries  [{title, sql, plan, scans, io}]       io: [["r"|"w", page], ...] in order
+                                                   scans: tables and indexes read end to end
     rows     {"<page>": {object, columns, rows}}   decoded page contents, for pages queries touch
     notes    [str]                                 how to read the trace
 
@@ -51,12 +52,16 @@ from typing import Any
 
 import apsw
 
-TRACE_VERSION = 1
+TRACE_VERSION = 2
 VFS_NAME = "bpsim-trace"
 REPO = Path(__file__).resolve().parent.parent
 SQLITE_MAGIC = b"SQLite format 3\x00"
 MAX_PAGE_SIZE = 65536
 SETUP_SECONDS = 60.0
+# Memory guards: no single string or blob may exceed MAX_VALUE bytes, and
+# SQLite may not hold more than HEAP_LIMIT bytes in all while capturing.
+MAX_VALUE = 10_000_000
+HEAP_LIMIT = 256 * 1024 * 1024
 
 NOTES = [
     "Page 1 holds the file header; SQLite reads it at the start of every statement to check "
@@ -443,6 +448,7 @@ def _restrict(conn: apsw.Connection, max_pages: int) -> None:
     conn.execute(f"PRAGMA max_page_count = {int(max_pages)}")
     conn.limit(apsw.SQLITE_LIMIT_ATTACHED, 0)
     conn.limit(apsw.SQLITE_LIMIT_SQL_LENGTH, 1_000_000)
+    conn.limit(apsw.SQLITE_LIMIT_LENGTH, MAX_VALUE)
     conn.authorizer = _authorizer
 
 
@@ -453,9 +459,12 @@ def _run(
     seconds: float,
     log: list[tuple[str, int]] | None = None,
     max_io: int = 0,
+    keep: bool = True,
 ) -> list[tuple[Any, ...]]:
     """Run restricted SQL to completion, stopping it if it runs too long or
-    does too much I/O. Errors come back as ValueError naming `what`."""
+    does too much I/O. With keep=False the rows are read and dropped one at a
+    time, so a query returning millions of rows costs no memory here. Errors
+    come back as ValueError naming `what`."""
     deadline = time.monotonic() + seconds
 
     def over() -> bool:
@@ -463,7 +472,11 @@ def _run(
 
     conn.set_progress_handler(over, 1000)
     try:
-        return list(conn.execute(sql))
+        if keep:
+            return list(conn.execute(sql))
+        for _ in conn.execute(sql):
+            pass
+        return []
     except apsw.InterruptError:
         if log is not None and len(log) > max_io:
             raise ValueError(
@@ -475,6 +488,15 @@ def _run(
     except apsw.FullError:
         raise ValueError(
             f"{what}: the database grew past its page limit (--max-pages raises it)"
+        ) from None
+    except apsw.TooBigError:
+        raise ValueError(
+            f"{what}: a value is larger than {MAX_VALUE // 1_000_000} MB, the most a capture allows"
+        ) from None
+    except apsw.NoMemError:
+        raise ValueError(
+            f"{what}: SQLite needed more than {HEAP_LIMIT // 2**20} MB of memory, "
+            "the most a capture allows"
         ) from None
     except apsw.AuthError:
         raise ValueError(
@@ -645,6 +667,60 @@ def _layout(
     return page_size, objects, pages
 
 
+# Opcodes that may jump to the address in P2, from SQLite's opcode list.
+_JUMPS = frozenset(
+    "Goto Gosub If IfNot IfPos IfNotZero DecrJumpZero Eq Ne Lt Le Gt Ge ElseEq IsNull NotNull "
+    "IsType Once SeekLT SeekLE SeekGE SeekGT SeekRowid SeekScan SeekEnd Found NotFound NotExists "
+    "NoConflict IfNoHope IdxGT IdxGE IdxLT IdxLE Rewind Last Next Prev SorterNext SorterSort "
+    "Sort Yield InitCoroutine Jump Filter IfNullRow IfEmpty IfSizeBetween VFilter VNext "
+    "RowSetTest RowSetRead MustBeInt FkIfZero Program Init".split()
+)
+_NO_FALLTHROUGH = frozenset({"Goto", "Halt", "Return", "EndCoroutine"})
+_P2_IS_REGISTER = 0x02  # OPFLAG_P2ISREG on OpenRead/OpenWrite
+
+
+def _scans(conn: apsw.Connection, sql: str, what: str, seconds: float) -> list[str]:
+    """The tables and indexes `sql` reads end to end, from its bytecode.
+
+    A cursor on a b-tree scans it when the program moves the cursor to its
+    first or last entry (Rewind, Last) and steps it (Next, Prev) without ever
+    seeking, or counts the b-tree (Count). Cursors are matched to objects by
+    root page, so aliases do not matter. A Next or Prev that nothing reaches
+    (the min()/max() shortcut reads one entry, then jumps past it) is not a
+    step. The plan text is not used: it names aliases, and it calls some full
+    reads (an unindexed max(), an automatic index's build) searches."""
+    roots = {
+        root: name
+        for name, root in _run(
+            conn, "SELECT name, rootpage FROM sqlite_schema WHERE rootpage > 0", what, seconds
+        )
+    }
+    program = _run(conn, "EXPLAIN " + sql, what, seconds)
+    targets = {row[3] for row in program if row[1] in _JUMPS}
+    name: dict[int, str | None] = {}
+    used: dict[int, set[str]] = {}
+    order: list[str] = []
+    for i, (addr, op, p1, p2, p3, _p4, p5, *_rest) in enumerate(program):
+        if op in ("OpenRead", "OpenWrite"):
+            name[p1] = roots.get(p2) if p3 == 0 and not p5 & _P2_IS_REGISTER else None
+            used[p1] = set()
+            if name[p1] and name[p1] not in order:
+                order.append(name[p1])
+        elif p1 in used:
+            if op in ("Next", "Prev") and not (
+                addr in targets or (i > 0 and program[i - 1][1] not in _NO_FALLTHROUGH)
+            ):
+                continue
+            used[p1].add(op)
+    scanned = set()
+    for cursor, ops in used.items():
+        loop = bool(ops & {"Rewind", "Last"}) and bool(ops & {"Next", "Prev"})
+        seeks = any(op.startswith("Seek") for op in ops)
+        if name[cursor] and ((loop and not seeks) or "Count" in ops):
+            scanned.add(name[cursor])
+    return [o for o in order if o in scanned]
+
+
 def _vacuum(db_path: Path, seconds: float) -> None:
     """Rebuild our working copy so every table and index is contiguous.
 
@@ -660,6 +736,18 @@ def _vacuum(db_path: Path, seconds: float) -> None:
 
 def capture(
     scenario: Scenario, workdir: Path, limits: Limits | None = None, rows: bool = True
+) -> dict[str, Any]:
+    """Build the database, run the queries through the trace VFS, and return
+    the trace. SQLite's memory is capped at HEAP_LIMIT meanwhile."""
+    previous = apsw.hard_heap_limit(HEAP_LIMIT)
+    try:
+        return _capture(scenario, workdir, limits, rows)
+    finally:
+        apsw.hard_heap_limit(previous)
+
+
+def _capture(
+    scenario: Scenario, workdir: Path, limits: Limits | None, rows: bool
 ) -> dict[str, Any]:
     limits = limits or Limits()
     if not scenario.queries:
@@ -683,7 +771,8 @@ def capture(
             _create_index(setup, spec)
         if scenario.setup.strip():
             _restrict(setup, limits.max_pages)
-            _run(setup, scenario.setup, "setup", max(SETUP_SECONDS, limits.timeout))
+            seconds = max(SETUP_SECONDS, limits.timeout)
+            _run(setup, scenario.setup, "setup", seconds, keep=False)
     finally:
         setup.close()
     if scenario.vacuum:
@@ -701,9 +790,12 @@ def capture(
         for title, sql in scenario.queries:
             what = f"query {title!r}"
             plan = [row[3] for row in _run(conn, "EXPLAIN QUERY PLAN " + sql, what, limits.timeout)]
+            scans = _scans(conn, sql, what, limits.timeout)
             vfs.log.clear()
-            _run(conn, sql, what, limits.timeout, vfs.log, limits.max_io)
-            queries.append({"title": title, "sql": sql, "plan": plan, "io": list(vfs.log)})
+            _run(conn, sql, what, limits.timeout, vfs.log, limits.max_io, keep=False)
+            queries.append(
+                {"title": title, "sql": sql, "plan": plan, "scans": scans, "io": list(vfs.log)}
+            )
         conn.close()
     finally:
         vfs.unregister()
@@ -806,13 +898,14 @@ def build_scenario(args: argparse.Namespace) -> Scenario:
     return scenario
 
 
-def view(trace_path: Path, frames: int, policy: str) -> Path:
-    """Replay the trace with the engine and return the viewer page it wrote."""
+def view(trace_path: Path, frames: int, policy: str, runs: Path | None = None) -> Path:
+    """Replay the trace with the engine and return the viewer page it wrote
+    under `runs` (default outputs/runs)."""
     sim = REPO / "sim" / "target" / "release" / ("sim.exe" if sys.platform == "win32" else "sim")
     if not sim.is_file():
         raise ValueError("--view needs the engine: run `cargo build --release` in sim/ first")
     cmd = [str(sim), "--trace", str(trace_path), "--policy", policy, "--frames", str(frames)]
-    cmd += ["--out", str(REPO / "outputs" / "runs")]
+    cmd += ["--out", str(runs or REPO / "outputs" / "runs")]
     done = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if done.returncode != 0:
         raise ValueError(done.stderr.strip().removeprefix("error: ") or "the engine failed")
@@ -857,6 +950,9 @@ def main() -> None:
     show.add_argument(
         "--view", action="store_true", help="replay with the engine, write viewer.html"
     )
+    show.add_argument(
+        "--runs", type=Path, help="where --view writes its run (default outputs/runs)"
+    )
     show.add_argument("--frames", type=int, default=8, help="buffer pool size for --view")
     show.add_argument("--policy", default="all", help="policies for --view (default: all)")
     args = parser.parse_args()
@@ -883,7 +979,8 @@ def main() -> None:
                 "--no-rows leaves them out"
             )
         if args.view:
-            print(f"viewer -> {view(out, min(args.frames, trace['page_count']), args.policy)}")
+            frames = min(args.frames, trace["page_count"])
+            print(f"viewer -> {view(out, frames, args.policy, args.runs)}")
     except (ValueError, OSError) as e:
         sys.exit(f"error: {e}")
 
