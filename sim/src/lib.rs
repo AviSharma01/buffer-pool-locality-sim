@@ -11,6 +11,7 @@
 //! This crate does no file I/O so it can be compiled to WebAssembly.
 
 pub mod capture;
+pub mod example;
 pub mod policy;
 pub mod pool;
 pub mod readahead;

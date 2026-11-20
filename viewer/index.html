@@ -60,6 +60,24 @@ button:focus-visible,select:focus-visible,summary:focus-visible,input:focus-visi
 .icon{width:32px;padding:0}
 .warn{margin:0;padding:10px 14px;background:color-mix(in srgb,var(--miss) 10%,var(--bg));border-radius:12px;color:var(--miss);font-size:13px}
 
+/* header tools, the walkthrough dialog */
+.tools{display:flex;align-items:center;gap:8px}
+.hint{font-size:12px;color:var(--accent)}
+dialog{border:0;border-radius:22px;padding:20px 24px 24px;width:min(660px,calc(100vw - 32px));max-height:86vh;overflow:auto;background:var(--bg);color:var(--ink);box-shadow:0 24px 70px rgba(0,0,0,.28)}
+dialog::backdrop{background:rgba(24,22,19,.45)}
+.dhead{display:flex;align-items:center;gap:10px;margin-bottom:4px}
+.dhead h2{font-family:var(--f-display);font-weight:600;font-size:20px;margin:0;flex:1}
+.dsub{margin:0 0 14px;font-size:12.5px;color:var(--muted)}
+#walk{display:flex;flex-direction:column;gap:6px;background:var(--panel);border-radius:18px;padding:16px 18px}
+#walk .fig{padding:8px 0 4px}
+#walk .said{font-size:18px}
+.walknav{display:flex;align-items:center;gap:8px;margin-top:8px}
+.walknav .dots{display:flex;gap:5px}
+.walknav .dots i{width:7px;height:7px;border-radius:50%;background:var(--line)}
+.walknav .dots i.on{background:var(--accent)}
+.walknav .tally{flex:1;font-size:12px;color:var(--muted);text-align:right;margin-right:6px}
+.dh{font-family:var(--f-display);font-weight:600;font-size:16px;margin:22px 0 0}
+
 /* layout: every part's place is set here, and only here */
 .grid{display:grid;grid-template-columns:minmax(0,236px) minmax(0,1fr);grid-template-rows:auto 1fr;gap:16px;align-items:start;
   grid-template-areas:"score now" "score pool" "disk disk" "time time" "fold fold"}
@@ -70,10 +88,21 @@ button:focus-visible,select:focus-visible,summary:focus-visible,input:focus-visi
 
 /* score column: one row per pool; the open pool's row is raised */
 .slist{display:flex;flex-direction:column;gap:2px}
-.srow{all:unset;box-sizing:border-box;position:relative;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:1px 10px;width:100%;padding:8px 10px;border-radius:12px;cursor:pointer}
+.srow{position:relative;display:flex;align-items:center;border-radius:12px}
 .srow:hover{background:color-mix(in srgb,var(--ink) 5%,transparent)}
-.srow:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 .srow.on{background:var(--raised)}
+.sopen{all:unset;box-sizing:border-box;flex:1;min-width:0;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:1px 10px;padding:8px 4px 8px 10px;border-radius:12px;cursor:pointer}
+.sopen:focus-visible,.sdraw:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+/* draw beside the open pool: a ring when off, a filled dot when on */
+.sdraw{all:unset;flex:none;width:18px;height:18px;margin:0 9px 0 6px;border-radius:50%;box-shadow:inset 0 0 0 1.5px color-mix(in srgb,var(--ink) 30%,transparent);cursor:pointer;display:flex;align-items:center;justify-content:center}
+.sdraw:hover{box-shadow:inset 0 0 0 1.5px var(--ink-2)}
+.sdraw[aria-pressed="true"]{background:var(--ink);box-shadow:none}
+.sdraw[aria-pressed="true"]::after{content:"";width:6px;height:6px;border-radius:50%;background:var(--bg)}
+.srow.on .sdraw{background:var(--accent);cursor:default}
+/* outrank the page-wide button:hover background */
+.srow .sopen:hover{background:transparent}
+.srow .sdraw[aria-pressed="true"]:hover{background:var(--ink)}
+.srow.on .sdraw[aria-pressed="true"]:hover{background:var(--accent)}
 .srow .n{font-size:13.5px;color:var(--ink-2);min-width:0}
 .srow.on .n{color:var(--ink);font-weight:500}
 .srow .h{font-family:var(--f-mono);font-size:13.5px;font-variant-numeric:tabular-nums;text-align:right}
@@ -148,7 +177,10 @@ button:focus-visible,select:focus-visible,summary:focus-visible,input:focus-visi
 .tile.ring{box-shadow:inset 0 0 0 1.5px var(--accent)}
 .tile.dirty::after{content:"";position:absolute;top:4px;right:4px;width:6px;height:6px;border-radius:50%;background:var(--accent)}
 .tile.touched{box-shadow:inset 0 0 0 2px var(--ink)}
-.tile.pulse{transform:scale(1.1)}
+.tile{transition:transform .16s ease,box-shadow .25s ease}
+.tile.pulse{box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--c) 45%,transparent),0 0 0 4px color-mix(in srgb,var(--hit) 30%,transparent)}
+.tile.arrive{animation:arrive .32s ease-out}
+@keyframes arrive{from{opacity:.2;transform:scale(.86)}}
 .fig.small .tile,.fig.small .slot{border-radius:4px}
 .fig.small .tile .pg,.fig.small .tile .bd{display:none}
 .fig.small .tile.dirty::after{top:2px;right:2px;width:4px;height:4px}
@@ -230,6 +262,7 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
   .grid{grid-template-columns:minmax(0,1fr);grid-template-rows:none;grid-template-areas:"score" "now" "pool" "disk" "time" "fold"}
   .said{font-size:17px}
   .slist{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
+  dialog{width:100vw;max-width:100vw;height:100dvh;max-height:100dvh;margin:0;border-radius:0;padding:16px}
   .panel{padding:14px 14px;border-radius:16px}
 }
 @media (prefers-reduced-motion: reduce){.tile,.place{transition:none}}
@@ -242,6 +275,7 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
 <div class="app" id="app" hidden>
   <header class="top">
     <div class="name"><h1 id="title"></h1><span id="sub"></span></div>
+    <div class="tools"><span class="hint" id="howHint" hidden>New here?</span><button type="button" id="howBtn" aria-haspopup="dialog">How it works</button></div>
     <div class="ctrl" role="group" aria-label="Playback">
       <button type="button" id="allBtn" aria-pressed="false">Show all pools</button>
       <div class="seg" role="group" aria-label="Mode" id="modeSeg" hidden>
@@ -290,8 +324,7 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
         <span class="tlhere" id="tlHere" hidden></span>
         <div class="tlnames" id="tlNames"></div>
       </div>
-      <div class="keyrow"><div class="key" id="key"></div><button type="button" class="link" id="helpBtn" aria-expanded="false" aria-controls="help">How to read this</button></div>
-      <div class="help" id="help" hidden></div>
+      <div class="keyrow"><div class="key" id="key"></div></div>
       <label class="sr" for="scrub">Page request</label><input class="sr" type="range" id="scrub" min="-1" value="-1">
     </section>
 
@@ -302,6 +335,22 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
   </div>
 </div>
 
+<dialog id="how" aria-labelledby="howTitle">
+  <div class="dhead"><h2 id="howTitle">How it works</h2><button type="button" class="icon" id="howClose" aria-label="Close">✕</button></div>
+  <section id="walk" aria-label="A worked example">
+    <p class="dsub" id="walkSub"></p>
+    <div class="caption"><b id="walkQ"></b><code id="walkSql"></code></div>
+    <div class="fig" id="walkFig"></div>
+    <div class="said" id="walkSaid" aria-live="polite"></div>
+    <div class="why2" id="walkWhy"></div>
+    <div class="walknav"><span class="dots" id="walkDots"></span><span class="tally" id="walkTally"></span>
+      <button type="button" id="walkBack">Back</button><button type="button" id="walkNext">Next</button></div>
+  </section>
+  <h3 class="dh">Reading this page</h3>
+  <div class="help" id="help"></div>
+</dialog>
+
+<script id="example" type="application/json">__BPSIM_EXAMPLE__</script>
 <script id="run" type="application/json">__BPSIM_RUN__</script>
 <script>
 "use strict";
@@ -387,7 +436,8 @@ const state = {
 const view = {
   pools: [], // the pools drawn: the open one, or all
   focus: null, // the pool opened in its own shape; the timeline and disk follow it
-  all: false, // "Show all pools"
+  drawn: new Set(), // pools drawn beside the open one, toggled in the score column
+  walk: 0, // the walkthrough's step
   mode: "step", // "step" or "race"
   at: -1, // the access shown; -1 before the first
   playing: false,
@@ -427,32 +477,14 @@ function start(data) {
   if (!data.runs?.length || !data.runs[0].events.length) throw new Error("the run file has no events");
   stopRace();
   view.playing = false;
-  state.data = data;
-  state.frames = state.data.frames;
-  state.events = state.data.runs[0].events;
-  state.accesses = state.events.length;
-  state.byPolicy = {};
-  state.head = {};
-  state.shape = {};
+  Object.assign(state, prepare(data));
   state.lanes = {};
   state.lanePos = {};
-  for (const r of state.data.runs) {
-    state.byPolicy[r.policy] = r;
-    state.head[r.policy] = heads(r.events);
-    state.shape[r.policy] = r.events[0].frames[r.events[0].frame].state.kind;
-  }
-  state.readsAhead = state.data.runs.some(r => r.summary.read_ahead_cap > 0);
   setStorage(state.data.storage, false);
-  state.pages = {};
-  for (const p of state.data.pages) state.pages[p.page] = p;
-  state.objectColor = {sqlite_schema: "var(--o-schema)"};
-  state.data.objects.forEach((o, i) => {
-    state.objectColor[o.name] = `var(--o${i % 6})`;
-  });
 
   const shown = comparePools();
   view.focus = ["pg", "innodb"].find(p => shown.includes(p)) || shown[0];
-  view.all = false;
+  view.drawn = new Set();
   view.mode = "step";
   view.at = -1;
 
@@ -478,7 +510,34 @@ function start(data) {
   buildMoments();
   buildTimeline();
   setModeUI();
+  $("howHint").hidden = seenHow();
   jump(state.moments.length && state.moments[0].k > 0 ? state.moments[0].k - 1 : -1);
+}
+/* Everything derived from a run file that drawing and wording read. The
+   walkthrough prepares its example the same way. */
+function prepare(data) {
+  const out = {
+    data,
+    frames: data.frames,
+    events: data.runs[0].events,
+    accesses: data.runs[0].events.length,
+    byPolicy: {},
+    head: {},
+    shape: {},
+    readsAhead: data.runs.some(r => r.summary.read_ahead_cap > 0),
+    pages: {},
+    objectColor: {sqlite_schema: "var(--o-schema)"}
+  };
+  for (const r of data.runs) {
+    out.byPolicy[r.policy] = r;
+    out.head[r.policy] = heads(r.events);
+    out.shape[r.policy] = r.events[0].frames[r.events[0].frame].state.kind;
+  }
+  for (const p of data.pages) out.pages[p.page] = p;
+  data.objects.forEach((o, i) => {
+    out.objectColor[o.name] = `var(--o${i % 6})`;
+  });
+  return out;
 }
 
 /* each event list must recount to its own summary, priced as the summary was */
@@ -618,7 +677,7 @@ function buildHelp() {
   };
   tip(
     "Pools.",
-    `Each pool serves the same ${state.accesses} page requests with ${state.frames} frame${state.frames === 1 ? "" : "s"} of memory. They differ only in what they evict. The score column shows each one's hits so far; click one to open it.`
+    `Each pool serves the same ${state.accesses} page requests with ${state.frames} frame${state.frames === 1 ? "" : "s"} of memory. They differ only in what they evict. The score column shows each one's hits so far: click a pool to open it, or its dot to draw it beside the open one. Show all pools draws every one.`
   );
   tip(
     "Timeline.",
@@ -641,7 +700,7 @@ function buildHelp() {
   );
   tip(
     "Race.",
-    "With all pools shown, Race replays every pool at the pace of its time, on a squashed scale so hits stay visible next to slow reads. Optimal has the fewest misses, but not always the least time: it ignores what a miss costs."
+    "With two or more pools drawn, Race replays them at the pace of its time, on a squashed scale so hits stay visible next to slow reads. Optimal has the fewest misses, but not always the least time: it ignores what a miss costs."
   );
   if (state.readsAhead)
     tip(
@@ -679,28 +738,42 @@ function buildScore() {
   list.replaceChildren();
   state.rows = {};
   for (const p of allPools()) {
-    const b = el("button", "srow");
-    b.type = "button";
-    b.dataset.p = p;
-    b.append(el("span", "n", nameOf(p)), el("span", "h"), el("span", "d"), el("span", "place"));
-    b.addEventListener("click", () => setFocus(p));
-    list.append(b);
-    state.rows[p] = b;
+    const line = el("div", "srow"),
+      open = el("button", "sopen"),
+      draw = el("button", "sdraw");
+    line.dataset.p = p;
+    open.type = draw.type = "button";
+    open.append(el("span", "n", nameOf(p)), el("span", "h"), el("span", "d"));
+    open.addEventListener("click", () => setFocus(p));
+    draw.addEventListener("click", () => toggleDrawn(p));
+    line.append(open, draw, el("span", "place"));
+    list.append(line);
+    state.rows[p] = line;
   }
   $("scoreHead").textContent = `Hits of ${state.accesses}`;
-  $("snote").textContent = "Click a pool to open it.";
+  $("snote").textContent = "Click a pool to open it. The dot draws it beside the open one.";
 }
 function paintScore(at) {
   for (const p of allPools()) {
     const b = state.rows[p],
       t = totals(p, at),
       left = at === state.accesses - 1 ? state.byPolicy[p].summary.dirty_at_end : 0;
-    b.classList.toggle("on", p === view.focus);
-    b.setAttribute("aria-pressed", p === view.focus);
+    const open = p === view.focus,
+      draw = b.querySelector(".sdraw");
+    b.classList.toggle("on", open);
+    b.querySelector(".sopen").setAttribute("aria-pressed", open);
+    draw.setAttribute("aria-pressed", open || view.drawn.has(p));
+    draw.setAttribute("aria-disabled", open);
+    draw.setAttribute("aria-label", open ? `${nameOf(p)} is open` : `Draw ${nameOf(p)} beside the open pool`);
+    draw.title = open
+      ? "Open"
+      : view.drawn.has(p)
+        ? "Drawn beside the open pool"
+        : "Draw beside the open pool";
     b.querySelector(".h").textContent = at < 0 ? "–" : t.hits;
     b.querySelector(".d").textContent =
       at < 0 ? INFO[p]?.how || "" : `${fmtMs(t.cost)} · ${t.req} request${t.req === 1 ? "" : "s"}`;
-    b.title =
+    b.querySelector(".sopen").title =
       at < 0
         ? ""
         : [
@@ -717,7 +790,7 @@ function paintScore(at) {
 /* the pools drawn: the open one, or all of them */
 function buildLanes() {
   stopRace();
-  view.pools = view.all ? allPools() : [view.focus];
+  view.pools = allPools().filter(p => p === view.focus || view.drawn.has(p));
   const pools = $("pools");
   pools.replaceChildren();
   state.lanes = {};
@@ -736,23 +809,32 @@ function buildLanes() {
     state.lanePos[p] = view.at;
   }
   for (const p of view.pools) state.lanes[p].lane.classList.toggle("focus", p === view.focus);
-  $("allBtn").setAttribute("aria-pressed", view.all);
-  $("modeSeg").hidden = !view.all;
+  $("allBtn").setAttribute("aria-pressed", view.pools.length === allPools().length);
+  /* Race needs two pools drawn */
+  $("modeSeg").hidden = view.pools.length < 2;
 }
 function setFocus(p) {
   if (p === view.focus) return;
   view.focus = p;
-  if (view.all) for (const q of view.pools) state.lanes[q].lane.classList.toggle("focus", q === p);
-  else buildLanes();
+  buildLanes();
   drawTimeline();
   renderAll(view.at);
 }
-function setAll(on) {
-  if (on === view.all) return;
-  if (!on && view.mode === "race") setMode("step");
-  view.all = on;
+function redrawPools() {
+  if (view.mode === "race" && view.drawn.size === 0) setMode("step");
   buildLanes();
   renderAll(view.at);
+}
+function toggleDrawn(p) {
+  if (p === view.focus) return;
+  if (view.drawn.has(p)) view.drawn.delete(p);
+  else view.drawn.add(p);
+  redrawPools();
+}
+/* every pool drawn, or back to the open one alone */
+function toggleAll() {
+  view.drawn = view.pools.length === allPools().length ? new Set() : new Set(allPools());
+  redrawPools();
 }
 
 /* page under the read head after each access, per pool: the last page read */
@@ -1522,22 +1604,22 @@ async function fly(from, to, label, c, wb, ms) {
   t.remove();
 }
 const tileOf = (p, page) => state.lanes[p]?.fig.querySelector(`[data-page="${page}"]`);
-/* `id` is the epoch the step belongs to; a jump or a newer step makes it stale */
-async function animateStep(p, at, id) {
+/* `id` is the epoch the step belongs to; a jump or a newer step makes it
+   stale. A page flies in from the disk only when stepping one at a time, and
+   only into the open pool; otherwise the open pool's frame fills or rings in
+   place and other pools change quietly. */
+async function animateStep(p, at, id, manual = false) {
   const e = state.byPolicy[p].events[at];
   if (!state.lanes[p]) return;
-  if (e.kind === "hit") {
+  const open = p === view.focus;
+  if (e.kind === "hit" || !manual || !open || reduce) {
     paintLane(p, at);
-    const t = tileOf(p, e.page);
-    if (!reduce) {
-      t?.classList.add("pulse");
-      await sleep(130);
-      t?.classList.remove("pulse");
-    }
-    return;
-  }
-  if (reduce) {
-    paintLane(p, at);
+    if (reduce || !open) return;
+    const t = tileOf(p, e.page),
+      cls = e.kind === "hit" ? "pulse" : "arrive";
+    t?.classList.add(cls);
+    await sleep(view.mode === "race" ? 0 : e.kind === "hit" ? 160 : 260);
+    setTimeout(() => t?.classList.remove(cls), 340);
     return;
   }
   if (e.evicted?.dirty) {
@@ -1562,6 +1644,94 @@ async function animateStep(p, at, id) {
     t.style.visibility = "";
   } else await sleep(400);
 }
+
+/* ---------- how it works: a worked example, then how to read the page ---------- */
+/* The example is a tiny run the engine made when it wrote this page. */
+const EXAMPLE = (() => {
+  try {
+    const d = JSON.parse($("example").textContent);
+    return d.format === FORMAT && d.version === VERSION && d.runs?.[0]?.events.length ? d : null;
+  } catch {
+    return null;
+  }
+})();
+const EX = EXAMPLE && prepare(EXAMPLE);
+/* Draw and word with the example's data in place of the run's, then put the
+   run's back: the same code explains both. */
+function borrow(fields, fn) {
+  const old = {};
+  for (const k of Object.keys(fields)) {
+    old[k] = state[k];
+    state[k] = fields[k];
+  }
+  try {
+    return fn();
+  } finally {
+    Object.assign(state, old);
+  }
+}
+function renderWalk() {
+  const run = EXAMPLE.runs[0],
+    p = run.policy,
+    n = run.events.length,
+    i = view.walk,
+    e = run.events[i],
+    q = EXAMPLE.queries[e.query];
+  $("walkSub").textContent =
+    `A tiny database replayed by this engine: ${EX.frames} frames, ${nameOf(p)} (${INFO[p]?.how}), read-ahead on.`;
+  $("walkQ").textContent = `${e.query + 1}. ${q.title}`;
+  $("walkSql").textContent = q.sql;
+  borrow({...EX, lanes: {[p]: {fig: $("walkFig")}}, profile: state.profile}, () => {
+    $("walkFig").replaceChildren(drawFocus(p, e, i, e.frame));
+    const said = $("walkSaid");
+    said.replaceChildren();
+    for (const part of opening(e))
+      said.append(typeof part === "string" ? part : el("span", part[0], part[1]));
+    said.append(el("span", "", ` · ${pageDesc(e.page)}`));
+    said.lastChild.style.cssText = "color:var(--muted);font-size:.7em";
+    $("walkWhy").textContent = describe(p, e);
+  });
+  const upTo = run.events.slice(0, i + 1),
+    hits = upTo.filter(x => x.kind === "hit").length,
+    misses = upTo.length - hits;
+  $("walkTally").textContent =
+    `${i + 1} of ${n} · ${hits} hit${hits === 1 ? "" : "s"}, ${misses} miss${misses === 1 ? "" : "es"}`;
+  $("walkDots").replaceChildren(...run.events.map((_, k) => el("i", k === i ? "on" : "")));
+  $("walkBack").disabled = i === 0;
+  $("walkNext").textContent = i === n - 1 ? "Start over" : "Next";
+}
+function walkBy(d) {
+  const n = EXAMPLE.runs[0].events.length;
+  view.walk = d > 0 && view.walk === n - 1 ? 0 : Math.max(0, Math.min(n - 1, view.walk + d));
+  renderWalk();
+}
+const seenHow = () => {
+  try {
+    return localStorage.getItem("bpsim.seenHow") === "1";
+  } catch {
+    return false;
+  }
+};
+function openHow() {
+  stopPlaying();
+  $("walk").hidden = !EXAMPLE;
+  if (EXAMPLE) renderWalk();
+  $("how").showModal();
+  $("howHint").hidden = true;
+  try {
+    localStorage.setItem("bpsim.seenHow", "1");
+  } catch {
+    /* the hint just shows again next time */
+  }
+}
+$("howBtn").addEventListener("click", openHow);
+$("howClose").addEventListener("click", () => $("how").close());
+$("how").addEventListener("click", ev => {
+  if (ev.target === $("how")) $("how").close(); // a click on the backdrop
+});
+$("how").addEventListener("close", () => $("howBtn").focus());
+$("walkBack").addEventListener("click", () => walkBy(-1));
+$("walkNext").addEventListener("click", () => walkBy(1));
 
 /* ---------- controls ---------- */
 function setModeUI() {
@@ -1593,7 +1763,7 @@ function jump(i) {
   clearPlaces();
   renderAll(view.at);
 }
-async function stepForward() {
+async function stepForward(manual = false) {
   if (view.at >= state.accesses - 1) return false;
   for (const p of view.pools) if (state.lanePos[p] !== view.at) paintLane(p, view.at);
   view.at++;
@@ -1601,7 +1771,7 @@ async function stepForward() {
     id = ++view.raceId;
   document.querySelectorAll(".fly").forEach(f => f.remove());
   renderChrome(at);
-  await Promise.all(view.pools.map(p => animateStep(p, at, id)));
+  await Promise.all(view.pools.map(p => animateStep(p, at, id, manual)));
   return id === view.raceId;
 }
 function stopPlaying() {
@@ -1666,14 +1836,14 @@ $("sHdd").addEventListener("click", () => {
   setStorage("hdd");
 });
 $("mRace").addEventListener("click", () => setMode("race"));
-$("allBtn").addEventListener("click", () => setAll(!view.all));
+$("allBtn").addEventListener("click", toggleAll);
 $("prev").addEventListener("click", () => {
   stopPlaying();
   jump(view.at - 1);
 });
 $("next").addEventListener("click", () => {
   stopPlaying();
-  stepForward();
+  stepForward(true);
 });
 $("scrub").addEventListener("input", () => {
   toStep();
@@ -1682,17 +1852,19 @@ $("scrub").addEventListener("input", () => {
 $("fold").addEventListener("toggle", () => {
   if (state.data) renderFold(view.at);
 });
-$("helpBtn").addEventListener("click", () => {
-  const open = $("help").hidden;
-  $("help").hidden = !open;
-  $("helpBtn").setAttribute("aria-expanded", open);
-});
 document.addEventListener("keydown", e => {
+  if ($("how").open) {
+    if (EXAMPLE && (e.key === "ArrowRight" || e.key === "ArrowLeft")) {
+      e.preventDefault();
+      walkBy(e.key === "ArrowRight" ? 1 : -1);
+    }
+    return;
+  }
   if (!state.data || view.mode !== "step" || e.target.closest("input,select,summary")) return;
   if (e.key === "ArrowRight") {
     e.preventDefault();
     stopPlaying();
-    stepForward();
+    stepForward(true);
   }
   if (e.key === "ArrowLeft") {
     e.preventDefault();
@@ -1773,6 +1945,8 @@ window.bpsim = Object.freeze({
   at: () => view.at,
   playing: () => view.playing,
   running: policy => state.running[policy],
+  focus: () => view.focus,
+  kinds: policy => state.byPolicy[policy].events.map(e => (e.kind === "miss" && !e.read ? "fresh" : e.kind)),
   jump
 });
 </script>

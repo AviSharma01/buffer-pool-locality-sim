@@ -15,6 +15,7 @@ use cli::Cli;
 /// The viewer page; the CLI puts the run file where this marker is.
 const VIEWER: &str = include_str!("../../viewer/index.html");
 const RUN_SLOT: &str = "__BPSIM_RUN__";
+const EXAMPLE_SLOT: &str = "__BPSIM_EXAMPLE__";
 
 /// Run files keep every frame for every access; past this many frame
 /// entries (roughly 15 MB of JSON) a run file is refused.
@@ -151,12 +152,17 @@ fn create_dir(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|e| format!("creating {}: {e}", path.display()))
 }
 
-/// The viewer page with the run file built in. Every `<` in the JSON becomes
-/// `<` (they only occur inside strings) so text from the database, such
-/// as `</script>`, cannot end the script element early.
+/// The viewer page with the run file built in, and the worked example for its
+/// "How it works". Every `<` in the JSON becomes `\u003c` (they only occur
+/// inside strings) so text from the database, such as `</script>`, cannot end
+/// the script element early.
 fn viewer_html(run_json: &str) -> String {
     assert_eq!(VIEWER.matches(RUN_SLOT).count(), 1, "one data slot");
-    VIEWER.replace(RUN_SLOT, &run_json.replace('<', "\\u003c"))
+    assert_eq!(VIEWER.matches(EXAMPLE_SLOT).count(), 1, "one example slot");
+    let safe = |json: &str| json.replace('<', "\\u003c");
+    VIEWER
+        .replace(EXAMPLE_SLOT, &safe(&bpsim::example::run_json()))
+        .replace(RUN_SLOT, &safe(run_json))
 }
 
 fn run(args: Cli) -> Result<(), String> {

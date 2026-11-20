@@ -177,6 +177,98 @@ def check_interaction(page: Page, run_file: Path) -> list[str]:
     return problems
 
 
+def flies_during(page: Page, seconds: float) -> int:
+    """The most pages seen flying at once, sampled while something plays."""
+    most = 0
+    for _ in range(int(seconds * 10)):
+        most = max(most, len(page.query_selector_all(".fly")))
+        page.wait_for_timeout(100)
+    return most
+
+
+def check_how(page: Page) -> list[str]:
+    """The "How it works" dialog: hint, every walkthrough step, Esc, focus."""
+    problems = []
+    if not page.is_visible("#howHint"):
+        problems.append("the New here? hint is not shown on a first visit")
+    at = page.evaluate("bpsim.at()")
+    page.click("#howBtn")
+    if not page.evaluate("document.getElementById('how').open"):
+        return problems + ["How it works did not open"]
+    steps = len(page.query_selector_all("#walkDots i"))
+    if steps < 10:
+        problems.append(f"the walkthrough has {steps} steps, expected the engine's 14")
+    for k in range(steps):
+        said = page.inner_text("#walkSaid").strip()
+        if not said or not page.query_selector_all("#walkFig .tile"):
+            problems.append(f"walkthrough step {k + 1} drew no pool or sentence")
+        if not page.inner_text("#walkTally").startswith(f"{k + 1} of {steps}"):
+            problems.append(f"walkthrough step {k + 1} says {page.inner_text('#walkTally')!r}")
+        page.keyboard.press("ArrowRight")
+    if not page.inner_text("#walkTally").startswith("1 of"):
+        problems.append("Next on the last step did not start over")
+    if page.evaluate("bpsim.at()") != at:
+        problems.append("arrow keys in the dialog moved the run behind it")
+    page.keyboard.press("Escape")
+    if page.evaluate("document.getElementById('how').open"):
+        problems.append("Esc did not close How it works")
+    if page.evaluate("document.activeElement.id") != "howBtn":
+        problems.append("closing How it works did not return focus to its button")
+    page.reload()
+    page.wait_for_selector(".pool")
+    if page.is_visible("#howHint"):
+        problems.append("the New here? hint came back after How it works was opened")
+    return problems
+
+
+def check_drawn(page: Page) -> list[str]:
+    """Drawing pools beside the open one, and racing just those."""
+    problems = []
+    other = page.query_selector("#slist .srow:not(.on)")
+    p = other.get_attribute("data-p")
+    toggle = f'#slist [data-p="{p}"] .sdraw'
+    page.click(toggle)
+    if len(page.query_selector_all("#pools .pool")) != 2 or not page.is_visible("#mRace"):
+        problems.append(f"drawing {p} beside the open pool did not give two pools and Race")
+    page.click("#mRace")
+    page.select_option("#speed", index=2)
+    page.click("#play")
+    page.wait_for_function("() => !bpsim.playing()", timeout=60_000)
+    if len(page.query_selector_all("#slist .place.on")) != 2:
+        problems.append("a race of two drawn pools did not place exactly two")
+    page.click("#mStep")
+    page.click(toggle)
+    if len(page.query_selector_all("#pools .pool")) != 1 or page.is_visible("#mRace"):
+        problems.append(f"undrawing {p} did not leave the open pool alone")
+    return problems
+
+
+def check_motion(page: Page, reduced: bool) -> list[str]:
+    """Pages fly in only on a single step into the open pool; never with
+    reduce motion; never while playing."""
+    problems = []
+    kinds = page.evaluate("bpsim.kinds(bpsim.focus())")
+    miss = next((i for i, k in enumerate(kinds) if k == "miss" and i > 0), None)
+    if miss is not None:
+        page.evaluate("k => bpsim.jump(k)", miss - 1)
+        page.keyboard.press("ArrowRight")
+        page.wait_for_timeout(120)
+        flying = len(page.query_selector_all(".fly"))
+        if reduced and flying:
+            problems.append("a page flew with reduce motion on")
+        if not reduced and not flying:
+            problems.append("a single step onto a miss did not fly the page in")
+    page.evaluate("() => bpsim.jump(-1)")
+    page.select_option("#speed", index=2)
+    page.click("#play")
+    if flies_during(page, 2.0):
+        problems.append("pages flew while playing")
+    if reduced and page.evaluate("document.getAnimations().length"):
+        problems.append("something animated with reduce motion on")
+    page.click("#play")
+    return problems
+
+
 def main() -> int:
     if not compare.SIM.is_file():
         print(f"build the engine first: cd sim && cargo build --release ({compare.SIM} missing)")
@@ -202,10 +294,24 @@ def main() -> int:
                 page.goto(viewer.as_uri())
                 page.wait_for_selector(".pool")
                 found = check_page(page, label, trace, run, width)
+                if i == 0:
+                    found += check_how(page)
                 if width == 1280 and i == 0:
+                    found += check_drawn(page)
+                    found += check_motion(page, reduced=False)
                     found += check_interaction(page, viewer.parent / "run.json")
                 found += [f"script error: {e}" for e in errors]
                 problems += [f"{label} ({width}px {scheme}): {p}" for p in found]
+                checked += 1
+                page.close()
+            if i == 0:
+                page = browser.new_page(
+                    viewport={"width": 1280, "height": 1000}, reduced_motion="reduce"
+                )
+                page.goto(viewer.as_uri())
+                page.wait_for_selector(".pool")
+                found = check_motion(page, reduced=True)
+                problems += [f"{label} (reduce motion): {p}" for p in found]
                 checked += 1
                 page.close()
         browser.close()
