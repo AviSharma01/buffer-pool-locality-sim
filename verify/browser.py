@@ -18,6 +18,7 @@ Install Playwright once: pip install playwright && python -m playwright install 
 from __future__ import annotations
 
 import json
+import random
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import compare  # noqa: E402
+import fuzz  # noqa: E402
 import model  # noqa: E402
 
 try:
@@ -41,9 +43,27 @@ TRACE_DIR = compare.REPO / "traces"
 POLICIES_WITH_A_MODEL = list(model.POLICIES)  # Optimal may break ties differently
 
 
+def long_trace(work: Path) -> Path:
+    """More page requests than the timeline has pixels, so it shades columns."""
+    rng = random.Random(5)
+    trace = fuzz.random_trace(rng, 0)
+    trace["scenario"] = "long"
+    pages = trace["page_count"]
+    trace["queries"] = [
+        {"title": f"batch {q + 1}", "sql": "SELECT 1", "plan": [], "scans": [],
+         "io": [["r", rng.randint(1, pages)] if rng.random() < 0.4 else ["r", 1 + (i % pages)]
+                for i in range(500)]}
+        for q in range(5)
+    ]  # fmt: skip
+    path = work / "long.trace.json"
+    path.write_text(json.dumps(trace), encoding="utf-8")
+    return path
+
+
 def runs(work: Path) -> list[tuple[str, Path, list[str]]]:
     """(label, trace, engine arguments) for every run to check."""
     traces = compare.traces(work)
+    traces["long: 2,500 requests"] = long_trace(work)
     out = [(name, path, ["--policy", "all", "--frames", "8"]) for name, path in traces.items()]
     out += [
         ("growth-vacuum, 32 frames, no read-ahead, HDD", TRACE_DIR / "growth-vacuum.trace.json",
@@ -68,13 +88,45 @@ def check_page(page: Page, label: str, trace: Path, run: dict, width: int) -> li
             if r["policy"] not in POLICIES_WITH_A_MODEL:
                 continue
             shown = page.evaluate("p => bpsim.running(p).c[bpsim.accesses() - 1]", r["policy"])
-            want = model.run(trace, r["policy"], run["frames"], storage, read_ahead)["total_ms"]
-            if abs(shown - want) > 1e-9 * max(1.0, want):
+            want = model.run(trace, r["policy"], run["frames"], storage, read_ahead)
+            if abs(shown - want["total_ms"]) > 1e-9 * max(1.0, want["total_ms"]):
                 problems.append(
-                    f"{r['policy']} on {storage}: page shows {shown} ms, model {want} ms"
+                    f"{r['policy']} on {storage}: page shows {shown} ms, "
+                    f"model {want['total_ms']} ms"
                 )
-    for button in page.query_selector_all("#footer button"):
-        button.click()
+            # the number a reader sees in the score column, not just the page's state
+            seen = page.inner_text(f'#slist [data-p="{r["policy"]}"] .h')
+            if seen != str(want["hits"]):
+                problems.append(
+                    f"{r['policy']}: score column shows {seen} hits, model {want['hits']}"
+                )
+    # every pool opened in turn, then all pools shown and hidden again
+    for row in page.query_selector_all("#slist .srow"):
+        row.click()
+        if page.query_selector_all("#pools .pool.focus") == []:
+            problems.append(f"clicking {row.inner_text().splitlines()[0]} opened no pool")
+    page.click("#allBtn")
+    if len(page.query_selector_all("#pools .pool")) != len(run["runs"]):
+        problems.append("Show all pools did not draw every pool")
+    page.click("#allBtn")
+    if len(page.query_selector_all("#pools .pool")) != 1:
+        problems.append("hiding all pools left more than the open one")
+    at = page.evaluate("bpsim.at()")
+    if at >= 0:
+        if len(page.query_selector_all("#cells i.now")) != 1:
+            problems.append("the disk strip does not mark exactly one current page")
+        if len(page.query_selector_all("#cells i.head")) > 1:
+            problems.append("the disk strip marks more than one read head")
+        if not page.inner_text("#pos").startswith(f"{at + 1} of "):
+            problems.append(f"the timeline says {page.inner_text('#pos')!r} at access {at + 1}")
+    painted = page.evaluate(
+        """() => { const c = document.getElementById('tlCanvas');
+        const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+        let n = 0; for (let i = 3; i < d.length; i += 4) if (d[i]) n++;
+        return n / (d.length / 4); }"""
+    )
+    if painted < 0.5:
+        problems.append(f"the timeline strip is mostly blank ({painted:.0%} painted)")
     page.evaluate("() => { document.getElementById('fold').open = true; }")
     overflow = page.evaluate("() => document.documentElement.scrollWidth")
     if overflow > width:
@@ -93,17 +145,21 @@ def check_interaction(page: Page, run_file: Path) -> list[str]:
         problems.append(
             f"two right-arrow presses landed on access {page.evaluate('bpsim.at()')}, not 1"
         )
-    box = page.query_selector("#chart .ctrack").bounding_box()  # a pool's row in the chart
+    box = page.query_selector("#tlCanvas").bounding_box()  # the timeline strip
     page.mouse.move(box["x"] + box["width"] * 0.6, box["y"] + box["height"] / 2)
     page.mouse.down()
+    page.mouse.move(box["x"] + box["width"] * 0.7, box["y"] + box["height"] / 2)
     page.mouse.up()
-    if page.evaluate("bpsim.at()") <= 1:
-        problems.append("dragging on the chart did not move")
+    want = int(0.7 * page.evaluate("bpsim.accesses()"))
+    if abs(page.evaluate("bpsim.at()") - want) > 1:
+        landed = page.evaluate("bpsim.at()")
+        problems.append(f"dragging on the timeline landed on {landed}, not ~{want}")
+    page.click("#allBtn")
     page.click("#mRace")
     page.select_option("#speed", index=0)
     page.click("#play")
     page.wait_for_function("() => !bpsim.playing()", timeout=60_000)
-    if page.query_selector_all(".pool .place:not(:empty)") == []:
+    if page.query_selector_all("#slist .place.on") == []:
         problems.append("the race finished without placing any pool")
     page.click("#mStep")
     old = json.loads(run_file.read_text(encoding="utf-8"))

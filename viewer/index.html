@@ -4,11 +4,11 @@
   built in (viewer.html). Opened as is, it waits for a run.json to be dropped
   on it, which is the quick loop while working on the viewer.
 
-  Layout, top to bottom: what is being read now; the run as a chart that is
-  also the timeline (per pool, one bar per page for as long as it stayed in
-  memory); under the chart of the pool in focus, that pool drawn in the shape
-  of how it works; the database file as a strip; and the query's path and rows
-  folded away.
+  Layout: a score column (every pool; click one to open it) beside what just
+  happened and the open pool, drawn in the shape of how it works; then the
+  database file with the read head; then the timeline, one cell per page
+  request; then the query's path and rows, folded away. Where each part goes
+  is set in one place: the grid areas under "layout".
 -->
 <html lang="en">
 <head>
@@ -23,6 +23,7 @@
   --bg:#f6f5f2; --ink:#1c1b19; --ink-2:#55514a; --muted:#6b665e; --line:#0000001f; --soft:#0000000a;
   --accent:#9a3412; --hit:#2f6b3c; --miss:#a3461f; --mark:#f3d27a66;
   --o-schema:#7d7872; --free:#d9d5cd; --o0:#3f7d4d; --o1:#4b60c8; --o2:#b47a12; --o3:#8a4fb0; --o4:#17828a; --o5:#b8496a;
+  --panel:color-mix(in srgb,var(--ink) 4.5%,var(--bg)); --raised:color-mix(in srgb,var(--bg) 70%,#fff);
   --f-display:"Bricolage Grotesque", ui-sans-serif, system-ui, sans-serif;
   --f-body:"Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --f-mono:"Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -31,6 +32,7 @@
 @media (prefers-color-scheme: dark){:root{
   --bg:#111112; --ink:#eceae6; --ink-2:#aca79f; --muted:#918c84; --line:#ffffff24; --soft:#ffffff0a;
   --accent:#ec8a63; --hit:#86c08f; --miss:#ec8a63; --mark:#e5c15b38;
+  --raised:color-mix(in srgb,var(--ink) 9%,var(--bg));
   --o-schema:#9b968f; --free:#3a3835; --o0:#86c08f; --o1:#8c9cf2; --o2:#e5c15b; --o3:#c29be0; --o4:#5fc4cc; --o5:#ee8fab;
   color-scheme:dark;
 }}
@@ -39,8 +41,8 @@ html{background:var(--bg)}
 body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:14px;line-height:1.5}
 [hidden]{display:none!important}
 .app{position:relative;max-width:1040px;margin:0 auto;padding:28px 20px 44px;display:flex;flex-direction:column;gap:20px}
-button,select{font-family:var(--f-body);font-size:12.5px;color:var(--ink);background:transparent;border:1px solid var(--line);border-radius:999px;height:32px;padding:0 12px;cursor:pointer}
-button:hover:not(:disabled){border-color:var(--ink-2)}
+button,select{font-family:var(--f-body);font-size:12.5px;color:var(--ink);background:var(--panel);border:0;border-radius:999px;height:32px;padding:0 13px;cursor:pointer}
+button:hover:not(:disabled){background:color-mix(in srgb,var(--ink) 9%,var(--bg))}
 button:disabled{opacity:.35;cursor:default}
 button:focus-visible,select:focus-visible,summary:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
@@ -50,74 +52,96 @@ button:focus-visible,select:focus-visible,summary:focus-visible,input:focus-visi
 .name h1{font-family:var(--f-display);font-weight:600;font-size:22px;letter-spacing:-.01em;margin:0}
 .name span{font-size:12.5px;color:var(--muted)}
 .ctrl{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
-.seg{display:inline-flex;border:1px solid var(--line);border-radius:999px;padding:2px;margin-right:6px}
-.seg button{border:0;height:26px}
+.seg{display:inline-flex;background:var(--panel);border-radius:999px;padding:3px;margin-right:6px}
+.seg button{background:transparent;height:26px}
 .seg button[aria-pressed="true"]{background:var(--ink);color:var(--bg)}
 #play{background:var(--ink);color:var(--bg);border-color:var(--ink);min-width:88px}
+#allBtn[aria-pressed="true"]{background:var(--ink);color:var(--bg)}
 .icon{width:32px;padding:0}
-.warn{margin:0;padding:8px 12px;border:1px solid var(--miss);border-radius:8px;color:var(--miss);font-size:13px}
+.warn{margin:0;padding:10px 14px;background:color-mix(in srgb,var(--miss) 10%,var(--bg));border-radius:12px;color:var(--miss);font-size:13px}
 
-/* the run as a chart; also the timeline. One row per pool. */
-.chart{display:flex;flex-direction:column;gap:6px;touch-action:pan-y}
-.crow{display:grid;grid-template-columns:150px minmax(0,1fr) 104px;gap:6px 20px;align-items:center}
-.cnote{font-size:11.5px;color:var(--muted)}
-.ctrack{position:relative;cursor:ew-resize}
-.axis{height:36px}
-.axis .mk{position:absolute;top:0;width:10px;height:10px;padding:0;border:0;border-radius:2px;transform:translateX(-50%) rotate(45deg);background:var(--muted)}
-.axis .mk.cur{background:var(--accent)}
-.axis .qs{all:unset;cursor:pointer;position:absolute;top:16px;height:20px;border-top:3px solid var(--line);padding-top:3px;font-size:11.5px;font-variant-numeric:tabular-nums;line-height:14px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.axis .qs:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.axis .qs.done{border-top-color:var(--ink-2)}
-.axis .qs.cur{color:var(--ink)}
-.band .tint{position:absolute;top:0;bottom:0;border-radius:3px;background:color-mix(in srgb,var(--c) 10%,transparent)}
-.band .qb{position:absolute;top:0;bottom:0;width:1px;background:var(--line)}
-.band .bar{position:absolute;min-width:1px;border-radius:2px;background:color-mix(in srgb,var(--c) 32%,var(--bg));border-left:1px solid var(--c);overflow:hidden;font-family:var(--f-mono);font-size:10px;color:var(--ink);white-space:nowrap}
-.band .bar.lab{padding-left:3px}
-.band .bar.edge{border-left-width:3px}
-.band .bar i{position:absolute;top:50%;width:4px;height:4px;margin:-2px 0 0 -2px;border-radius:50%;background:color-mix(in srgb,var(--ink) 65%,var(--c))}
-.band .veil{position:absolute;top:-1px;bottom:-1px;right:0;background:var(--bg);opacity:.66;pointer-events:none}
-.band .ph{position:absolute;top:-3px;bottom:-3px;width:2px;margin-left:-1px;border-radius:1px;background:var(--ink);pointer-events:none}
+/* layout: every part's place is set here, and only here */
+.grid{display:grid;grid-template-columns:minmax(0,236px) minmax(0,1fr);grid-template-rows:auto 1fr;gap:16px;align-items:start;
+  grid-template-areas:"score now" "score pool" "disk disk" "time time" "fold fold"}
+#score{grid-area:score}#now{grid-area:now}#pools{grid-area:pool}#disk{grid-area:disk}#tl{grid-area:time}#fold{grid-area:fold}
+.panel{background:var(--panel);border-radius:18px;padding:16px 18px;min-width:0}
+.phead{display:flex;align-items:baseline;gap:10px;margin-bottom:12px;font-size:12px;color:var(--muted)}
+.phead .r{margin-left:auto;text-align:right;font-variant-numeric:tabular-nums}
 
-.caption{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;min-height:22px}
-.caption b{font-family:var(--f-display);font-weight:600;font-size:16px}
-.caption code{font-family:var(--f-mono);font-size:12px;color:var(--ink-2);overflow-wrap:anywhere}
-.caption .pos{margin-left:auto;font-size:12.5px;font-variant-numeric:tabular-nums;color:var(--muted)}
-.moment{display:flex;align-items:baseline;gap:10px;font-size:13px;color:var(--ink-2);min-height:24px;flex-wrap:wrap}
+/* score column: one row per pool; the open pool's row is raised */
+.slist{display:flex;flex-direction:column;gap:2px}
+.srow{all:unset;box-sizing:border-box;position:relative;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:1px 10px;width:100%;padding:8px 10px;border-radius:12px;cursor:pointer}
+.srow:hover{background:color-mix(in srgb,var(--ink) 5%,transparent)}
+.srow:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.srow.on{background:var(--raised)}
+.srow .n{font-size:13.5px;color:var(--ink-2);min-width:0}
+.srow.on .n{color:var(--ink);font-weight:500}
+.srow .h{font-family:var(--f-mono);font-size:13.5px;font-variant-numeric:tabular-nums;text-align:right}
+.srow .d{grid-column:1 / -1;font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.place{position:absolute;right:8px;top:-7px;font-size:10.5px;padding:0 7px;border-radius:999px;background:var(--ink);color:var(--bg);opacity:0;transition:opacity .2s}
+.place.on{opacity:1}
+.snote{font-size:11.5px;color:var(--muted);margin:10px 10px 0}
+
+/* what just happened: on the page itself, no panel */
+#now{display:flex;flex-direction:column;gap:6px;padding:4px 4px 0;min-width:0}
+.caption{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 10px;font-size:12.5px;color:var(--muted)}
+.caption b{font-family:var(--f-display);font-weight:600;font-size:15px;color:var(--ink-2)}
+.caption code{font-family:var(--f-mono);font-size:11.5px;color:var(--muted);overflow-wrap:anywhere}
+.said{font-size:20px;line-height:1.35;letter-spacing:-.005em;min-height:27px}
+.said .k{font-weight:500}.said .k.hit{color:var(--hit)}.said .k.miss{color:var(--miss)}
+.said code{font-family:var(--f-mono);font-size:17px}
+.why2{font-size:13px;color:var(--ink-2);min-height:20px}
+.moment{display:flex;align-items:baseline;gap:10px;font-size:13px;color:var(--ink-2);min-height:26px;flex-wrap:wrap}
 .moment .tag{font-weight:500;font-size:12.5px;color:var(--accent)}
 .moment .d{flex:1 1 300px;min-width:0}
-.moment button{height:24px;font-size:11.5px;margin-left:auto;white-space:nowrap}
+.moment button{height:26px;font-size:11.5px;margin-left:auto;white-space:nowrap}
+
+/* timeline: one cell per page request, for the open pool */
+.tlwrap{position:relative;touch-action:pan-y;cursor:ew-resize;user-select:none}
+.tlmarks{position:relative;height:20px}
+.tlmarks .mk{all:unset;cursor:pointer;position:absolute;bottom:4px;display:flex;align-items:center;gap:5px;transform:translateX(-5px);font-size:11px;color:var(--o2);white-space:nowrap}
+.tlmarks .mk i{width:8px;height:8px;border-radius:2px;transform:rotate(45deg);background:var(--o2);flex:none}
+.tlmarks .mk.left{transform:translateX(calc(-100% + 5px));flex-direction:row-reverse}
+.tlmarks .mk.cur{color:var(--accent)}.tlmarks .mk.cur i{background:var(--accent)}
+.tlmarks .mk:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#tlCanvas{display:block;width:100%;height:28px}
+.tlhere{position:absolute;top:16px;bottom:16px;width:2px;margin-left:-1px;border-radius:1px;background:var(--ink);pointer-events:none}
+.tlnames{position:relative;height:18px;margin-top:4px}
+.tlnames .qs{all:unset;cursor:pointer;position:absolute;top:0;font-size:11px;line-height:16px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tlnames .qs.cur{color:var(--ink)}
+.tlnames .qs:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
 /* how to read the chart */
-.keyrow{align-items:start;padding-top:6px}
+.keyrow{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 18px;margin-top:12px}
 .link{all:unset;cursor:pointer;font-size:12px;color:var(--ink-2);text-decoration:underline;text-underline-offset:3px;border-radius:3px}
 .link:hover{color:var(--ink)}
 .link:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .key{display:flex;flex-wrap:wrap;gap:4px 18px;font-size:11.5px;color:var(--muted)}
 .key span{display:inline-flex;align-items:center;gap:6px}
 .key i{flex:none}
-.key .kb{width:24px;height:9px;border-radius:2px;background:color-mix(in srgb,var(--ink-2) 30%,var(--bg));border-left:3px solid var(--ink-2)}
-.key .kh{width:4px;height:4px;border-radius:50%;background:var(--ink)}
-.key .kf{width:24px;height:9px;border-radius:2px;background:color-mix(in srgb,var(--ink-2) 12%,var(--bg))}
-.key .ks{width:24px;height:9px;border-radius:2px;background:color-mix(in srgb,var(--o2) 22%,var(--bg))}
-.key .km{width:8px;height:8px;border-radius:2px;transform:rotate(45deg);background:var(--muted)}
-.help{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr));gap:8px 36px;border-top:1px solid var(--line);padding-top:14px;margin-top:6px;font-size:13px;color:var(--ink-2)}
+.key .kh,.key .ka,.key .kx{width:10px;height:10px;border-radius:3px}
+.key .kh{background:color-mix(in srgb,var(--hit) 75%,var(--bg))}
+.key .ka{box-shadow:inset 0 0 0 1.5px var(--hit);background:color-mix(in srgb,var(--hit) 30%,var(--bg))}
+.key .kx{background:color-mix(in srgb,var(--miss) 38%,var(--bg))}
+.key .km{width:8px;height:8px;border-radius:2px;transform:rotate(45deg);background:var(--o2)}
+.help{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr));gap:8px 36px;padding-top:14px;margin-top:4px;font-size:13px;color:var(--ink-2)}
 .help p{margin:0}
 .help b{font-weight:500;color:var(--ink)}
 .help .foot{grid-column:1 / -1}
 
 /* pools */
-.pools{display:flex;flex-direction:column;gap:14px}
-.pool.focus{padding:6px 0 10px}
-.pname{all:unset;cursor:pointer;display:flex;flex-direction:column;gap:1px;font-size:13.5px;color:var(--ink-2);border-radius:4px}
+#pools{display:flex;flex-direction:column;gap:18px}
+.pool{min-width:0}
+.pname{all:unset;cursor:pointer;display:flex;align-items:baseline;gap:10px;font-size:13.5px;color:var(--ink-2);border-radius:4px}
 .pname small{font-size:11.5px;color:var(--muted)}
+.pool.focus .pname{cursor:default}
 .pool.focus .pname span{font-family:var(--f-display);font-weight:600;font-size:17px;line-height:1.2;color:var(--ink)}
-.pool:not(.focus) .pname small{display:none}
 .pool:not(.focus) .pname:hover span{color:var(--ink);text-decoration:underline;text-underline-offset:3px}
-.fig{grid-column:2 / 4;min-width:0;padding-top:10px}
+.fig{min-width:0;padding-top:12px}
 .tiles{display:flex;flex-wrap:wrap;gap:6px}
-.slot{position:relative;width:var(--ts);height:var(--ts);flex:none;border-radius:8px;background:var(--soft)}
-.tile{position:relative;width:var(--ts);height:var(--ts);flex:none;border-radius:8px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
-  background:color-mix(in srgb,var(--c) 15%,var(--bg));box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--c) 70%,transparent);transition:transform .16s ease}
+.slot{position:relative;width:var(--ts);height:var(--ts);flex:none;border-radius:10px;background:color-mix(in srgb,var(--ink) 4%,transparent)}
+.tile{position:relative;width:var(--ts);height:var(--ts);flex:none;border-radius:10px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
+  background:color-mix(in srgb,var(--c) 16%,var(--bg));box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--c) 45%,transparent);transition:transform .16s ease}
 .tile .pg{font-family:var(--f-mono);font-size:12px;line-height:1}
 .tile .bd{font-family:var(--f-mono);font-size:10px;color:var(--muted);display:flex;gap:2px;line-height:1;min-height:4px}
 .tile.old{background:transparent;box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--c) 80%,transparent)}
@@ -145,23 +169,19 @@ button:focus-visible,select:focus-visible,summary:focus-visible,input:focus-visi
 .split .mid{flex:none;width:2px;height:var(--ts);background:var(--accent);border-radius:1px}
 .hint{font-size:12.5px;color:var(--ink-2);margin-top:10px}
 .handmark{position:absolute;bottom:-8px;left:50%;transform:translateX(-50%);border-left:4px solid transparent;border-right:4px solid transparent;border-bottom:6px solid var(--accent)}
-.score{position:relative;text-align:right;font-family:var(--f-mono);font-variant-numeric:tabular-nums;line-height:1.3}
-.score .t{font-size:16px}
-.score .s{font-family:var(--f-body);font-size:11.5px;color:var(--muted)}
-.place{position:absolute;right:0;top:-16px;font-size:11px;padding:1px 8px;border-radius:999px;background:var(--ink);color:var(--bg);opacity:0;transition:opacity .2s}
-.place.on{opacity:1}
-.say{grid-column:2 / 4;font-size:12.5px;color:var(--ink-2);min-height:19px;line-height:19px}
+.say{font-size:12.5px;color:var(--ink-2);min-height:19px;line-height:19px;margin-top:8px}
 .say .k{font-weight:500;margin-right:8px}
 .say .k.hit{color:var(--hit)}.say .k.miss{color:var(--miss)}
 
 /* database file */
-.disk{display:flex;flex-direction:column;gap:6px}
-.cells{display:grid;gap:1px}
-.cells i{height:10px;border-radius:1px;background:color-mix(in srgb,var(--c) 30%,var(--bg))}
-.cells.dense i{height:5px}
+.cells{display:grid;gap:7px 2px;padding-bottom:4px}
+.cells i{position:relative;height:12px;border-radius:3px;background:color-mix(in srgb,var(--c) 30%,var(--bg))}
+.cells.dense{row-gap:6px}.cells.dense i{height:6px;border-radius:2px}
 .cells i.int{background:color-mix(in srgb,var(--c) 75%,var(--bg))}
-.cells i.now{outline:1.5px solid var(--accent);outline-offset:1px}
-.legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:11.5px;color:var(--muted)}
+.cells i.ra{box-shadow:0 0 0 1.5px color-mix(in srgb,var(--accent) 55%,transparent)}
+.cells i.now{box-shadow:0 0 0 2px var(--accent)}
+.cells i.head::after{content:"";position:absolute;left:50%;bottom:-7px;transform:translateX(-50%);border-left:4px solid transparent;border-right:4px solid transparent;border-bottom:5px solid var(--ink)}
+.legend{display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:10px;font-size:11.5px;color:var(--muted)}
 .legend span{display:inline-flex;align-items:center;gap:5px}
 .legend i{width:8px;height:8px;border-radius:2px;background:var(--c)}
 .fly{position:absolute;z-index:5;left:0;top:0;width:28px;height:28px;border-radius:7px;display:flex;align-items:center;justify-content:center;font-family:var(--f-mono);font-size:10px;
@@ -169,7 +189,7 @@ button:focus-visible,select:focus-visible,summary:focus-visible,input:focus-visi
 .fly.wb{box-shadow:inset 0 0 0 1px var(--accent);background:var(--bg)}
 
 /* the query's path and rows, folded */
-details{border-top:1px solid var(--line);padding-top:10px}
+details{padding:4px 4px 0}
 summary{cursor:pointer;list-style:none;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;font-size:13px;color:var(--ink-2);border-radius:4px}
 summary::-webkit-details-marker{display:none}
 summary::before{content:"▸";color:var(--muted);font-size:11px}
@@ -201,22 +221,16 @@ summary b{font-weight:500;color:var(--ink)}
 .ticks i{width:9px;height:9px;border-radius:2px;box-shadow:inset 0 0 0 1px var(--line)}
 .ticks i.hit{background:var(--hit);box-shadow:none}.ticks i.miss{background:var(--miss);box-shadow:none}
 
-footer{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;font-size:12px;color:var(--muted)}
-.pt{height:26px;font-size:11.5px}
-.pt[aria-pressed="true"]{border-color:var(--ink-2)}
-.pt[aria-pressed="false"]{color:var(--muted)}
 .foot{max-width:100ch;font-size:12px;color:var(--muted)}
 #drop{max-width:520px;margin:18vh auto 0;padding:36px 24px;border:2px dashed var(--line);border-radius:12px;text-align:center;color:var(--ink-2)}
 #error{max-width:520px;margin:24px auto;padding:0 20px;color:var(--miss)}
 body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-offset:6px}
 
 @media (max-width:720px){
-  .crow{grid-template-columns:minmax(0,1fr) auto}
-  .crow .ctrack,.fig,.say,.keyrow .key{grid-column:1 / -1}
-  .crow.axisrow .cnote{display:none}
-  .crow.axisrow .ctrack{grid-row:1}
-  .pool:not(.focus) .score{display:flex;gap:6px;align-items:baseline}
-  .caption .pos{margin-left:0;width:100%}
+  .grid{grid-template-columns:minmax(0,1fr);grid-template-rows:none;grid-template-areas:"score" "now" "pool" "disk" "time" "fold"}
+  .said{font-size:17px}
+  .slist{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
+  .panel{padding:14px 14px;border-radius:16px}
 }
 @media (prefers-reduced-motion: reduce){.tile,.place{transition:none}}
 </style>
@@ -229,11 +243,12 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
   <header class="top">
     <div class="name"><h1 id="title"></h1><span id="sub"></span></div>
     <div class="ctrl" role="group" aria-label="Playback">
-      <div class="seg" role="group" aria-label="Mode">
+      <button type="button" id="allBtn" aria-pressed="false">Show all pools</button>
+      <div class="seg" role="group" aria-label="Mode" id="modeSeg" hidden>
         <button type="button" id="mStep" aria-pressed="true">Step</button>
         <button type="button" id="mRace" aria-pressed="false">Race</button>
       </div>
-      <div class="seg" role="group" aria-label="Storage">
+      <div class="seg" role="group" aria-label="Storage" id="storageSeg">
         <button type="button" id="sSsd" aria-pressed="true">SSD</button>
         <button type="button" id="sHdd" aria-pressed="false">HDD</button>
       </div>
@@ -245,28 +260,46 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
   </header>
   <p class="warn" id="warn" hidden></p>
 
-  <div class="caption"><b id="qTitle"></b><code id="qSql"></code><span class="pos" id="pos"></span></div>
-  <div class="moment" id="moment" aria-live="polite"></div>
+  <div class="grid">
+    <aside class="panel" id="score" aria-label="Every pool's score so far">
+      <div class="phead"><span id="scoreHead"></span></div>
+      <div class="slist" id="slist"></div>
+      <p class="snote" id="snote"></p>
+    </aside>
 
-  <section class="chart" id="chart" aria-label="The run: per pool, one bar per page for as long as it stayed in memory">
-    <div class="crow axisrow"><span class="cnote" id="chartNote"></span><div class="ctrack axis" id="axis"></div><span class="cnote" style="text-align:right">time · hits</span></div>
-    <div class="pools" id="pools"></div>
-    <div class="crow keyrow"><button type="button" class="link" id="helpBtn" aria-expanded="false" aria-controls="help">How to read this</button><div class="key" id="key"></div><span></span></div>
-    <div class="help" id="help" hidden></div>
-    <label class="sr" for="scrub">Page read</label><input class="sr" type="range" id="scrub" min="-1" value="-1">
-  </section>
+    <section id="now" aria-label="What just happened">
+      <div class="caption"><b id="qTitle"></b><code id="qSql"></code></div>
+      <div class="said" id="said" aria-live="polite"></div>
+      <div class="why2" id="why2"></div>
+      <div class="moment" id="moment"></div>
+    </section>
 
-  <section class="disk" aria-label="Database file">
-    <div class="cells" id="cells"></div>
-    <div class="legend" id="legend"></div>
-  </section>
+    <section class="panel" id="pools" aria-label="The open pool"></section>
 
-  <details id="fold">
-    <summary id="foldSum"></summary>
-    <div class="cols" id="foldBody"></div>
-  </details>
+    <section class="panel" id="disk" aria-label="Database file">
+      <div class="phead"><span>Disk, in file order</span><span class="r" id="diskSay"></span></div>
+      <div class="cells" id="cells"></div>
+      <div class="legend" id="legend"></div>
+    </section>
 
-  <footer id="footer"></footer>
+    <section class="panel" id="tl" aria-label="Timeline: one cell per page request">
+      <div class="phead"><span>Every page request</span><span class="r" id="pos"></span></div>
+      <div class="tlwrap" id="tlWrap">
+        <div class="tlmarks" id="tlMarks"></div>
+        <canvas id="tlCanvas" aria-hidden="true"></canvas>
+        <span class="tlhere" id="tlHere" hidden></span>
+        <div class="tlnames" id="tlNames"></div>
+      </div>
+      <div class="keyrow"><div class="key" id="key"></div><button type="button" class="link" id="helpBtn" aria-expanded="false" aria-controls="help">How to read this</button></div>
+      <div class="help" id="help" hidden></div>
+      <label class="sr" for="scrub">Page request</label><input class="sr" type="range" id="scrub" min="-1" value="-1">
+    </section>
+
+    <details id="fold">
+      <summary id="foldSum"></summary>
+      <div class="cols" id="foldBody"></div>
+    </details>
+  </div>
 </div>
 
 <script id="run" type="application/json">__BPSIM_RUN__</script>
@@ -339,10 +372,11 @@ const state = {
   frames: 0, // pool size
   pages: {}, // page number -> its description from the trace
   objectColor: {}, // table or index -> its colour
-  bars: {}, // policy -> residency bars for the chart
+  head: {}, // policy -> page under the read head after each access
   running: {}, // policy -> running totals per access (time, hits, read-ahead hits, requests)
   shape: {}, // policy -> the kind of frame state it draws (clock, pg, innodb, ...)
-  lanes: {}, // policy -> its lane's DOM nodes
+  lanes: {}, // policy -> its lane's DOM nodes, for the pools drawn
+  rows: {}, // policy -> its row in the score column
   lanePos: {}, // policy -> the access its lane last showed
   moments: [], // moments worth a look, in access order
   storage: null, // "ssd" or "hdd": the profile prices are shown in
@@ -351,8 +385,9 @@ const state = {
 };
 /* What is on screen. */
 const view = {
-  pools: [], // the pools shown, in order
-  focus: null, // the pool opened in its own shape
+  pools: [], // the pools drawn: the open one, or all
+  focus: null, // the pool opened in its own shape; the timeline and disk follow it
+  all: false, // "Show all pools"
   mode: "step", // "step" or "race"
   at: -1, // the access shown; -1 before the first
   playing: false,
@@ -397,13 +432,13 @@ function start(data) {
   state.events = state.data.runs[0].events;
   state.accesses = state.events.length;
   state.byPolicy = {};
-  state.bars = {};
+  state.head = {};
   state.shape = {};
   state.lanes = {};
   state.lanePos = {};
   for (const r of state.data.runs) {
     state.byPolicy[r.policy] = r;
-    state.bars[r.policy] = residency(r.events);
+    state.head[r.policy] = heads(r.events);
     state.shape[r.policy] = r.events[0].frames[r.events[0].frame].state.kind;
   }
   state.readsAhead = state.data.runs.some(r => r.summary.read_ahead_cap > 0);
@@ -415,10 +450,9 @@ function start(data) {
     state.objectColor[o.name] = `var(--o${i % 6})`;
   });
 
-  const all = state.data.runs.map(r => r.policy),
-    real = all.filter(p => !INFO[p]?.textbook);
-  view.pools = real.length ? real : all;
-  view.focus = ["pg", "innodb"].find(p => view.pools.includes(p)) || view.pools[0];
+  const shown = comparePools();
+  view.focus = ["pg", "innodb"].find(p => shown.includes(p)) || shown[0];
+  view.all = false;
   view.mode = "step";
   view.at = -1;
 
@@ -438,9 +472,11 @@ function start(data) {
     : "";
 
   buildDisk();
-  buildFooter();
+  buildScore();
   buildHelp();
   buildLanes();
+  buildMoments();
+  buildTimeline();
   setModeUI();
   jump(state.moments.length && state.moments[0].k > 0 ? state.moments[0].k - 1 : -1);
 }
@@ -516,37 +552,12 @@ function setStorage(kind, redraw = true) {
   if (redraw) {
     buildHelp();
     buildMoments();
+    buildTimeline();
     renderAll(view.at);
   }
 }
 
-/* one bar per (frame, page): the reads it stayed for, and its hits */
-function residency(evs) {
-  const bars = [],
-    open = new Array(state.frames).fill(null);
-  for (let i = 0; i < state.accesses; i++) {
-    const fr = evs[i].frames;
-    for (let f = 0; f < state.frames; f++) {
-      const pg = fr[f].page,
-        o = open[f];
-      if (o && o.page !== pg) {
-        o.e = i - 1;
-        bars.push(o);
-        open[f] = null;
-      }
-      if (pg != null && !open[f]) open[f] = {f, page: pg, s: i, e: i, hits: []};
-    }
-    if (evs[i].kind === "hit" && open[evs[i].frame]) open[evs[i].frame].hits.push(i);
-  }
-  for (const o of open)
-    if (o) {
-      o.e = state.accesses - 1;
-      bars.push(o);
-    }
-  return bars;
-}
-
-/* ---------- database file strip, footer ---------- */
+/* ---------- database file strip, help ---------- */
 
 function buildDisk() {
   const cells = $("cells");
@@ -585,26 +596,6 @@ function buildDisk() {
   m.append(dot, "modified in memory");
   legend.append(m);
 }
-function buildFooter() {
-  const f = $("footer");
-  f.replaceChildren(el("span", "", "pools"));
-  for (const r of state.data.runs) {
-    const p = r.policy,
-      b = el("button", "pt", nameOf(p));
-    b.type = "button";
-    b.dataset.p = p;
-    b.addEventListener("click", () => {
-      view.pools = view.pools.includes(p)
-        ? view.pools.filter(x => x !== p)
-        : state.data.runs.map(r => r.policy).filter(x => x === p || view.pools.includes(x));
-      if (!view.pools.length) view.pools = [p];
-      if (!view.pools.includes(view.focus)) view.focus = view.pools[0];
-      buildLanes();
-      renderAll(view.at);
-    });
-    f.append(b);
-  }
-}
 function buildHelp() {
   const key = $("key");
   key.replaceChildren();
@@ -613,10 +604,9 @@ function buildHelp() {
     sp.append(el("i", cls), text);
     key.append(sp);
   };
-  item("kb", "a page held in memory; the dark edge is its disk read");
-  item("kh", "a hit");
-  item("kf", "not read yet");
-  if (state.data.queries.some(isScanQ)) item("ks", "a scan");
+  item("kh", "hit");
+  if (state.readsAhead) item("ka", "hit on a page read ahead");
+  item("kx", "miss: read from disk");
   item("km", "a moment worth a look");
 
   const help = $("help");
@@ -627,20 +617,20 @@ function buildHelp() {
     help.append(p);
   };
   tip(
-    "Rows.",
-    `Each row is one buffer pool serving the same ${state.accesses} page accesses with ${state.frames} frame${state.frames === 1 ? "" : "s"} of memory. They differ only in what they evict.`
+    "Pools.",
+    `Each pool serves the same ${state.accesses} page requests with ${state.frames} frame${state.frames === 1 ? "" : "s"} of memory. They differ only in what they evict. The score column shows each one's hits so far; click one to open it.`
   );
   tip(
-    "Bars.",
-    "A bar is one page staying in one frame. Long bars mean the pool kept the page. Many short bars mean it keeps throwing pages out."
+    "Timeline.",
+    "One cell per page request, for the open pool, grouped by query. Runs of misses are the pool waiting on the disk; a scan shows as a long stretch of them. Cells not reached yet are faded."
   );
   tip(
     "Moving.",
-    "Drag on the chart, or use the left and right arrow keys, to move through the accesses. Click a query number or a diamond to jump."
+    "Drag on the timeline, or use the left and right arrow keys, to move through the requests. Click a query name or a diamond to jump."
   );
   tip(
-    "Opening a pool.",
-    "Click a pool's name to open it and see how it decides what to evict. One pool is open at a time."
+    "Disk.",
+    "The database file in page order, coloured by table. The open pool's current page is outlined; the triangle marks the last page it read, which is where the next read starts from."
   );
   const P = state.profile;
   tip(
@@ -651,7 +641,7 @@ function buildHelp() {
   );
   tip(
     "Race.",
-    "Replays every pool at the pace of its time, on a squashed scale so hits stay visible next to slow reads. Optimal has the fewest misses, but not always the least time: it ignores what a miss costs."
+    "With all pools shown, Race replays every pool at the pace of its time, on a squashed scale so hits stay visible next to slow reads. Optimal has the fewest misses, but not always the least time: it ignores what a miss costs."
   );
   if (state.readsAhead)
     tip(
@@ -669,7 +659,7 @@ function buildHelp() {
       "foot",
       `Page reads were captured from SQLite ${state.data.sqlite_version} and replayed through miniature policies` +
         (mini.length ? `: ${mini.join("; ")}` : "") +
-        ". Every pool sees SQLite's reads; another database would read different pages for the same query. Times come from one datasheet per drive (a Samsung 990 Pro SSD, a 7,200 rpm enterprise hard drive); the operating system's file cache and overlapping I/O with work are left out. The layout is SQLite's: tables share one file page by page." +
+        ". Every pool sees SQLite's reads; another database would read different pages for the same query. Times come from one datasheet per drive (a Samsung 990 Pro SSD, a 7,200 rpm enterprise hard drive); the operating system's file cache and overlapping I/O with work are left out. Requests are timed one after another; a real SSD serves several at once, so its gain from fewer, larger requests is if anything larger than shown. The layout is SQLite's: tables share one file page by page." +
         (state.readsAhead
           ? " Read-ahead here is a simple rule (two pages of a table in a row; scans for PostgreSQL-style); real InnoDB reads a whole 64-page extent once 56 of its pages were read in order, and would not read ahead tables this small at all."
           : "")
@@ -677,77 +667,138 @@ function buildHelp() {
   );
 }
 
-/* ---------- chart + pools for the visible set ---------- */
+/* ---------- score column, pools on screen, timeline ---------- */
+const allPools = () => state.data.runs.map(r => r.policy);
+/* the pools moments compare: the real-world ones, unless only textbook ones ran */
+const comparePools = () => {
+  const real = allPools().filter(p => !INFO[p]?.textbook);
+  return real.length ? real : allPools();
+};
+function buildScore() {
+  const list = $("slist");
+  list.replaceChildren();
+  state.rows = {};
+  for (const p of allPools()) {
+    const b = el("button", "srow");
+    b.type = "button";
+    b.dataset.p = p;
+    b.append(el("span", "n", nameOf(p)), el("span", "h"), el("span", "d"), el("span", "place"));
+    b.addEventListener("click", () => setFocus(p));
+    list.append(b);
+    state.rows[p] = b;
+  }
+  $("scoreHead").textContent = `Hits of ${state.accesses}`;
+  $("snote").textContent = "Click a pool to open it.";
+}
+function paintScore(at) {
+  for (const p of allPools()) {
+    const b = state.rows[p],
+      t = totals(p, at),
+      left = at === state.accesses - 1 ? state.byPolicy[p].summary.dirty_at_end : 0;
+    b.classList.toggle("on", p === view.focus);
+    b.setAttribute("aria-pressed", p === view.focus);
+    b.querySelector(".h").textContent = at < 0 ? "–" : t.hits;
+    b.querySelector(".d").textContent =
+      at < 0 ? INFO[p]?.how || "" : `${fmtMs(t.cost)} · ${t.req} request${t.req === 1 ? "" : "s"}`;
+    b.title =
+      at < 0
+        ? ""
+        : [
+            `${t.hits} hits of ${at + 1}, ${t.early} of them on pages read ahead; ${t.req} disk request${t.req === 1 ? "" : "s"} waited on`,
+            left
+              ? `${left} modified page${left > 1 ? "s" : ""} still in memory at the end; a checkpoint would write ${left > 1 ? "them" : "it"} (not counted)`
+              : ""
+          ]
+            .filter(Boolean)
+            .join(". ");
+  }
+}
+
+/* the pools drawn: the open one, or all of them */
 function buildLanes() {
   stopRace();
-  for (const b of $("footer").querySelectorAll(".pt"))
-    b.setAttribute("aria-pressed", view.pools.includes(b.dataset.p));
+  view.pools = view.all ? allPools() : [view.focus];
   const pools = $("pools");
   pools.replaceChildren();
   state.lanes = {};
-  for (const p of state.data.runs.map(r => r.policy).filter(p => view.pools.includes(p))) {
-    const lane = el("section", "pool crow");
+  for (const p of view.pools) {
+    const lane = el("section", "pool");
     lane.setAttribute("aria-label", nameOf(p));
     const pn = el("button", "pname");
     pn.type = "button";
     pn.append(el("span", "", nameOf(p)), el("small", "", INFO[p]?.how || ""));
     pn.addEventListener("click", () => setFocus(p));
-    const track = el("div", "ctrack band"),
-      score = el("div", "score"),
-      fig = el("div", "fig"),
+    const fig = el("div", "fig"),
       sayEl = el("div", "say");
-    score.append(el("span", "place"), el("div", "t", "0"), el("div", "s"));
-    lane.append(pn, track, score, fig, sayEl);
+    lane.append(pn, fig, sayEl);
     pools.append(lane);
-    state.lanes[p] = {lane, pn, track, score, fig, sayEl};
-    if (state.lanePos[p] === undefined) state.lanePos[p] = view.at;
+    state.lanes[p] = {lane, pn, fig, sayEl};
+    state.lanePos[p] = view.at;
   }
-  markFocus();
-  buildMoments();
-  buildChart();
-}
-function markFocus() {
-  for (const p of view.pools) {
-    const L = state.lanes[p],
-      on = p === view.focus;
-    L.lane.classList.toggle("focus", on);
-    L.pn.setAttribute("aria-expanded", on);
-    L.fig.hidden = !on;
-  }
+  for (const p of view.pools) state.lanes[p].lane.classList.toggle("focus", p === view.focus);
+  $("allBtn").setAttribute("aria-pressed", view.all);
+  $("modeSeg").hidden = !view.all;
 }
 function setFocus(p) {
   if (p === view.focus) return;
   view.focus = p;
-  markFocus();
-  buildChart();
-  for (const q of view.pools) paintLane(q, state.lanePos[q]);
+  if (view.all) for (const q of view.pools) state.lanes[q].lane.classList.toggle("focus", q === p);
+  else buildLanes();
+  drawTimeline();
+  renderAll(view.at);
+}
+function setAll(on) {
+  if (on === view.all) return;
+  if (!on && view.mode === "race") setMode("step");
+  view.all = on;
+  buildLanes();
+  renderAll(view.at);
 }
 
-function buildChart() {
-  const axis = $("axis");
-  axis.replaceChildren();
-  const W = axis.clientWidth || 600;
-  $("chartNote").textContent =
-    `${state.frames} frame${state.frames === 1 ? "" : "s"} × ${state.accesses} accesses`;
-  const seen = new Set();
-  for (const m of state.moments) {
-    if (seen.has(m.k)) continue;
-    seen.add(m.k);
+/* page under the read head after each access, per pool: the last page read */
+function heads(evs) {
+  const out = [];
+  let head = null;
+  for (const e of evs) {
+    if (e.read) head = e.ahead?.length ? e.ahead.at(-1) : e.page;
+    out.push(head);
+  }
+  return out;
+}
+
+/* moments above the strip, query names under it; the strip itself is drawn */
+function buildTimeline() {
+  const marks = $("tlMarks"),
+    names = $("tlNames");
+  marks.replaceChildren();
+  names.replaceChildren();
+  const W = $("tlCanvas").clientWidth || 600,
+    at = k => (W * (k + 0.5)) / state.accesses;
+  const ks = [...new Set(state.moments.map(m => m.k))];
+  ks.forEach((k, i) => {
     const b = el("button", "mk");
     b.type = "button";
-    b.dataset.k = m.k;
-    b.style.left = `${(100 * (m.k + 0.5)) / state.accesses}%`;
-    b.title = state.moments
-      .filter(x => x.k === m.k)
+    b.dataset.k = k;
+    b.style.left = `${(100 * (k + 0.5)) / state.accesses}%`;
+    const title = state.moments
+      .filter(x => x.k === k)
       .map(x => x.t)
       .join(" · ");
-    b.setAttribute("aria-label", "Moment: " + b.title);
+    b.title = title;
+    b.setAttribute("aria-label", "Moment: " + title);
+    b.append(el("i"));
+    /* a label when it has room; past the middle it reads to the left */
+    const before = i ? at(k) - at(ks[i - 1]) : Infinity,
+      after = i < ks.length - 1 ? at(ks[i + 1]) - at(k) : Infinity,
+      room = Math.min(before, after);
+    if (room > 150 || ks.length === 1) b.append(el("span", "", title));
+    if (at(k) > W / 2) b.classList.add("left");
     b.addEventListener("click", () => {
       toStep();
-      jump(m.k);
+      jump(k);
     });
-    axis.append(b);
-  }
+    marks.append(b);
+  });
   state.data.queries.forEach((q, i) => {
     const [a, b] = q.accesses,
       px = (W * (b - a)) / state.accesses;
@@ -755,9 +806,9 @@ function buildChart() {
     s.type = "button";
     s.dataset.q = i;
     s.style.left = `${(100 * a) / state.accesses}%`;
-    s.style.width = `calc(${(100 * (b - a)) / state.accesses}% - 3px)`;
+    s.style.width = `calc(${(100 * (b - a)) / state.accesses}% - 4px)`;
     s.textContent =
-      px >= 150
+      px >= 110
         ? `${i + 1} · ${q.title}${isScanQ(q) ? " (scan)" : ""}`
         : px >= 8 * String(i + 1).length + 6
           ? i + 1
@@ -768,68 +819,90 @@ function buildChart() {
       toStep();
       jump(a);
     });
-    axis.append(s);
+    names.append(s);
   });
-
-  const colW = W / state.accesses;
-  for (const p of view.pools) {
-    // the pool in focus gets rows tall enough to label; the others stay slim
-    const H =
-        p === view.focus
-          ? Math.max(30, Math.min(120, state.frames * 15))
-          : Math.max(24, Math.min(56, state.frames * 6)),
-      rowH = H / state.frames,
-      gap = rowH >= 8 ? 2 : rowH >= 3 ? 1 : 0;
-    const tr = state.lanes[p].track;
-    tr.replaceChildren();
-    tr.style.height = H + "px";
-    state.data.queries.forEach(q => {
-      const [a, b] = q.accesses,
-        scan = state.events.slice(a, b).find(e => e.scan);
-      if (scan) {
-        const t = el("span", "tint");
-        t.style.left = `${(100 * a) / state.accesses}%`;
-        t.style.width = `${(100 * (b - a)) / state.accesses}%`;
-        t.style.setProperty("--c", colorOf(scan.page));
-        tr.append(t);
-      }
-      if (a && colW >= 2) {
-        const l = el("span", "qb");
-        l.style.left = `${(100 * a) / state.accesses}%`;
-        tr.append(l);
-      }
-    });
-    for (const bar of state.bars[p]) {
-      const span = bar.e - bar.s + 1,
-        d = el("div", "bar" + (colW >= 5 ? " edge" : ""));
-      d.style.cssText = `left:${(100 * bar.s) / state.accesses}%;width:calc(${(100 * span) / state.accesses}% - ${colW >= 3 ? 1 : 0}px);top:${bar.f * rowH}px;height:${Math.max(1, rowH - gap)}px;line-height:${Math.max(1, rowH - gap)}px`;
-      d.style.setProperty("--c", colorOf(bar.page));
-      if (rowH - gap >= 12 && span * colW >= 30) {
-        d.textContent = "p" + bar.page;
-        d.classList.add("lab");
-      }
-      if (rowH - gap >= 7 && colW >= 7)
-        for (const h of bar.hits) {
-          const dot = el("i");
-          dot.style.left = `${(100 * (h - bar.s + 0.5)) / span}%`;
-          d.append(dot);
-        }
-      tr.append(d);
-    }
-    tr.append(el("span", "veil"), el("span", "ph"));
-    paintBand(p, state.lanePos[p]);
-  }
-  markAxis(view.at);
+  drawTimeline();
 }
-function markAxis(at) {
-  const q = at >= 0 ? state.events[at].query : -1;
-  for (const s of $("axis").querySelectorAll(".qs")) {
-    const i = +s.dataset.q;
-    s.classList.toggle("cur", i === q);
-    s.classList.toggle("done", q >= 0 && state.data.queries[i].accesses[0] <= at);
+/* One cell per access for the open pool: hit, hit on a page read ahead, or
+   miss. When there are more accesses than pixels, each pixel column holds
+   several and is split by their share of hits. Accesses not reached yet fade. */
+function drawTimeline() {
+  const cv = $("tlCanvas"),
+    W = cv.clientWidth || 600,
+    H = 28,
+    dpr = devicePixelRatio || 1;
+  cv.width = Math.round(W * dpr);
+  cv.height = Math.round(H * dpr);
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+  const css = getComputedStyle(document.body),
+    hit = css.getPropertyValue("--hit").trim(),
+    miss = css.getPropertyValue("--miss").trim(),
+    muted = css.getPropertyValue("--muted").trim();
+  const evs = state.byPolicy[view.focus].events,
+    N = state.accesses,
+    cw = W / N,
+    at = view.mode === "race" ? N - 1 : view.at;
+  const later = i => (i > at ? 0.3 : 1);
+  if (cw >= 1) {
+    const gap = cw >= 4 ? 1.5 : 0,
+      r = Math.min(3, Math.max(0, (cw - gap) / 3));
+    for (let i = 0; i < N; i++) {
+      const e = evs[i],
+        x = i * cw,
+        w = Math.max(1, cw - gap);
+      g.beginPath();
+      if (g.roundRect) g.roundRect(x, 0, w, H, r);
+      else g.rect(x, 0, w, H);
+      if (e.kind === "hit" && e.read_ahead_hit) {
+        g.globalAlpha = 0.3 * later(i);
+        g.fillStyle = hit;
+        g.fill();
+        if (cw >= 5) {
+          g.globalAlpha = later(i);
+          g.strokeStyle = hit;
+          g.lineWidth = 1.5;
+          g.setLineDash(cw >= 9 ? [3, 2] : []);
+          g.beginPath();
+          if (g.roundRect) g.roundRect(x + 0.75, 0.75, w - 1.5, H - 1.5, r);
+          else g.rect(x + 0.75, 0.75, w - 1.5, H - 1.5);
+          g.stroke();
+          g.setLineDash([]);
+        }
+      } else {
+        g.globalAlpha = (e.kind === "hit" ? 0.75 : e.read ? 0.38 : 0.2) * later(i);
+        g.fillStyle = e.kind === "hit" ? hit : e.read ? miss : muted;
+        g.fill();
+      }
+    }
+  } else {
+    for (let x = 0; x < W; x++) {
+      const a = Math.floor((x * N) / W),
+        b = Math.max(a + 1, Math.floor(((x + 1) * N) / W));
+      let h = 0;
+      for (let i = a; i < b; i++) if (evs[i].kind === "hit") h++;
+      const share = h / (b - a),
+        fade = later(a);
+      g.globalAlpha = 0.38 * fade;
+      g.fillStyle = miss;
+      g.fillRect(x, 0, 1, H * (1 - share));
+      g.globalAlpha = 0.75 * fade;
+      g.fillStyle = hit;
+      g.fillRect(x, H * (1 - share), 1, H * share);
+    }
   }
-  for (const b of $("axis").querySelectorAll(".mk"))
+  g.globalAlpha = 1;
+}
+function markTimeline(at) {
+  const q = at >= 0 ? state.events[at].query : -1;
+  for (const s of $("tlNames").querySelectorAll(".qs")) s.classList.toggle("cur", +s.dataset.q === q);
+  for (const b of $("tlMarks").querySelectorAll(".mk"))
     b.classList.toggle("cur", view.mode === "step" && +b.dataset.k === at);
+  const here = $("tlHere");
+  here.hidden = at < 0 || view.mode === "race";
+  here.style.left = `${(100 * (at + 0.5)) / state.accesses}%`;
+  drawTimeline();
 }
 const totals = (p, at) =>
   at < 0
@@ -840,14 +913,6 @@ const totals = (p, at) =>
         early: state.running[p].a[at],
         req: state.running[p].q[at]
       };
-function paintBand(p, at) {
-  const L = state.lanes[p],
-    x = `${(100 * (at + 1)) / state.accesses}%`;
-  L.track.querySelector(".veil").style.left = x;
-  const ph = L.track.querySelector(".ph");
-  ph.style.left = x;
-  ph.hidden = at < 0;
-}
 
 /* ---------- one access in words ---------- */
 function describe(p, e) {
@@ -1070,53 +1135,94 @@ function paintLane(p, at) {
     hand: null
   };
   if (p === view.focus) L.fig.replaceChildren(drawFocus(p, shown, at, touched));
-  else L.fig.replaceChildren();
-  const t = totals(p, at);
-  L.score.querySelector(".t").textContent = at < 0 ? "0" : fmtMs(t.cost);
-  const left = at === state.accesses - 1 ? state.byPolicy[p].summary.dirty_at_end : 0;
-  L.score.querySelector(".s").textContent =
-    at < 0
-      ? "nothing yet"
-      : `${t.hits}/${at + 1} hits · ${t.req} request${t.req === 1 ? "" : "s"}` +
-        (left ? ` · ${left} still modified` : "");
-  L.score.title =
-    at < 0
-      ? ""
-      : [
-          `${t.hits} hits, ${t.early} of them on pages read ahead; ${t.req} disk request${t.req === 1 ? "" : "s"} waited on`,
-          left
-            ? `${left} modified page${left > 1 ? "s" : ""} still in memory at the end; a checkpoint would write ${left > 1 ? "them" : "it"} (not counted)`
-            : ""
-        ]
-          .filter(Boolean)
-          .join(". ");
+  else {
+    L.fig.style.setProperty("--ts", "22px");
+    L.fig.classList.add("small");
+    L.fig.replaceChildren(row(shown.frames, at, touched >= 0 ? shown.frames[touched] : null));
+  }
+  /* the open pool's words are the big sentence; the others get a line each */
   L.sayEl.replaceChildren();
-  if (e && view.mode === "step") L.sayEl.append(el("span", "k " + e.kind, e.kind), describe(p, e));
-  paintBand(p, at);
+  L.sayEl.hidden = p === view.focus;
+  if (e && view.mode === "step" && p !== view.focus)
+    L.sayEl.append(el("span", "k " + e.kind, e.kind), describe(p, e));
 }
 function renderAll(at) {
   for (const p of view.pools) paintLane(p, at);
   renderChrome(at);
 }
+/* the open pool's access in one sentence, then how it decided */
+function opening(e) {
+  const pg = `p${e.page}`;
+  if (e.kind === "hit") return [["k hit", "Hit"], ` on ${pg}`];
+  if (!e.read) return [`${pg} is written without being read`];
+  return [["k miss", "Miss"], ` on ${pg}`];
+}
+function renderNow(at) {
+  const said = $("said"),
+    why = $("why2");
+  said.replaceChildren();
+  why.textContent = "";
+  if (view.mode === "race") {
+    said.textContent = "Race: every pool at the pace of its own time";
+    return;
+  }
+  if (at < 0) {
+    said.textContent = "Before the first page request";
+    why.textContent = "Press Play, or use the arrow keys.";
+    return;
+  }
+  const e = state.byPolicy[view.focus].events[at];
+  for (const part of opening(e)) said.append(typeof part === "string" ? part : el("span", part[0], part[1]));
+  said.append(el("span", "", ` · ${pageDesc(e.page)}`));
+  said.lastChild.style.cssText = "color:var(--muted);font-size:.7em";
+  why.textContent = `${nameOf(view.focus)}: ${describe(view.focus, e)}`;
+}
+/* the disk strip follows the open pool: the page asked for, the pages read
+   ahead with it, and the read head */
+function renderDisk(at) {
+  for (const c of Object.values(view.diskCells)) c.classList.remove("now", "ra", "head");
+  const say = $("diskSay");
+  if (at < 0 || view.mode === "race") {
+    say.textContent = "";
+    return;
+  }
+  const e = state.byPolicy[view.focus].events[at],
+    head = state.head[view.focus][at];
+  view.diskCells[e.page]?.classList.add("now");
+  for (const a of e.ahead || []) view.diskCells[a]?.classList.add("ra");
+  if (head != null) view.diskCells[head]?.classList.add("head");
+  const wb = writeBacks(e),
+    pages = 1 + (e.ahead?.length || 0);
+  say.textContent =
+    (e.kind === "hit"
+      ? "hit · no disk read"
+      : !e.read
+        ? "written without reading · no disk read"
+        : `1 request · ${pages} page${pages > 1 ? "s" : ""}`) +
+    (wb ? ` · ${wb} write-back${wb > 1 ? "s" : ""}` : "") +
+    (e.kind === "hit" && !wb ? "" : ` · ${fmtMs(costOf(e))}`);
+}
 function renderChrome(at) {
-  for (const c of Object.values(view.diskCells)) c.classList.remove("now");
-  if (at >= 0 && view.mode === "step") view.diskCells[state.events[at].page]?.classList.add("now");
+  renderDisk(at);
+  paintScore(view.mode === "race" ? -1 : at);
   $("scrub").value = at;
-  markAxis(at);
+  markTimeline(at);
   const q = at >= 0 ? state.events[at].query : -1,
     query = state.data.queries[Math.max(0, q)];
   if (view.mode === "race") {
-    $("qTitle").textContent = "Race";
+    $("qTitle").textContent = "";
     $("qSql").textContent = "";
-    $("pos").textContent = `${state.accesses} accesses each`;
+    $("pos").textContent = `${state.accesses} requests each`;
   } else {
-    $("qTitle").textContent = q < 0 ? "Before the first query" : `${q + 1}. ${query.title}`;
+    $("qTitle").textContent = q < 0 ? "" : `${q + 1}. ${query.title}`;
     $("qSql").textContent = q < 0 ? "" : query.sql;
     $("pos").textContent =
       at < 0
-        ? `${state.accesses} accesses ahead`
-        : `access ${at + 1}/${state.accesses} · p${state.events[at].page} ${pageDesc(state.events[at].page)}`;
+        ? `${state.accesses} requests ahead`
+        : `${at + 1} of ${state.accesses} · ${nameOf(view.focus)} · ` +
+          state.byPolicy[view.focus].events[at].kind;
   }
+  renderNow(at);
   renderMoment(at);
   renderFold(at);
 }
@@ -1124,7 +1230,7 @@ function renderChrome(at) {
 /* ---------- moments, found from the events ---------- */
 function buildMoments() {
   const list = [],
-    real = view.pools.filter(p => p !== "opt"),
+    real = comparePools().filter(p => p !== "opt"),
     E = p => state.byPolicy[p].events;
   const and = xs => (xs.length > 1 ? xs.slice(0, -1).join(", ") + " and " + xs.at(-1) : xs[0]);
   state.data.queries.forEach(q => {
@@ -1364,7 +1470,7 @@ function renderFold(at) {
   const cc = el("div", "col c");
   cc.append(el("span", "eyebrow", "this query in each pool, so far"));
   const list = el("div");
-  for (const p of view.pools) {
+  for (const p of allPools()) {
     const evs = state.byPolicy[p].events,
       row = el("div", "qcost"),
       l = el("div", "l"),
@@ -1465,7 +1571,7 @@ function setModeUI() {
   $("play").textContent = view.mode === "race" ? "Race" : "Play";
 }
 function clearPlaces() {
-  for (const p of view.pools) state.lanes[p]?.score.querySelector(".place").classList.remove("on");
+  for (const b of Object.values(state.rows)) b.querySelector(".place").classList.remove("on");
 }
 function setMode(m) {
   if (m === view.mode) return;
@@ -1537,7 +1643,7 @@ async function race() {
       }
       if (id !== view.raceId) return;
       place++;
-      const pl = state.lanes[p].score.querySelector(".place");
+      const pl = state.rows[p].querySelector(".place");
       pl.textContent = ["1st", "2nd", "3rd"][place - 1] || place + "th";
       pl.classList.add("on");
     })
@@ -1560,6 +1666,7 @@ $("sHdd").addEventListener("click", () => {
   setStorage("hdd");
 });
 $("mRace").addEventListener("click", () => setMode("race"));
+$("allBtn").addEventListener("click", () => setAll(!view.all));
 $("prev").addEventListener("click", () => {
   stopPlaying();
   jump(view.at - 1);
@@ -1594,33 +1701,39 @@ document.addEventListener("keydown", e => {
   }
 });
 
-/* drag on the chart to move through the run */
-let dragging = null;
+/* drag on the timeline to move through the run */
+let dragging = false;
 const scrubTo = ev => {
-  const r = dragging.getBoundingClientRect();
+  const r = $("tlCanvas").getBoundingClientRect();
   jump(Math.floor(((ev.clientX - r.left) / r.width) * state.accesses));
 };
-$("chart").addEventListener("pointerdown", ev => {
-  const tr = ev.target.closest(".ctrack");
-  if (!tr || ev.target.closest("button") || ev.button) return;
+$("tlWrap").addEventListener("pointerdown", ev => {
+  if (ev.target.closest("button") || ev.button) return;
   toStep();
-  dragging = tr;
-  tr.setPointerCapture(ev.pointerId);
+  dragging = true;
+  $("tlWrap").setPointerCapture(ev.pointerId);
   scrubTo(ev);
 });
-$("chart").addEventListener("pointermove", ev => {
+$("tlWrap").addEventListener("pointermove", ev => {
   if (dragging) scrubTo(ev);
 });
 for (const type of ["pointerup", "pointercancel"])
-  $("chart").addEventListener(type, () => {
-    dragging = null;
+  $("tlWrap").addEventListener(type, () => {
+    dragging = false;
   });
 let resizeTimer = 0;
 addEventListener("resize", () => {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => {
-    if (state.data) buildChart();
+    if (state.data) {
+      buildTimeline();
+      markTimeline(view.at);
+    }
   }, 150);
+});
+/* the strip is drawn in the page's colours, which change with the theme */
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  if (state.data) drawTimeline();
 });
 
 /* ---------- loading ---------- */
