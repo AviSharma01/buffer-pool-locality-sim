@@ -546,6 +546,43 @@ def check_dock(page: Page) -> list[str]:
     return problems
 
 
+def check_theme(page: Page, scheme: str) -> list[str]:
+    """Follows the system until the button picks; the page, the strip and the
+    memory chart switch; the choice survives a reload; nothing is left set."""
+    problems = []
+
+    def look() -> tuple:
+        bg = page.evaluate("getComputedStyle(document.body).backgroundColor")
+        strip = page.evaluate(
+            """() => { const c = document.getElementById('tlCanvas');
+            const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+            let s = 0; for (let i = 0; i < d.length; i += 97) s += d[i]; return s; }"""
+        )
+        return page.evaluate("bpsim.theme()"), bg, strip
+
+    first = look()
+    if first[0] != scheme:
+        problems.append(f"with the system {scheme}, the page is {first[0]}")
+    page.click("#themeBtn")
+    other = look()
+    if other[0] == scheme or other[1] == first[1]:
+        problems.append(f"the theme button did not switch the page ({first[:2]} → {other[:2]})")
+    if other[2] == first[2]:
+        problems.append("the timeline strip was not redrawn in the new theme")
+    page.reload()
+    page.wait_for_selector(".pool")
+    if page.evaluate("bpsim.theme()") != other[0]:
+        problems.append("the chosen theme was not remembered")
+    page.click("#themeBtn")
+    if page.evaluate("bpsim.theme()") != scheme:
+        problems.append("a second click did not switch back")
+    page.evaluate(
+        """() => { localStorage.removeItem('bpsim.theme');
+        delete document.documentElement.dataset.theme; }"""
+    )
+    return problems
+
+
 def check_motion(page: Page, reduced: bool) -> list[str]:
     """Pages fly in only on a single step into the open pool; never with
     reduce motion; never while playing."""
@@ -599,6 +636,7 @@ def main() -> int:
                 found = check_page(page, label, trace, run, width)
                 if i == 0:
                     found += check_how(page)
+                    found += check_theme(page, scheme)
                 if width == 1280 and i == 0:
                     found += check_mem(page, run)
                     found += check_sound(page)

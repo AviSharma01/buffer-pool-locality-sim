@@ -29,13 +29,21 @@
   --f-mono:"Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   color-scheme:light;
 }
-@media (prefers-color-scheme: dark){:root{
+/* dark: the system's choice, unless the theme button picked one (data-theme on <html>) */
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
   --bg:#111112; --ink:#eceae6; --ink-2:#aca79f; --muted:#918c84; --line:#ffffff24; --soft:#ffffff0a;
   --accent:#ec8a63; --hit:#86c08f; --miss:#ec8a63; --mark:#e5c15b38;
   --raised:color-mix(in srgb,var(--ink) 9%,var(--bg));
   --o-schema:#9b968f; --free:#3a3835; --o0:#86c08f; --o1:#8c9cf2; --o2:#e5c15b; --o3:#c29be0; --o4:#5fc4cc; --o5:#ee8fab;
   color-scheme:dark;
 }}
+:root[data-theme="dark"]{
+  --bg:#111112; --ink:#eceae6; --ink-2:#aca79f; --muted:#918c84; --line:#ffffff24; --soft:#ffffff0a;
+  --accent:#ec8a63; --hit:#86c08f; --miss:#ec8a63; --mark:#e5c15b38;
+  --raised:color-mix(in srgb,var(--ink) 9%,var(--bg));
+  --o-schema:#9b968f; --free:#3a3835; --o0:#86c08f; --o1:#8c9cf2; --o2:#e5c15b; --o3:#c29be0; --o4:#5fc4cc; --o5:#ee8fab;
+  color-scheme:dark;
+}
 *{box-sizing:border-box}
 html{background:var(--bg)}
 body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:14px;line-height:1.5}
@@ -118,6 +126,8 @@ dialog::backdrop{background:rgba(24,22,19,.45)}
 @keyframes glowText{from{color:var(--accent)}}
 @keyframes glowRow{from{background:color-mix(in srgb,var(--accent) 20%,transparent)}}
 @media (prefers-reduced-motion:reduce){.pool.fresh{animation:none}}
+
+#themeBtn{width:32px;padding:0;display:inline-flex;align-items:center;justify-content:center}
 
 /* sound switch: a clear pill, accent when on */
 .soundpill{display:inline-flex;align-items:center;gap:7px;padding:0 13px 0 4px}
@@ -330,6 +340,14 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
 }
 @media (prefers-reduced-motion: reduce){.tile,.place{transition:none}}
 </style>
+<script>
+  try {
+    const t = localStorage.getItem("bpsim.theme");
+    if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+  } catch {
+    /* follow the system */
+  }
+</script>
 </head>
 <body>
 <div id="drop" hidden>No run data in this page. Drop a <code>run.json</code> here.</div>
@@ -339,7 +357,8 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
   <header class="top">
     <div class="name"><h1 id="title"></h1><span id="sub"></span></div>
     <div class="tools"><span class="hint" id="howHint" hidden>New here?</span><button type="button" id="howBtn" aria-haspopup="dialog">How it works</button>
-      <button type="button" class="soundpill" id="soundBtn" aria-pressed="false" title="A soft pop when the pools on screen change (rising as one arrives, falling as one leaves), and a tune when a race is won"><span class="sp"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2 6h3l4-3v10l-4-3H2z" fill="currentColor"/><path class="w" d="M11.5 5.5c.8.7 1.2 1.6 1.2 2.5s-.4 1.8-1.2 2.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path class="x" d="M11 6l3 4M14 6l-3 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></span>Sound <span class="st" id="soundState">off</span></button></div>
+      <button type="button" class="soundpill" id="soundBtn" aria-pressed="false" title="A soft pop when the pools on screen change (rising as one arrives, falling as one leaves), and a tune when a race is won"><span class="sp"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2 6h3l4-3v10l-4-3H2z" fill="currentColor"/><path class="w" d="M11.5 5.5c.8.7 1.2 1.6 1.2 2.5s-.4 1.8-1.2 2.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path class="x" d="M11 6l3 4M14 6l-3 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></span>Sound <span class="st" id="soundState">off</span></button>
+      <button type="button" class="icon" id="themeBtn"></button></div>
     <div class="ctrl" role="group" aria-label="Playback">
       <button type="button" id="allBtn" aria-pressed="false">Show all pools</button>
       <div class="seg" role="group" aria-label="Mode" id="modeSeg" hidden>
@@ -2367,13 +2386,40 @@ addEventListener("resize", () => {
     }
   }, 150);
 });
-/* the strip is drawn in the page's colours, which change with the theme */
-matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+/* light or dark: the system's choice until the button picks one, then that,
+   remembered */
+const isDark = () =>
+  document.documentElement.dataset.theme
+    ? document.documentElement.dataset.theme === "dark"
+    : matchMedia("(prefers-color-scheme: dark)").matches;
+const SUN =
+  '<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><circle cx="8" cy="8" r="3" fill="currentColor"/><g stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M8 1.5v1.6M8 12.9v1.6M1.5 8h1.6M12.9 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M3.4 12.6l1.1-1.1M11.5 4.5l1.1-1.1"/></g></svg>';
+const MOON =
+  '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M13.5 10.2A6 6 0 0 1 5.8 2.5a6 6 0 1 0 7.7 7.7z" fill="currentColor"/></svg>';
+function showTheme() {
+  const dark = isDark(),
+    b = $("themeBtn");
+  b.innerHTML = dark ? SUN : MOON;
+  b.setAttribute("aria-label", dark ? "Switch to light" : "Switch to dark");
+  b.title = b.getAttribute("aria-label");
   if (state.data) {
     drawTimeline();
     drawMem(view.at);
   }
+}
+$("themeBtn").addEventListener("click", () => {
+  const t = isDark() ? "light" : "dark";
+  document.documentElement.dataset.theme = t;
+  try {
+    localStorage.setItem("bpsim.theme", t);
+  } catch {
+    /* this visit only */
+  }
+  showTheme();
 });
+showTheme();
+/* the strip is drawn in the page's colours, which change with the theme */
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", showTheme);
 
 /* ---------- loading ---------- */
 function fail(err) {
@@ -2417,6 +2463,7 @@ window.bpsim = Object.freeze({
   heard: () => [...view.heard],
   moments: () => state.moments.map(m => ({k: m.k, t: m.t, d: m.d})),
   pools: () => [...view.pools],
+  theme: () => (isDark() ? "dark" : "light"),
   racePos: policy => view.race?.pos[policy] ?? null,
   docked: () => !$("dock").hidden,
   bars: policy => state.bars[policy].length,
