@@ -78,6 +78,38 @@ dialog::backdrop{background:rgba(24,22,19,.45)}
 .walknav .tally{flex:1;font-size:12px;color:var(--muted);text-align:right;margin-right:6px}
 .dh{font-family:var(--f-display);font-weight:600;font-size:16px;margin:22px 0 0}
 
+/* highlights a change added glow; dropped ones fade out */
+.phead .note,.dhead2 .note{color:var(--accent)}
+.tlmarks .mk.fresh i,.dmarks .mk.fresh i{background:var(--accent);box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 25%,transparent);transition:box-shadow 2s ease-out}
+.mk.gone{pointer-events:none;animation:gone .7s ease-out forwards}
+@keyframes gone{to{opacity:0}}
+.tlmarks .mk.gone,.dmarks .mk.gone{position:absolute}
+
+/* drawn pools beside the open one: a grid of small cards */
+#pools{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px 14px;align-content:start}
+#pools .pool.focus{grid-column:1 / -1;order:-1}
+#pools .pool:not(.focus){background:var(--raised);border-radius:12px;padding:9px 11px 10px;min-width:0}
+#pools .pool:not(.focus) .pname{font-size:12.5px}
+#pools .pool:not(.focus) .pname small{display:none}
+#pools .pool:not(.focus) .fig{padding-top:8px}
+#pools .pool:not(.focus) .say{margin-top:6px;font-size:11.5px;min-height:17px;line-height:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* the timeline kept in view: a slim bar while the full one is scrolled away */
+.dock{position:fixed;left:50%;bottom:12px;transform:translateX(-50%);width:min(1180px,calc(100vw - 24px));z-index:20;
+  background:var(--bg);border-radius:16px;padding:8px 14px 10px;box-shadow:0 8px 28px rgba(0,0,0,.14),0 0 0 1px var(--line);transition:opacity .2s ease,transform .2s ease}
+.dock[hidden]{display:block;opacity:0;pointer-events:none;transform:translate(-50%,12px)}
+.dhead2{display:flex;align-items:baseline;gap:10px;font-size:11.5px;color:var(--muted);margin-bottom:4px}
+.dhead2 .r{margin-left:auto;font-variant-numeric:tabular-nums}
+.dockwrap{position:relative;touch-action:pan-y;cursor:ew-resize;user-select:none;padding-top:10px}
+#dockCanvas{display:block;width:100%;height:14px}
+.dockwrap .tlhere{top:8px;bottom:-2px}
+.dmarks{position:absolute;left:0;right:0;top:0;height:10px;pointer-events:none}
+.dmarks .mk{position:absolute;top:0;transform:translateX(-4px)}
+.dmarks .mk i{display:block;width:7px;height:7px;border-radius:1.5px;transform:rotate(45deg);background:var(--o2)}
+.dmarks .mk.cur i{background:var(--accent)}
+.app{padding-bottom:84px}
+@media (prefers-reduced-motion:reduce){.dock{transition:none}.mk.gone{animation:none;opacity:0}}
+
 /* a pool that just arrived settles in, and its name and row glow for 2 s */
 .pool.fresh{animation:settle .3s ease-out}
 .pool.fresh .pname span{animation:glowText 2s ease-out}
@@ -189,7 +221,6 @@ dialog::backdrop{background:rgba(24,22,19,.45)}
 .help .foot{grid-column:1 / -1}
 
 /* pools */
-#pools{display:flex;flex-direction:column;gap:18px}
 .pool{min-width:0}
 .pname{all:unset;cursor:pointer;display:flex;align-items:baseline;gap:10px;font-size:13.5px;color:var(--ink-2);border-radius:4px}
 .pname small{font-size:11.5px;color:var(--muted)}
@@ -292,6 +323,8 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
   .grid{grid-template-columns:minmax(0,1fr);grid-template-rows:none;grid-template-areas:"score" "now" "pool" "disk" "time" "mem" "fold"}
   .said{font-size:17px}
   .slist{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
+  #pools{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .dock{bottom:8px;padding:6px 10px 8px;border-radius:12px}
   dialog{width:100vw;max-width:100vw;height:100dvh;max-height:100dvh;margin:0;border-radius:0;padding:16px}
   .panel{padding:14px 14px;border-radius:16px}
 }
@@ -306,7 +339,7 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
   <header class="top">
     <div class="name"><h1 id="title"></h1><span id="sub"></span></div>
     <div class="tools"><span class="hint" id="howHint" hidden>New here?</span><button type="button" id="howBtn" aria-haspopup="dialog">How it works</button>
-      <button type="button" class="soundpill" id="soundBtn" aria-pressed="false" title="A soft pop when the pools on screen change, and a tune when a race is won"><span class="sp"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2 6h3l4-3v10l-4-3H2z" fill="currentColor"/><path class="w" d="M11.5 5.5c.8.7 1.2 1.6 1.2 2.5s-.4 1.8-1.2 2.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path class="x" d="M11 6l3 4M14 6l-3 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></span>Sound <span class="st" id="soundState">off</span></button></div>
+      <button type="button" class="soundpill" id="soundBtn" aria-pressed="false" title="A soft pop when the pools on screen change (rising as one arrives, falling as one leaves), and a tune when a race is won"><span class="sp"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2 6h3l4-3v10l-4-3H2z" fill="currentColor"/><path class="w" d="M11.5 5.5c.8.7 1.2 1.6 1.2 2.5s-.4 1.8-1.2 2.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path class="x" d="M11 6l3 4M14 6l-3 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></span>Sound <span class="st" id="soundState">off</span></button></div>
     <div class="ctrl" role="group" aria-label="Playback">
       <button type="button" id="allBtn" aria-pressed="false">Show all pools</button>
       <div class="seg" role="group" aria-label="Mode" id="modeSeg" hidden>
@@ -348,7 +381,7 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
     </section>
 
     <section class="panel" id="tl" aria-label="Timeline: one cell per page request">
-      <div class="phead"><span>Every page request</span><span class="r" id="pos"></span></div>
+      <div class="phead"><span>Every page request</span><span class="note" id="tlNote" aria-live="polite"></span><span class="r" id="pos"></span></div>
       <div class="tlwrap" id="tlWrap">
         <div class="tlmarks" id="tlMarks"></div>
         <canvas id="tlCanvas" aria-hidden="true"></canvas>
@@ -371,6 +404,11 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
       <div class="cols" id="foldBody"></div>
     </details>
   </div>
+</div>
+
+<div class="dock" id="dock" hidden aria-label="Timeline, kept in view">
+  <div class="dhead2"><span id="dockName"></span><span class="note" id="dockNote"></span><span class="r" id="dockPos"></span></div>
+  <div class="dockwrap" id="dockWrap"><div class="dmarks" id="dockMarks"></div><canvas id="dockCanvas" aria-hidden="true"></canvas><span class="tlhere" id="dockHere" hidden></span></div>
 </div>
 
 <dialog id="how" aria-labelledby="howTitle">
@@ -708,7 +746,7 @@ function buildHelp() {
   item("kh", "hit");
   if (state.readsAhead) item("ka", "hit on a page read ahead");
   item("kx", "miss: read from disk");
-  item("km", "a moment worth a look");
+  item("km", "a highlight: a step worth a look");
 
   const help = $("help");
   help.replaceChildren();
@@ -726,8 +764,8 @@ function buildHelp() {
     "One cell per page request, for the open pool, grouped by query. Runs of misses are the pool waiting on the disk; a scan shows as a long stretch of them. Cells not reached yet are faded."
   );
   tip(
-    "Moments.",
-    "The diamonds mark moments worth a look in the pools on screen: an eviction paid back, a page written back, read-ahead paying off, a scan, and, with two or more pools drawn, where they disagree. Play pauses on each. Drawing or removing a pool changes them."
+    "Highlights.",
+    "The diamonds mark steps worth a look in the pools on screen: an eviction paid back, a page written back, read-ahead paying off, a scan, and, with two or more pools drawn, where they disagree. Play pauses on each. Drawing or removing a pool changes them: new ones glow briefly, and the timeline says how many came or went."
   );
   tip(
     "Moving.",
@@ -739,7 +777,7 @@ function buildHelp() {
   );
   tip(
     "Sound.",
-    "Off until you switch it on at the top. Then a soft pop confirms each change to the pools on screen (at most one every 2 seconds), and a short tune plays when a race is won."
+    "Off until you switch it on at the top. Then a soft pop confirms each change to the pools on screen, rising as a pool arrives and falling as one leaves (at most one every 2 seconds), and a short tune plays when a race is won."
   );
   tip(
     "Disk.",
@@ -754,7 +792,7 @@ function buildHelp() {
   );
   tip(
     "Race.",
-    "With two or more pools drawn, Race replays them at the pace of its time, on a squashed scale so hits stay visible next to slow reads. Optimal has the fewest misses, but not always the least time: it ignores what a miss costs."
+    "With two or more pools drawn, Race replays them, each at the pace of its own time, on a squashed scale so hits stay visible next to slow reads. Optimal has the fewest misses, but not always the least time: it ignores what a miss costs. Pools can be drawn or removed while it runs; one drawn mid-race starts where its own pace would have it by then."
   );
   if (state.readsAhead)
     tip(
@@ -843,8 +881,7 @@ function paintScore(at) {
 
 /* the pools drawn: the open one, or all of them */
 function buildLanes() {
-  if (view.mode === "race") stopRace();
-  else document.querySelectorAll(".fly").forEach(f => f.remove());
+  if (view.mode !== "race") document.querySelectorAll(".fly").forEach(f => f.remove());
   view.pools = allPools().filter(p => p === view.focus || view.drawn.has(p));
   const pools = $("pools");
   pools.replaceChildren();
@@ -875,19 +912,58 @@ function buildLanes() {
    are never blocked; the last one wins. */
 function changePools(mutate) {
   const before = new Set(view.pools),
-    oldFocus = view.focus;
+    oldFocus = view.focus,
+    oldKs = new Set(state.moments.map(m => m.k));
   mutate();
-  if (view.mode === "race") {
-    stopRace();
-    if (view.drawn.size === 0) setMode("step");
-  }
   buildLanes();
+  const arrived = view.pools.filter(p => !before.has(p)),
+    left = [...before].filter(p => !view.pools.includes(p));
+  if (view.mode === "race") {
+    if (view.pools.length < 2) setMode("step");
+    else {
+      for (const p of left) leaveRace(p);
+      for (const p of view.pools) if (!arrived.includes(p)) paintLane(p, view.race?.pos[p] ?? -1);
+      for (const p of arrived) joinRace(p);
+    }
+  }
   buildMoments();
   buildTimeline();
-  renderAll(view.at);
-  const arrived = view.pools.filter(p => !before.has(p) || (p === view.focus && p !== oldFocus));
-  highlight(arrived);
-  if (arrived.length || view.pools.length !== before.size) sound("pop");
+  if (view.mode === "race") renderChrome(view.at);
+  else renderAll(view.at);
+  noteHighlights(oldKs, arrived);
+  highlight(view.pools.filter(p => arrived.includes(p) || (p === view.focus && p !== oldFocus)));
+  if (arrived.length) sound("popIn");
+  else if (left.length) sound("popOut");
+}
+/* which diamonds a change added or dropped: new ones glow, dropped ones fade,
+   and the timeline says so for two seconds */
+let noteTimer = 0;
+function noteHighlights(oldKs, arrived) {
+  const ks = new Set(state.moments.map(m => m.k)),
+    added = [...ks].filter(k => !oldKs.has(k)),
+    dropped = [...oldKs].filter(k => !ks.has(k));
+  for (const box of [$("tlMarks"), $("dockMarks")])
+    for (const b of box.querySelectorAll(".mk")) if (added.includes(+b.dataset.k)) b.classList.add("fresh");
+  for (const k of dropped)
+    for (const box of [$("tlMarks"), $("dockMarks")]) {
+      const g = el("span", "mk gone");
+      g.style.left = `${(100 * (k + 0.5)) / state.accesses}%`;
+      g.append(el("i"));
+      box.append(g);
+      setTimeout(() => g.remove(), 700);
+    }
+  const n = x => `${x} highlight${x === 1 ? "" : "s"}`,
+    who = arrived.length === 1 ? ` with ${nameOf(arrived[0])}` : "",
+    text = [added.length ? `+${n(added.length)}${who}` : "", dropped.length ? `−${n(dropped.length)}` : ""]
+      .filter(Boolean)
+      .join(" · ");
+  clearTimeout(noteTimer);
+  for (const id of ["tlNote", "dockNote"]) $(id).textContent = text;
+  if (text)
+    noteTimer = setTimeout(() => {
+      for (const id of ["tlNote", "dockNote"]) $(id).textContent = "";
+      document.querySelectorAll(".mk.fresh").forEach(b => b.classList.remove("fresh"));
+    }, 2000);
 }
 /* Open a pool. One already drawn swaps places with the open one, so the
    pools on screen stay the same; any other replaces it. */
@@ -917,17 +993,15 @@ function toggleAll() {
 let freshTimer = 0;
 function highlight(pools) {
   clearTimeout(freshTimer);
-  document.querySelectorAll(".fresh").forEach(x => x.classList.remove("fresh"));
+  const arrivals = () => document.querySelectorAll(".pool.fresh, .srow.fresh");
+  arrivals().forEach(x => x.classList.remove("fresh"));
   if (!pools.length) return;
   void document.body.offsetWidth; // so the glow restarts on the latest change
   for (const p of pools) {
     state.lanes[p]?.lane.classList.add("fresh");
     state.rows[p]?.classList.add("fresh");
   }
-  freshTimer = setTimeout(
-    () => document.querySelectorAll(".fresh").forEach(x => x.classList.remove("fresh")),
-    2000
-  );
+  freshTimer = setTimeout(() => arrivals().forEach(x => x.classList.remove("fresh")), 2000);
 }
 
 /* page under the read head after each access, per pool: the last page read */
@@ -960,7 +1034,7 @@ function buildTimeline() {
       .map(x => x.t)
       .join(" · ");
     b.title = title;
-    b.setAttribute("aria-label", "Moment: " + title);
+    b.setAttribute("aria-label", "Highlight: " + title);
     b.append(el("i"));
     /* a label when it has room; past the middle it reads to the left */
     const before = i ? at(k) - at(ks[i - 1]) : Infinity,
@@ -974,6 +1048,15 @@ function buildTimeline() {
     });
     marks.append(b);
   });
+  const dm = $("dockMarks");
+  dm.replaceChildren();
+  for (const k of ks) {
+    const d = el("span", "mk");
+    d.dataset.k = k;
+    d.style.left = `${(100 * (k + 0.5)) / state.accesses}%`;
+    d.append(el("i"));
+    dm.append(d);
+  }
   state.data.queries.forEach((q, i) => {
     const [a, b] = q.accesses,
       px = (W * (b - a)) / state.accesses;
@@ -1002,9 +1085,11 @@ function buildTimeline() {
    miss. When there are more accesses than pixels, each pixel column holds
    several and is split by their share of hits. Accesses not reached yet fade. */
 function drawTimeline() {
-  const cv = $("tlCanvas"),
-    W = cv.clientWidth || 600,
-    H = 28,
+  drawStrip($("tlCanvas"), 28);
+  if (!$("dock").hidden) drawStrip($("dockCanvas"), 14);
+}
+function drawStrip(cv, H) {
+  const W = cv.clientWidth || 600,
     dpr = devicePixelRatio || 1;
   cv.width = Math.round(W * dpr);
   cv.height = Math.round(H * dpr);
@@ -1074,9 +1159,18 @@ function markTimeline(at) {
   for (const s of $("tlNames").querySelectorAll(".qs")) s.classList.toggle("cur", +s.dataset.q === q);
   for (const b of $("tlMarks").querySelectorAll(".mk"))
     b.classList.toggle("cur", view.mode === "step" && +b.dataset.k === at);
-  const here = $("tlHere");
-  here.hidden = at < 0 || view.mode === "race";
-  here.style.left = `${(100 * (at + 0.5)) / state.accesses}%`;
+  for (const b of $("dockMarks").querySelectorAll(".mk"))
+    b.classList.toggle("cur", view.mode === "step" && +b.dataset.k === at);
+  for (const id of ["tlHere", "dockHere"]) {
+    const here = $(id);
+    here.hidden = at < 0 || view.mode === "race";
+    here.style.left = `${(100 * (at + 0.5)) / state.accesses}%`;
+  }
+  $("dockName").textContent = `Every page request · ${nameOf(view.focus)}`;
+  $("dockPos").textContent =
+    at < 0 || view.mode === "race"
+      ? $("pos").textContent
+      : `${at + 1} of ${state.accesses} · ${state.byPolicy[view.focus].events[at].kind}`;
   drawTimeline();
   drawMem(at);
 }
@@ -1312,7 +1406,7 @@ function paintLane(p, at) {
   };
   if (p === view.focus) L.fig.replaceChildren(drawFocus(p, shown, at, touched));
   else {
-    L.fig.style.setProperty("--ts", "22px");
+    L.fig.style.setProperty("--ts", `${Math.max(9, Math.min(20, Math.floor(200 / state.frames)))}px`);
     L.fig.classList.add("small");
     L.fig.replaceChildren(row(shown.frames, at, touched >= 0 ? shown.frames[touched] : null));
   }
@@ -1523,7 +1617,7 @@ function renderMoment(at) {
       el("span", "tag", "◆ " + here.map(m => m.t).join(" · ")),
       el("span", "d", here.map(m => m.d).join(" "))
     );
-  else box.append(el("span", "d", at < 0 && next ? "Press Play, or jump to the first moment." : ""));
+  else box.append(el("span", "d", at < 0 && next ? "Press Play, or jump to the first highlight." : ""));
   if (next) {
     const b = el("button", "", `next: ${next.t.toLowerCase()} →`);
     b.type = "button";
@@ -1890,12 +1984,13 @@ function note(c, f, at, dur, type, vol, to) {
   o.stop(t0 + dur + 0.03);
 }
 const TONES = {
-  pop: c => note(c, 740, 0, 0.12, "sine", 0.1, 620),
+  popIn: c => note(c, 620, 0, 0.12, "sine", 0.1, 740),
+  popOut: c => note(c, 740, 0, 0.12, "sine", 0.1, 560),
   win: c => [523, 659, 784, 1047].forEach((f, i) => note(c, f, i * 0.09, i === 3 ? 0.5 : 0.22, "sine", 0.09))
 };
 function sound(kind) {
   if (!view.sound) return;
-  if (kind === "pop") {
+  if (kind.startsWith("pop")) {
     const now = performance.now();
     if (now - lastPop < 2000) return;
     lastPop = now;
@@ -1920,7 +2015,7 @@ function setSound(on, test) {
   } catch {
     /* remembered for this visit only */
   }
-  if (on && test) sound("pop");
+  if (on && test) sound("popIn");
 }
 $("soundBtn").addEventListener("click", () => setSound(!view.sound, true));
 try {
@@ -2078,35 +2173,87 @@ function stopRace() {
   }
   document.querySelectorAll(".fly").forEach(f => f.remove());
 }
+/* A race: each pool runs at its own pace, a short pause per step that grows
+   with what the step cost. Pools can join and leave while it runs: one that
+   joins starts at the step its own pace would have reached by now, so the
+   race stays fair. Places go by total race time. */
+const paceOf = (p, i) => 30 + 60 * Math.log10(1 + costOf(state.byPolicy[p].events[i]) / state.profile.hit_ms);
+const raceTime = p => state.byPolicy[p].events.reduce((t, _, i) => t + paceOf(p, i), 0);
 async function race() {
   stopRace();
-  const id = view.raceId;
+  view.race = {id: view.raceId, t: {}, pos: {}, running: new Set(), done: new Set()};
   view.playing = true;
   $("play").textContent = "Stop";
   view.at = -1;
   clearPlaces();
   renderAll(-1);
-  let place = 0;
-  await Promise.all(
-    view.pools.map(async p => {
-      for (let i = 0; i < state.accesses; i++) {
-        if (id !== view.raceId) return;
-        await animateStep(p, i, id);
-        if (id !== view.raceId) return;
-        await sleep(30 + 60 * Math.log10(1 + costOf(state.byPolicy[p].events[i]) / state.profile.hit_ms));
-      }
-      if (id !== view.raceId) return;
-      place++;
-      if (place === 1) sound("win");
-      const pl = state.rows[p].querySelector(".place");
-      pl.textContent = ["1st", "2nd", "3rd"][place - 1] || place + "th";
-      pl.classList.add("on");
-    })
-  );
-  if (id === view.raceId) {
+  await Promise.all(view.pools.map(p => runRacer(p, 0, 0)));
+}
+async function runRacer(p, from, t) {
+  const R = view.race,
+    id = R.id;
+  R.running.add(p);
+  R.t[p] = t;
+  for (let i = from; i < state.accesses; i++) {
+    if (id !== view.raceId || !R.running.has(p)) return;
+    R.pos[p] = i;
+    await animateStep(p, i, id);
+    if (id !== view.raceId || !R.running.has(p)) return;
+    const pace = paceOf(p, i);
+    await sleep(pace);
+    R.t[p] += pace;
+  }
+  if (id !== view.raceId || !R.running.has(p)) return;
+  R.running.delete(p);
+  R.done.add(p);
+  if (R.done.size === 1) sound("win");
+  placeRacers();
+  if (!R.running.size) {
     view.playing = false;
     $("play").textContent = "Race again";
   }
+}
+/* finished pools ranked by their whole race time */
+function placeRacers() {
+  clearPlaces();
+  const R = view.race;
+  if (!R) return;
+  [...R.done]
+    .sort((a, b) => raceTime(a) - raceTime(b))
+    .forEach((p, i) => {
+      const pl = state.rows[p].querySelector(".place");
+      pl.textContent = ["1st", "2nd", "3rd"][i] || i + 1 + "th";
+      pl.classList.add("on");
+    });
+}
+/* a pool drawn while the race runs joins where its own pace puts it now */
+function joinRace(p) {
+  const R = view.race;
+  if (!view.playing || !R || R.id !== view.raceId || !R.running.size) {
+    paintLane(p, -1);
+    return;
+  }
+  const clock = Math.max(...[...R.running].map(q => R.t[q]));
+  let i = 0,
+    t = 0;
+  while (i < state.accesses && t + paceOf(p, i) <= clock) t += paceOf(p, i++);
+  if (i >= state.accesses) {
+    R.pos[p] = state.accesses - 1;
+    paintLane(p, R.pos[p]);
+    R.done.add(p);
+    placeRacers();
+    return;
+  }
+  paintLane(p, i - 1);
+  runRacer(p, i, t);
+}
+function leaveRace(p) {
+  const R = view.race;
+  if (!R) return;
+  R.running.delete(p);
+  R.done.delete(p);
+  delete R.pos[p];
+  placeRacers();
 }
 $("play").addEventListener("click", () =>
   view.mode === "race" ? (view.playing ? stopRace() : race()) : view.playing ? stopPlaying() : play()
@@ -2178,6 +2325,38 @@ for (const type of ["pointerup", "pointercancel"])
   $("tlWrap").addEventListener(type, () => {
     dragging = false;
   });
+const dragOn = (wrap, canvas) => {
+  let on = false;
+  const to = ev => {
+    const r = canvas.getBoundingClientRect();
+    jump(Math.floor(((ev.clientX - r.left) / r.width) * state.accesses));
+  };
+  wrap.addEventListener("pointerdown", ev => {
+    if (ev.button) return;
+    toStep();
+    on = true;
+    wrap.setPointerCapture(ev.pointerId);
+    to(ev);
+  });
+  wrap.addEventListener("pointermove", ev => {
+    if (on) to(ev);
+  });
+  for (const type of ["pointerup", "pointercancel"])
+    wrap.addEventListener(type, () => {
+      on = false;
+    });
+};
+dragOn($("dockWrap"), $("dockCanvas"));
+/* docked unless the full strip is wholly in view */
+new IntersectionObserver(
+  ([entry]) => {
+    const show = !!state.data && entry.intersectionRatio < 1;
+    if (show === !$("dock").hidden) return;
+    $("dock").hidden = !show;
+    if (show) drawStrip($("dockCanvas"), 14);
+  },
+  {threshold: [0, 1]}
+).observe($("tlCanvas"));
 let resizeTimer = 0;
 addEventListener("resize", () => {
   clearTimeout(resizeTimer);
@@ -2238,6 +2417,8 @@ window.bpsim = Object.freeze({
   heard: () => [...view.heard],
   moments: () => state.moments.map(m => ({k: m.k, t: m.t, d: m.d})),
   pools: () => [...view.pools],
+  racePos: policy => view.race?.pos[policy] ?? null,
+  docked: () => !$("dock").hidden,
   bars: policy => state.bars[policy].length,
   jump
 });

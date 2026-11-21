@@ -313,16 +313,21 @@ def check_sound(page: Page) -> list[str]:
     if page.evaluate("bpsim.heard()"):
         problems.append("a sound played with sound off")
     page.click("#soundBtn")
-    if page.evaluate("bpsim.heard()") != ["pop"]:
+    if page.evaluate("bpsim.heard()") != ["popIn"]:
         problems.append(f"switching sound on gave {page.evaluate('bpsim.heard()')}, not the pop")
     page.wait_for_timeout(2100)
     for p in (a, b, a):  # three changes in quick succession
         page.click(f'#slist [data-p="{p}"] .sdraw')
-    if page.evaluate("bpsim.heard()") != ["pop", "pop"]:
+    if page.evaluate("bpsim.heard()") != ["popIn", "popIn"]:
         problems.append(
             f"three quick changes gave {page.evaluate('bpsim.heard()')[1:]}, not one pop"
         )
-    page.click(f'#slist [data-p="{b}"] .sdraw')  # back to the open pool alone
+    page.wait_for_timeout(2100)
+    page.click(f'#slist [data-p="{b}"] .sdraw')  # removing b leaves the open pool alone
+    if page.evaluate("bpsim.heard()")[-1:] != ["popOut"]:
+        problems.append(
+            f"removing a pool gave {page.evaluate('bpsim.heard()')[-1:]}, not the falling pop"
+        )
     page.wait_for_timeout(2100)
     count = len(page.evaluate("bpsim.heard()"))
     page.focus("#play")
@@ -403,6 +408,144 @@ def check_changes(page: Page) -> list[str]:
     return problems
 
 
+def check_race_changes(page: Page) -> list[str]:
+    """A race keeps running when the open pool is swapped, or a pool is drawn
+    or removed; one drawn mid-race joins near the others, not at the start;
+    places go to the pools still in it; under two pools it stops."""
+    problems = []
+    rows = page.eval_on_selector_all("#slist .srow:not(.on)", "rs => rs.map(r => r.dataset.p)")
+    a, b, c = rows[0], rows[1], rows[2]
+    page.click(f'#slist [data-p="{a}"] .sdraw')
+    page.click(f'#slist [data-p="{b}"] .sdraw')
+    page.click("#mRace")
+    page.select_option("#speed", index=1)
+    page.click("#play")
+    page.wait_for_timeout(1500)
+    page.click(f'#slist [data-p="{c}"] .sdraw')
+    others = [
+        page.evaluate("p => bpsim.racePos(p)", p) for p in page.evaluate("bpsim.pools()") if p != c
+    ]
+    joined = page.evaluate("p => bpsim.racePos(p)", c)
+    if not page.evaluate("bpsim.playing()"):
+        problems.append("drawing a pool stopped the race")
+    elif joined is None or joined < min(others) / 2:
+        problems.append(f"{c} joined the race at {joined}, the others were at {others}")
+    page.click(f'#slist [data-p="{b}"] .sdraw')
+    if not page.evaluate("bpsim.playing()"):
+        problems.append("removing a pool stopped the race")
+    page.click(f'#slist [data-p="{a}"] .sopen')
+    if not page.evaluate("bpsim.playing()"):
+        problems.append("opening a drawn pool stopped the race")
+    page.select_option("#speed", index=2)
+    page.wait_for_function("() => !bpsim.playing()", timeout=120_000)
+    racing = sorted(page.evaluate("bpsim.pools()"))
+    placed = sorted(
+        page.eval_on_selector_all(
+            "#slist .place.on", "ps => ps.map(p => p.closest('.srow').dataset.p)"
+        )
+    )
+    if placed != racing:
+        problems.append(f"places went to {placed}, the pools in the race were {racing}")
+    gone = next(p for p in racing if p != page.evaluate("bpsim.focus()"))
+    page.click(f'#slist [data-p="{gone}"] .sdraw')  # a finished pool leaves
+    placed = sorted(
+        page.eval_on_selector_all(
+            "#slist .place.on", "ps => ps.map(p => p.closest('.srow').dataset.p)"
+        )
+    )
+    if placed != sorted(p for p in racing if p != gone):
+        problems.append(f"after {gone} left, places show {placed}")
+    for p in page.evaluate("bpsim.pools()"):
+        if p != page.evaluate("bpsim.focus()"):
+            page.click(f'#slist [data-p="{p}"] .sdraw')
+    if page.get_attribute("#mStep", "aria-pressed") != "true":
+        problems.append("down to one pool, the race did not end")
+    return problems
+
+
+def check_highlights(page: Page) -> list[str]:
+    """Drawing a pool says how many highlights came, and the new diamonds
+    glow; both clear after 2 seconds; removing it says how many went."""
+    problems = []
+    if page.evaluate("bpsim.pools().length") != 1:
+        return ["highlight check needs the open pool alone"]
+    candidates = page.eval_on_selector_all(
+        "#slist .srow:not(.on)", "rs => rs.map(r => r.dataset.p).filter(p => p !== 'opt')"
+    )
+    for p in candidates:
+        before = {m["k"] for m in page.evaluate("bpsim.moments()")}
+        page.click(f'#slist [data-p="{p}"] .sdraw')
+        after = {m["k"] for m in page.evaluate("bpsim.moments()")}
+        added, dropped = after - before, before - after
+        note = page.inner_text("#tlNote")
+        name = page.inner_text(f'#slist [data-p="{p}"] .n')
+        if added and not note.startswith(f"+{len(added)} highlight"):
+            problems.append(f"drawing {p} added {len(added)} highlights; the note says {note!r}")
+        if added and f"with {name}" not in note:
+            problems.append(f"the note {note!r} does not name {name}")
+        if dropped and f"−{len(dropped)} highlight" not in note:
+            problems.append(
+                f"drawing {p} dropped {len(dropped)} highlights; the note says {note!r}"
+            )
+        glowing = {
+            int(k)
+            for k in page.eval_on_selector_all(
+                "#tlMarks .mk.fresh", "ms => ms.map(m => m.dataset.k)"
+            )
+        }
+        if glowing != added:
+            problems.append(
+                f"drawing {p}: diamonds glowing {sorted(glowing)}, new ones {sorted(added)}"
+            )
+        page.wait_for_timeout(2200)
+        if page.inner_text("#tlNote") or page.query_selector_all(".mk.fresh"):
+            problems.append("the highlight note or glow outlasted 2 seconds")
+        page.click(f'#slist [data-p="{p}"] .sdraw')
+        if added and f"−{len(added)} highlight" not in page.inner_text("#tlNote"):
+            problems.append(f"removing {p} did not say {len(added)} highlights went")
+        if added:
+            return problems
+    return problems + ["no pool added highlights to check"]
+
+
+def check_dock(page: Page) -> list[str]:
+    """The slim timeline docks while the full strip is out of view, goes
+    when it is in view, and dragging on it moves the run."""
+    problems = []
+    size = page.viewport_size
+    page.set_viewport_size({"width": size["width"], "height": 600})  # strip below the fold
+    page.evaluate("() => window.scrollTo(0, 0)")
+    page.click("#allBtn")
+    page.wait_for_timeout(300)
+    tops = page.eval_on_selector_all(
+        "#pools .pool:not(.focus)", "ps => ps.map(p => Math.round(p.getBoundingClientRect().top))"
+    )
+    if len(tops) > 1 and len(set(tops)) == len(tops):
+        problems.append("the drawn pools are stacked one per row, not side by side")
+    full = page.evaluate("document.getElementById('tlCanvas').getBoundingClientRect().bottom")
+    if full > page.viewport_size["height"] and not page.evaluate("bpsim.docked()"):
+        problems.append("the strip is out of view but the timeline did not dock")
+    if page.evaluate("bpsim.docked()"):
+        box = page.query_selector("#dockCanvas").bounding_box()
+        page.mouse.move(box["x"] + box["width"] * 0.25, box["y"] + 7)
+        page.mouse.down()
+        page.mouse.move(box["x"] + box["width"] * 0.5, box["y"] + 7)
+        page.mouse.up()
+        want = int(0.5 * page.evaluate("bpsim.accesses()"))
+        if abs(page.evaluate("bpsim.at()") - want) > 1:
+            problems.append(
+                f"dragging on the docked timeline landed on {page.evaluate('bpsim.at()')}"
+            )
+    page.locator("#tlCanvas").scroll_into_view_if_needed()
+    page.wait_for_timeout(300)
+    if page.evaluate("bpsim.docked()"):
+        problems.append("the timeline stayed docked with the full strip in view")
+    page.click("#allBtn")
+    page.evaluate("() => window.scrollTo(0, 0)")
+    page.set_viewport_size(size)
+    return problems
+
+
 def check_motion(page: Page, reduced: bool) -> list[str]:
     """Pages fly in only on a single step into the open pool; never with
     reduce motion; never while playing."""
@@ -460,6 +603,9 @@ def main() -> int:
                     found += check_mem(page, run)
                     found += check_sound(page)
                     found += check_changes(page)
+                    found += check_highlights(page)
+                    found += check_race_changes(page)
+                    found += check_dock(page)
                     found += check_drawn(page)
                     found += check_motion(page, reduced=False)
                     found += check_interaction(page, viewer.parent / "run.json")
