@@ -243,6 +243,166 @@ def check_drawn(page: Page) -> list[str]:
     return problems
 
 
+def residency(events: list[dict], frames: int) -> list[tuple[int, int, int, int]]:
+    """(frame, page, first, last) for each stay of a page in a frame, from the
+    run file: what the memory chart should draw."""
+    bars, open_ = [], [None] * frames
+    for i, ev in enumerate(events):
+        for f in range(frames):
+            page = ev["frames"][f]["page"]
+            if open_[f] and open_[f][1] != page:
+                bars.append(tuple(open_[f]))
+                open_[f] = None
+            if page is not None and not open_[f]:
+                open_[f] = [f, page, i, i]
+            if open_[f]:
+                open_[f][3] = i
+    return bars + [tuple(o) for o in open_ if o]
+
+
+def check_mem(page: Page, run: dict) -> list[str]:
+    """Memory over time: closed at first; bars match the run file; the open
+    pool's band comes first; pointing names the page; dragging moves."""
+    problems = []
+    if page.evaluate("document.getElementById('mem').open"):
+        problems.append("Memory over time is open before being asked for")
+    page.click("#mem summary")
+    page.wait_for_function("() => document.getElementById('memCanvas').clientHeight > 0")
+    focus = page.evaluate("bpsim.focus()")
+    by = {r["policy"]: r for r in run["runs"]}
+    for p, r in by.items():
+        want = len(residency(r["events"], run["frames"]))
+        got = page.evaluate("p => bpsim.bars(p)", p)
+        if got != want:
+            problems.append(f"memory chart has {got} bars for {p}, the run file gives {want}")
+    labels = page.eval_on_selector_all(".memlabel", "ls => ls.map(l => l.textContent)")
+    if len(labels) != 1:
+        problems.append(f"memory chart labels {labels} with only the open pool drawn")
+    # the longest stay in the open pool, pointed at in its middle
+    frames, n = run["frames"], len(run["runs"][0]["events"])
+    f, pg, s, e = max(residency(by[focus]["events"], frames), key=lambda b: b[3] - b[2])
+    page.locator("#memCanvas").scroll_into_view_if_needed()
+    box = page.query_selector("#memCanvas").bounding_box()
+    row_h = max(30, min(120, frames * 12)) / frames
+    page.mouse.move(
+        box["x"] + box["width"] * (s + e + 1) / 2 / n, box["y"] + 18 + (f + 0.5) * row_h
+    )
+    if f"p{pg} " not in page.inner_text("#memSay"):
+        problems.append(f"pointing at p{pg}'s bar reads {page.inner_text('#memSay')!r}")
+    page.mouse.move(box["x"] + box["width"] * 0.3, box["y"] + 30)
+    page.mouse.down()
+    page.mouse.move(box["x"] + box["width"] * 0.4, box["y"] + 30)
+    page.mouse.up()
+    if abs(page.evaluate("bpsim.at()") - int(0.4 * n)) > 1:
+        problems.append(f"dragging on the memory chart landed on {page.evaluate('bpsim.at()')}")
+    page.click("#mem summary")
+    return problems
+
+
+def check_sound(page: Page) -> list[str]:
+    """Off and silent by default; on gives the pop as a test; a change of
+    pools pops once, however many changes come within 2 seconds; stepping
+    through moments is silent; a race's end plays the win; the choice is
+    remembered. (Headless browsers can't hear: the page records what it asked
+    for.)"""
+    problems = []
+    rows = page.eval_on_selector_all("#slist .srow:not(.on)", "rs => rs.map(r => r.dataset.p)")
+    a, b = rows[0], rows[1]
+    page.click(f'#slist [data-p="{a}"] .sdraw')
+    page.click(f'#slist [data-p="{a}"] .sdraw')
+    if page.evaluate("bpsim.heard()"):
+        problems.append("a sound played with sound off")
+    page.click("#soundBtn")
+    if page.evaluate("bpsim.heard()") != ["pop"]:
+        problems.append(f"switching sound on gave {page.evaluate('bpsim.heard()')}, not the pop")
+    page.wait_for_timeout(2100)
+    for p in (a, b, a):  # three changes in quick succession
+        page.click(f'#slist [data-p="{p}"] .sdraw')
+    if page.evaluate("bpsim.heard()") != ["pop", "pop"]:
+        problems.append(
+            f"three quick changes gave {page.evaluate('bpsim.heard()')[1:]}, not one pop"
+        )
+    page.click(f'#slist [data-p="{b}"] .sdraw')  # back to the open pool alone
+    page.wait_for_timeout(2100)
+    count = len(page.evaluate("bpsim.heard()"))
+    page.focus("#play")
+    page.evaluate("() => bpsim.jump(-1)")
+    for _ in range(page.evaluate("bpsim.accesses()")):
+        page.keyboard.press("ArrowRight")
+    if len(page.evaluate("bpsim.heard()")) != count:
+        problems.append("stepping through the run made a sound")
+    page.click(f'#slist [data-p="{a}"] .sdraw')
+    page.click("#mRace")
+    page.select_option("#speed", index=2)
+    page.click("#play")
+    page.wait_for_function("() => !bpsim.playing()", timeout=60_000)
+    if page.evaluate("bpsim.heard()")[-1:] != ["win"]:
+        problems.append(
+            f"a finished race gave {page.evaluate('bpsim.heard()')[count:]}, not the win"
+        )
+    page.click("#mStep")
+    page.click(f'#slist [data-p="{a}"] .sdraw')
+    page.reload()
+    page.wait_for_selector(".pool")
+    if page.get_attribute("#soundBtn", "aria-pressed") != "true":
+        problems.append("sound on was not remembered")
+    page.click("#soundBtn")
+    return problems
+
+
+def check_changes(page: Page) -> list[str]:
+    """Moments follow the pools on screen; Play keeps going through a change;
+    a drawn pool's name swaps it to large; what just arrived glows, then not."""
+    problems = []
+
+    def strays() -> list[str]:
+        shown = set(page.evaluate("bpsim.pools()"))
+        off = [
+            r.inner_text().splitlines()[0]
+            for r in page.query_selector_all("#slist .srow")
+            if r.get_attribute("data-p") not in shown and r.get_attribute("data-p") != "opt"
+        ]
+        text = " ".join(m["d"] for m in page.evaluate("bpsim.moments()"))
+        return [n for n in off if n in text]  # fmt: skip
+
+    if strays():
+        problems.append(f"with one pool open, moments name {strays()}")
+    other = page.eval_on_selector_all(
+        "#slist .srow:not(.on)", "rs => rs.map(r => r.dataset.p).filter(p => p !== 'opt')"
+    )[0]
+    before = page.evaluate("bpsim.moments()")
+    page.evaluate("() => bpsim.jump(-1)")
+    page.select_option("#speed", index=2)
+    page.click("#play")
+    page.wait_for_timeout(600)
+    page.click(f'#slist [data-p="{other}"] .sdraw')
+    at = page.evaluate("bpsim.at()")
+    if not page.evaluate("bpsim.playing()"):
+        problems.append("drawing a pool stopped Play")
+    page.wait_for_timeout(900)
+    if page.evaluate("bpsim.at()") <= at:
+        problems.append("Play did not move on after a pool was drawn")
+    page.click("#play")
+    if page.evaluate("bpsim.moments()") == before:
+        problems.append(f"drawing {other} did not change the moments")
+    if strays():
+        problems.append(f"with {other} drawn, moments name {strays()}")
+    if "fresh" not in (page.get_attribute(f'#slist [data-p="{other}"]', "class") or ""):
+        problems.append(f"{other} did not glow on arriving")
+    page.wait_for_timeout(2200)
+    if page.query_selector_all(".fresh"):
+        problems.append("the glow outlasted 2 seconds")
+    opened = page.evaluate("bpsim.focus()")
+    page.click(f'#slist [data-p="{other}"] .sopen')
+    if page.evaluate("bpsim.focus()") != other or sorted(page.evaluate("bpsim.pools()")) != sorted(
+        [opened, other]
+    ):
+        problems.append("opening a drawn pool did not swap it with the open one")
+    page.click(f'#slist [data-p="{opened}"] .sopen')
+    page.click(f'#slist [data-p="{other}"] .sdraw')
+    return problems
+
+
 def check_motion(page: Page, reduced: bool) -> list[str]:
     """Pages fly in only on a single step into the open pool; never with
     reduce motion; never while playing."""
@@ -297,6 +457,9 @@ def main() -> int:
                 if i == 0:
                     found += check_how(page)
                 if width == 1280 and i == 0:
+                    found += check_mem(page, run)
+                    found += check_sound(page)
+                    found += check_changes(page)
                     found += check_drawn(page)
                     found += check_motion(page, reduced=False)
                     found += check_interaction(page, viewer.parent / "run.json")

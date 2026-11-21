@@ -78,10 +78,40 @@ dialog::backdrop{background:rgba(24,22,19,.45)}
 .walknav .tally{flex:1;font-size:12px;color:var(--muted);text-align:right;margin-right:6px}
 .dh{font-family:var(--f-display);font-weight:600;font-size:16px;margin:22px 0 0}
 
+/* a pool that just arrived settles in, and its name and row glow for 2 s */
+.pool.fresh{animation:settle .3s ease-out}
+.pool.fresh .pname span{animation:glowText 2s ease-out}
+.srow.fresh{animation:glowRow 2s ease-out}
+@keyframes settle{from{opacity:0;transform:translateY(4px)}}
+@keyframes glowText{from{color:var(--accent)}}
+@keyframes glowRow{from{background:color-mix(in srgb,var(--accent) 20%,transparent)}}
+@media (prefers-reduced-motion:reduce){.pool.fresh{animation:none}}
+
+/* sound switch: a clear pill, accent when on */
+.soundpill{display:inline-flex;align-items:center;gap:7px;padding:0 13px 0 4px}
+.soundpill .sp{width:24px;height:24px;border-radius:50%;background:var(--bg);display:flex;align-items:center;justify-content:center}
+.soundpill .st{color:var(--muted)}
+.soundpill .w{display:none}
+#soundBtn[aria-pressed="true"],#soundBtn[aria-pressed="true"]:hover{background:color-mix(in srgb,var(--accent) 15%,var(--bg));color:var(--accent)}
+#soundBtn[aria-pressed="true"] .sp{background:var(--accent);color:var(--bg)}
+#soundBtn[aria-pressed="true"] .st{color:var(--accent)}
+#soundBtn[aria-pressed="true"] .w{display:inline}
+#soundBtn[aria-pressed="true"] .x{display:none}
+
+/* memory over time: folded under the timeline */
+#mem summary{cursor:pointer;font-size:13px;color:var(--ink-2)}
+#mem[open] summary{margin-bottom:10px}
+.memnote{margin:0 0 12px;font-size:12px;color:var(--muted);max-width:72ch}
+.memwrap{position:relative;touch-action:pan-y;cursor:ew-resize;user-select:none}
+#memCanvas{display:block;width:100%}
+.memwrap .tlhere{top:0;bottom:0}
+.memlabel{position:absolute;left:0;font-size:11.5px;color:var(--ink-2);pointer-events:none}
+.memsay{margin-top:10px;font-size:12px;color:var(--muted);min-height:18px}
+
 /* layout: every part's place is set here, and only here */
 .grid{display:grid;grid-template-columns:minmax(0,236px) minmax(0,1fr);grid-template-rows:auto 1fr;gap:16px;align-items:start;
-  grid-template-areas:"score now" "score pool" "disk disk" "time time" "fold fold"}
-#score{grid-area:score}#now{grid-area:now}#pools{grid-area:pool}#disk{grid-area:disk}#tl{grid-area:time}#fold{grid-area:fold}
+  grid-template-areas:"score now" "score pool" "disk disk" "time time" "mem mem" "fold fold"}
+#score{grid-area:score}#now{grid-area:now}#pools{grid-area:pool}#disk{grid-area:disk}#tl{grid-area:time}#mem{grid-area:mem}#fold{grid-area:fold}
 .panel{background:var(--panel);border-radius:18px;padding:16px 18px;min-width:0}
 .phead{display:flex;align-items:baseline;gap:10px;margin-bottom:12px;font-size:12px;color:var(--muted)}
 .phead .r{margin-left:auto;text-align:right;font-variant-numeric:tabular-nums}
@@ -259,7 +289,7 @@ summary b{font-weight:500;color:var(--ink)}
 body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-offset:6px}
 
 @media (max-width:720px){
-  .grid{grid-template-columns:minmax(0,1fr);grid-template-rows:none;grid-template-areas:"score" "now" "pool" "disk" "time" "fold"}
+  .grid{grid-template-columns:minmax(0,1fr);grid-template-rows:none;grid-template-areas:"score" "now" "pool" "disk" "time" "mem" "fold"}
   .said{font-size:17px}
   .slist{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
   dialog{width:100vw;max-width:100vw;height:100dvh;max-height:100dvh;margin:0;border-radius:0;padding:16px}
@@ -275,7 +305,8 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
 <div class="app" id="app" hidden>
   <header class="top">
     <div class="name"><h1 id="title"></h1><span id="sub"></span></div>
-    <div class="tools"><span class="hint" id="howHint" hidden>New here?</span><button type="button" id="howBtn" aria-haspopup="dialog">How it works</button></div>
+    <div class="tools"><span class="hint" id="howHint" hidden>New here?</span><button type="button" id="howBtn" aria-haspopup="dialog">How it works</button>
+      <button type="button" class="soundpill" id="soundBtn" aria-pressed="false" title="A soft pop when the pools on screen change, and a tune when a race is won"><span class="sp"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2 6h3l4-3v10l-4-3H2z" fill="currentColor"/><path class="w" d="M11.5 5.5c.8.7 1.2 1.6 1.2 2.5s-.4 1.8-1.2 2.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path class="x" d="M11 6l3 4M14 6l-3 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></span>Sound <span class="st" id="soundState">off</span></button></div>
     <div class="ctrl" role="group" aria-label="Playback">
       <button type="button" id="allBtn" aria-pressed="false">Show all pools</button>
       <div class="seg" role="group" aria-label="Mode" id="modeSeg" hidden>
@@ -327,6 +358,13 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
       <div class="keyrow"><div class="key" id="key"></div></div>
       <label class="sr" for="scrub">Page request</label><input class="sr" type="range" id="scrub" min="-1" value="-1">
     </section>
+
+    <details class="panel" id="mem">
+      <summary>Memory over time</summary>
+      <p class="memnote">For each pool drawn, one lane per frame. A bar is a page staying in that frame, coloured by its table; dots are hits on it. Long bars mean the pool kept the page; many short bars mean it keeps throwing pages out.</p>
+      <div class="memwrap" id="memWrap"><canvas id="memCanvas" aria-hidden="true"></canvas><span class="tlhere" id="memHere" hidden></span></div>
+      <div class="memsay" id="memSay">Point at a bar to see the page; drag to move through the run.</div>
+    </details>
 
     <details id="fold">
       <summary id="foldSum"></summary>
@@ -438,6 +476,8 @@ const view = {
   focus: null, // the pool opened in its own shape; the timeline and disk follow it
   drawn: new Set(), // pools drawn beside the open one, toggled in the score column
   walk: 0, // the walkthrough's step
+  sound: false, // sounds on moments; off until switched on, then remembered
+  heard: [], // sounds asked for, for the automated checks
   mode: "step", // "step" or "race"
   at: -1, // the access shown; -1 before the first
   playing: false,
@@ -524,6 +564,7 @@ function prepare(data) {
     byPolicy: {},
     head: {},
     shape: {},
+    bars: {},
     readsAhead: data.runs.some(r => r.summary.read_ahead_cap > 0),
     pages: {},
     objectColor: {sqlite_schema: "var(--o-schema)"}
@@ -532,6 +573,7 @@ function prepare(data) {
     out.byPolicy[r.policy] = r;
     out.head[r.policy] = heads(r.events);
     out.shape[r.policy] = r.events[0].frames[r.events[0].frame].state.kind;
+    out.bars[r.policy] = residency(r.events, data.frames);
   }
   for (const p of data.pages) out.pages[p.page] = p;
   data.objects.forEach((o, i) => {
@@ -684,8 +726,20 @@ function buildHelp() {
     "One cell per page request, for the open pool, grouped by query. Runs of misses are the pool waiting on the disk; a scan shows as a long stretch of them. Cells not reached yet are faded."
   );
   tip(
+    "Moments.",
+    "The diamonds mark moments worth a look in the pools on screen: an eviction paid back, a page written back, read-ahead paying off, a scan, and, with two or more pools drawn, where they disagree. Play pauses on each. Drawing or removing a pool changes them."
+  );
+  tip(
     "Moving.",
     "Drag on the timeline, or use the left and right arrow keys, to move through the requests. Click a query name or a diamond to jump."
+  );
+  tip(
+    "Memory over time.",
+    "Folded under the timeline: for each pool drawn, one lane per frame and one bar per page that stayed there, with dots for its hits. Point at a bar to name the page."
+  );
+  tip(
+    "Sound.",
+    "Off until you switch it on at the top. Then a soft pop confirms each change to the pools on screen (at most one every 2 seconds), and a short tune plays when a race is won."
   );
   tip(
     "Disk.",
@@ -728,7 +782,7 @@ function buildHelp() {
 
 /* ---------- score column, pools on screen, timeline ---------- */
 const allPools = () => state.data.runs.map(r => r.policy);
-/* the pools moments compare: the real-world ones, unless only textbook ones ran */
+/* the pool opened first: a real-world one, unless only textbook ones ran */
 const comparePools = () => {
   const real = allPools().filter(p => !INFO[p]?.textbook);
   return real.length ? real : allPools();
@@ -789,7 +843,8 @@ function paintScore(at) {
 
 /* the pools drawn: the open one, or all of them */
 function buildLanes() {
-  stopRace();
+  if (view.mode === "race") stopRace();
+  else document.querySelectorAll(".fly").forEach(f => f.remove());
   view.pools = allPools().filter(p => p === view.focus || view.drawn.has(p));
   const pools = $("pools");
   pools.replaceChildren();
@@ -812,29 +867,67 @@ function buildLanes() {
   $("allBtn").setAttribute("aria-pressed", view.pools.length === allPools().length);
   /* Race needs two pools drawn */
   $("modeSeg").hidden = view.pools.length < 2;
+  drawMem(view.at);
 }
+/* Every change to the pools on screen goes through here: the moments follow
+   the pools shown, Play keeps going, the pools that just arrived settle in
+   and glow for two seconds, and a soft pop confirms it (once per 2 s). Clicks
+   are never blocked; the last one wins. */
+function changePools(mutate) {
+  const before = new Set(view.pools),
+    oldFocus = view.focus;
+  mutate();
+  if (view.mode === "race") {
+    stopRace();
+    if (view.drawn.size === 0) setMode("step");
+  }
+  buildLanes();
+  buildMoments();
+  buildTimeline();
+  renderAll(view.at);
+  const arrived = view.pools.filter(p => !before.has(p) || (p === view.focus && p !== oldFocus));
+  highlight(arrived);
+  if (arrived.length || view.pools.length !== before.size) sound("pop");
+}
+/* Open a pool. One already drawn swaps places with the open one, so the
+   pools on screen stay the same; any other replaces it. */
 function setFocus(p) {
   if (p === view.focus) return;
-  view.focus = p;
-  buildLanes();
-  drawTimeline();
-  renderAll(view.at);
-}
-function redrawPools() {
-  if (view.mode === "race" && view.drawn.size === 0) setMode("step");
-  buildLanes();
-  renderAll(view.at);
+  changePools(() => {
+    if (view.drawn.has(p)) {
+      view.drawn.delete(p);
+      view.drawn.add(view.focus);
+    }
+    view.focus = p;
+  });
 }
 function toggleDrawn(p) {
   if (p === view.focus) return;
-  if (view.drawn.has(p)) view.drawn.delete(p);
-  else view.drawn.add(p);
-  redrawPools();
+  changePools(() => {
+    if (view.drawn.has(p)) view.drawn.delete(p);
+    else view.drawn.add(p);
+  });
 }
 /* every pool drawn, or back to the open one alone */
 function toggleAll() {
-  view.drawn = view.pools.length === allPools().length ? new Set() : new Set(allPools());
-  redrawPools();
+  changePools(() => {
+    view.drawn = view.pools.length === allPools().length ? new Set() : new Set(allPools());
+  });
+}
+let freshTimer = 0;
+function highlight(pools) {
+  clearTimeout(freshTimer);
+  document.querySelectorAll(".fresh").forEach(x => x.classList.remove("fresh"));
+  if (!pools.length) return;
+  void document.body.offsetWidth; // so the glow restarts on the latest change
+  for (const p of pools) {
+    state.lanes[p]?.lane.classList.add("fresh");
+    state.rows[p]?.classList.add("fresh");
+  }
+  freshTimer = setTimeout(
+    () => document.querySelectorAll(".fresh").forEach(x => x.classList.remove("fresh")),
+    2000
+  );
 }
 
 /* page under the read head after each access, per pool: the last page read */
@@ -985,6 +1078,7 @@ function markTimeline(at) {
   here.hidden = at < 0 || view.mode === "race";
   here.style.left = `${(100 * (at + 0.5)) / state.accesses}%`;
   drawTimeline();
+  drawMem(at);
 }
 const totals = (p, at) =>
   at < 0
@@ -1312,7 +1406,7 @@ function renderChrome(at) {
 /* ---------- moments, found from the events ---------- */
 function buildMoments() {
   const list = [],
-    real = comparePools().filter(p => p !== "opt"),
+    real = view.pools.filter(p => p !== "opt"),
     E = p => state.byPolicy[p].events;
   const and = xs => (xs.length > 1 ? xs.slice(0, -1).join(", ") + " and " + xs.at(-1) : xs[0]);
   state.data.queries.forEach(q => {
@@ -1645,6 +1739,196 @@ async function animateStep(p, at, id, manual = false) {
   } else await sleep(400);
 }
 
+/* ---------- memory over time ---------- */
+/* One bar per page staying in a frame: first and last access, and its hits. */
+function residency(evs, frames) {
+  const bars = [],
+    open = new Array(frames).fill(null);
+  evs.forEach((ev, i) => {
+    for (let f = 0; f < frames; f++) {
+      const pg = ev.frames[f].page,
+        o = open[f];
+      if (o && o.page !== pg) {
+        bars.push(o);
+        open[f] = null;
+      }
+      if (pg != null && !open[f]) open[f] = {f, page: pg, s: i, e: i, hits: []};
+      if (open[f]) open[f].e = i;
+    }
+    if (ev.kind === "hit" && open[ev.frame]) open[ev.frame].hits.push(i);
+  });
+  for (const o of open) if (o) bars.push(o);
+  return bars;
+}
+/* each drawn pool's band: the open one taller */
+function memLayout() {
+  let y = 0;
+  const pools = [view.focus, ...view.pools.filter(p => p !== view.focus)];
+  return pools.map(p => {
+    const focus = p === view.focus,
+      h = focus
+        ? Math.max(30, Math.min(120, state.frames * 12))
+        : Math.max(20, Math.min(56, state.frames * 5)),
+      band = {p, label: y, y: y + 18, h, rowH: h / state.frames};
+    y += 18 + h + 12;
+    return band;
+  });
+}
+const resolve = (css, c) => (c.startsWith("var(") ? css.getPropertyValue(c.slice(4, -1)).trim() : c);
+function drawMem(at) {
+  if (!$("mem").open || !state.data) return;
+  const cv = $("memCanvas"),
+    wrap = $("memWrap"),
+    bands = memLayout(),
+    W = cv.clientWidth || 600,
+    H = bands.length ? bands.at(-1).y + bands.at(-1).h : 0,
+    dpr = devicePixelRatio || 1,
+    N = state.accesses,
+    cw = W / N;
+  cv.style.height = `${H}px`;
+  cv.width = Math.round(W * dpr);
+  cv.height = Math.round(H * dpr);
+  const g = cv.getContext("2d"),
+    css = getComputedStyle(document.body),
+    ink = css.getPropertyValue("--ink").trim(),
+    bg = css.getPropertyValue("--panel").trim() || css.getPropertyValue("--bg").trim();
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  wrap.querySelectorAll(".memlabel").forEach(l => l.remove());
+  for (const b of bands) {
+    const label = el("span", "memlabel", nameOf(b.p));
+    label.style.top = `${b.label}px`;
+    if (b.p === view.focus) label.style.fontWeight = "500";
+    wrap.append(label);
+    const gap = b.rowH >= 4 ? 1 : 0;
+    for (const bar of state.bars[b.p]) {
+      const span = bar.e - bar.s + 1,
+        x = bar.s * cw,
+        w = Math.max(1, span * cw - (span * cw >= 3 ? 1 : 0)),
+        y = b.y + bar.f * b.rowH;
+      g.globalAlpha = 0.5;
+      g.fillStyle = resolve(css, colorOf(bar.page));
+      g.fillRect(x, y, w, Math.max(1, b.rowH - gap));
+      if (b.rowH >= 5 && cw >= 2) {
+        g.globalAlpha = 0.75;
+        g.fillStyle = ink;
+        for (const h of bar.hits) {
+          g.beginPath();
+          g.arc((h + 0.5) * cw, y + (b.rowH - gap) / 2, Math.min(2, b.rowH / 4), 0, 2 * Math.PI);
+          g.fill();
+        }
+      }
+    }
+    /* what has not happened yet is veiled */
+    if (at < N - 1) {
+      g.globalAlpha = 0.7;
+      g.fillStyle = bg;
+      g.fillRect((at + 1) * cw, b.y, W - (at + 1) * cw, b.h);
+    }
+  }
+  g.globalAlpha = 1;
+  const here = $("memHere");
+  here.hidden = at < 0 || view.mode === "race";
+  here.style.left = `${(100 * (at + 0.5)) / N}%`;
+}
+/* the bar under the pointer, in words */
+function memPoint(ev) {
+  const r = $("memCanvas").getBoundingClientRect(),
+    x = ev.clientX - r.left,
+    y = ev.clientY - r.top,
+    i = Math.floor((x / r.width) * state.accesses),
+    band = memLayout().find(b => y >= b.y && y < b.y + b.h);
+  if (!band) return null;
+  const f = Math.floor((y - band.y) / band.rowH),
+    bar = state.bars[band.p].find(b => b.f === f && b.s <= i && i <= b.e);
+  return bar && {p: band.p, bar};
+}
+$("mem").addEventListener("toggle", () => drawMem(view.at));
+let memDrag = false;
+const memTo = ev => {
+  const r = $("memCanvas").getBoundingClientRect();
+  jump(Math.floor(((ev.clientX - r.left) / r.width) * state.accesses));
+};
+$("memWrap").addEventListener("pointerdown", ev => {
+  if (ev.button) return;
+  toStep();
+  memDrag = true;
+  $("memWrap").setPointerCapture(ev.pointerId);
+  memTo(ev);
+});
+$("memWrap").addEventListener("pointermove", ev => {
+  if (memDrag) return memTo(ev);
+  const hit = memPoint(ev);
+  $("memSay").textContent = hit
+    ? `${nameOf(hit.p)}, frame ${hit.bar.f + 1}: p${hit.bar.page} (${pageDesc(hit.bar.page)}) stayed ` +
+      `for ${hit.bar.e - hit.bar.s + 1} request${hit.bar.e > hit.bar.s ? "s" : ""}, ` +
+      `${hit.bar.hits.length} hit${hit.bar.hits.length === 1 ? "" : "s"} on it`
+    : "Point at a bar to see the page; drag to move through the run.";
+});
+for (const type of ["pointerup", "pointercancel"])
+  $("memWrap").addEventListener(type, () => {
+    memDrag = false;
+  });
+
+/* ---------- sound: a soft pop when the pools on screen change, a tune when a race is won ---------- */
+/* Tones are made here, no audio files; browsers allow them after a click or
+   key press. The pop plays at most once every 2 seconds, however fast the
+   clicks come. */
+let audio = null,
+  lastPop = -Infinity;
+function note(c, f, at, dur, type, vol, to) {
+  const t0 = c.currentTime + at,
+    o = c.createOscillator(),
+    g = c.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f, t0);
+  if (to) o.frequency.exponentialRampToValueAtTime(to, t0 + dur);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(vol, t0 + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.connect(g).connect(c.destination);
+  o.start(t0);
+  o.stop(t0 + dur + 0.03);
+}
+const TONES = {
+  pop: c => note(c, 740, 0, 0.12, "sine", 0.1, 620),
+  win: c => [523, 659, 784, 1047].forEach((f, i) => note(c, f, i * 0.09, i === 3 ? 0.5 : 0.22, "sine", 0.09))
+};
+function sound(kind) {
+  if (!view.sound) return;
+  if (kind === "pop") {
+    const now = performance.now();
+    if (now - lastPop < 2000) return;
+    lastPop = now;
+  }
+  view.heard.push(kind);
+  try {
+    const C = window.AudioContext || window.webkitAudioContext;
+    if (!C) return;
+    audio ||= new C();
+    if (audio.state === "suspended") audio.resume();
+    TONES[kind](audio);
+  } catch {
+    /* no sound here; nothing else depends on it */
+  }
+}
+function setSound(on, test) {
+  view.sound = on;
+  $("soundBtn").setAttribute("aria-pressed", on);
+  $("soundState").textContent = on ? "on" : "off";
+  try {
+    localStorage.setItem("bpsim.sound", on ? "1" : "0");
+  } catch {
+    /* remembered for this visit only */
+  }
+  if (on && test) sound("pop");
+}
+$("soundBtn").addEventListener("click", () => setSound(!view.sound, true));
+try {
+  if (localStorage.getItem("bpsim.sound") === "1") setSound(true, false);
+} catch {
+  /* off */
+}
+
 /* ---------- how it works: a worked example, then how to read the page ---------- */
 /* The example is a tiny run the engine made when it wrote this page. */
 const EXAMPLE = (() => {
@@ -1813,6 +2097,7 @@ async function race() {
       }
       if (id !== view.raceId) return;
       place++;
+      if (place === 1) sound("win");
       const pl = state.rows[p].querySelector(".place");
       pl.textContent = ["1st", "2nd", "3rd"][place - 1] || place + "th";
       pl.classList.add("on");
@@ -1905,7 +2190,10 @@ addEventListener("resize", () => {
 });
 /* the strip is drawn in the page's colours, which change with the theme */
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
-  if (state.data) drawTimeline();
+  if (state.data) {
+    drawTimeline();
+    drawMem(view.at);
+  }
 });
 
 /* ---------- loading ---------- */
@@ -1947,6 +2235,10 @@ window.bpsim = Object.freeze({
   running: policy => state.running[policy],
   focus: () => view.focus,
   kinds: policy => state.byPolicy[policy].events.map(e => (e.kind === "miss" && !e.read ? "fresh" : e.kind)),
+  heard: () => [...view.heard],
+  moments: () => state.moments.map(m => ({k: m.k, t: m.t, d: m.d})),
+  pools: () => [...view.pools],
+  bars: policy => state.bars[policy].length,
   jump
 });
 </script>
