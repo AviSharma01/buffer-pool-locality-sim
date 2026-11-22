@@ -40,7 +40,7 @@ FROM n;
 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 600)
 INSERT INTO orders
 SELECT i,
-       printf('customer%03d@mail.com', i * 31 % 400),
+       printf('buyer%03d@example.com', i * 31 % 400),
        date('2025-03-01', '+' || (i % 90) || ' days'),
        CASE i % 4 WHEN 0 THEN 'shipped' ELSE 'paid' END
 FROM n;
@@ -54,7 +54,7 @@ FROM n;
 SELECT name, price, stock FROM products WHERE id = 17;
 
 -- query: Place order 601
-INSERT INTO orders VALUES(601, 'customer042@mail.com', '2025-06-02', 'paid');
+INSERT INTO orders VALUES(601, 'buyer042@example.com', '2025-06-02', 'paid');
 
 -- query: Add its items
 INSERT INTO order_items(order_id, product_id, quantity) VALUES(601, 17, 2), (601, 480, 1);
@@ -72,7 +72,7 @@ UPDATE products SET stock = stock + 40 WHERE stock < 5;
 SELECT name, price, stock FROM products WHERE id = 17;
 
 -- query: Place order 602
-INSERT INTO orders VALUES(602, 'customer007@mail.com', '2025-06-02', 'paid');
+INSERT INTO orders VALUES(602, 'buyer007@example.com', '2025-06-02', 'paid');
 
 -- query: Add a large order's items
 INSERT INTO order_items(order_id, product_id, quantity)

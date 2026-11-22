@@ -24,7 +24,7 @@ CREATE TABLE orders(
 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000)
 INSERT INTO users
 SELECT i,
-       printf('user%04d@mail.com', i),
+       printf('u%04d@example.com', i),
        'User ' || i,
        CASE i % 5 WHEN 0 THEN 'Vancouver' WHEN 1 THEN 'Toronto' WHEN 2 THEN 'Delhi'
                   WHEN 3 THEN 'Mumbai' ELSE 'Calgary' END,
@@ -46,7 +46,7 @@ SELECT * FROM users WHERE id = 42;
 SELECT * FROM users WHERE id = 2077;
 
 -- query: Find user by email
-SELECT * FROM users WHERE email = 'user1234@mail.com';
+SELECT * FROM users WHERE email = 'u1234@example.com';
 
 -- query: Update user 42
 UPDATE users SET city = 'Toronto' WHERE id = 42;
@@ -61,7 +61,7 @@ SELECT * FROM users WHERE id = 42;
 SELECT * FROM users WHERE id = 2077;
 
 -- query: Find user by email
-SELECT * FROM users WHERE email = 'user1234@mail.com';
+SELECT * FROM users WHERE email = 'u1234@example.com';
 
 -- query: Look up user 42
 SELECT * FROM users WHERE id = 42;
