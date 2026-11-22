@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import json
 import re
 import shutil
@@ -51,6 +52,8 @@ from pathlib import Path
 from typing import Any
 
 import apsw
+
+import workload
 
 TRACE_VERSION = 2
 VFS_NAME = "bpsim-trace"
@@ -123,17 +126,31 @@ def _check_single_statement(title: str, sql: str) -> str:
     return sql
 
 
-def parse_scenario(text: str, name: str, setup_required: bool = True) -> Scenario:
+def parse_scenario(
+    text: str, name: str, setup_required: bool = True, seed: int | None = None
+) -> Scenario:
     """Split a scenario file into its setup SQL and titled queries.
 
     With `setup_required=False` (the database comes from `--db` or `--csv`)
-    the file may hold only `-- query:` sections.
+    the file may hold only `-- query:` sections. A last `-- workload:`
+    section adds many queries made from templates (see workload.py); `seed`
+    replaces the seed it names, for a local variant.
     """
     setup: list[str] | None = None
     queries: list[tuple[str, list[str]]] = []
     current: list[str] | None = None
-    for lineno, line in enumerate(text.splitlines(), start=1):
+    load: workload.Workload | None = None
+    lines = text.splitlines()
+    for lineno, line in enumerate(lines, start=1):
         stripped = line.strip()
+        if workload.is_header(stripped):
+            if setup is None and setup_required:
+                raise ValueError(f"line {lineno}: '-- workload:' before '-- setup'")
+            rest = list(enumerate(lines[lineno - 1 :], start=lineno))
+            load = workload.parse(rest, _check_single_statement)
+            if seed is not None:
+                load.seed = seed
+            break
         if stripped == "-- setup":
             if setup is not None:
                 raise ValueError(f"line {lineno}: a scenario has only one '-- setup' section")
@@ -154,9 +171,11 @@ def parse_scenario(text: str, name: str, setup_required: bool = True) -> Scenari
             raise ValueError(f"line {lineno}: SQL before '-- setup'")
     if setup is None and setup_required:
         raise ValueError("scenario has no '-- setup' section")
-    if not queries and setup_required:
-        raise ValueError("scenario has no '-- query:' sections")
-    parsed = [(title, _check_single_statement(title, "\n".join(lines))) for title, lines in queries]
+    if not queries and load is None and setup_required:
+        raise ValueError("scenario has no '-- query:' or '-- workload:' sections")
+    parsed = [(title, _check_single_statement(title, "\n".join(body))) for title, body in queries]
+    if load is not None:
+        parsed += workload.generate(load)
     return Scenario(name=name, setup="\n".join(setup or []), queries=parsed)
 
 
@@ -873,7 +892,9 @@ def build_scenario(args: argparse.Namespace) -> Scenario:
     own_data = args.db is not None or bool(args.csv)
     if args.scenario is not None:
         text = args.scenario.read_text(encoding="utf-8")
-        scenario = parse_scenario(text, args.scenario.stem, setup_required=not own_data)
+        scenario = parse_scenario(
+            text, args.scenario.stem, setup_required=not own_data, seed=args.seed
+        )
     elif own_data:
         scenario = Scenario(name="", setup="", queries=[])
     else:
@@ -926,7 +947,12 @@ def main() -> None:
         description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("scenario", type=Path, nargs="?", help="scenario .sql file")
-    parser.add_argument("-o", "--out", type=Path, help="trace .json to write")
+    parser.add_argument(
+        "-o", "--out", type=Path, help="trace to write: .json, or .json.gz to compress it"
+    )
+    parser.add_argument(
+        "--seed", type=int, help="replace the seed of the scenario's workload (a local variant)"
+    )
     data = parser.add_argument_group("your own data")
     data.add_argument("--db", type=Path, help="existing SQLite file (a copy is used)")
     data.add_argument(
@@ -966,7 +992,11 @@ def main() -> None:
             trace = capture(scenario, Path(tmp), limits, rows=not args.no_rows)
         out = args.out or REPO / "outputs" / "traces" / f"{scenario.name}.trace.json"
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(dump(trace), encoding="utf-8")
+        if out.name.endswith(".gz"):
+            # mtime 0: the same trace always gives the same bytes
+            out.write_bytes(gzip.compress(dump(trace).encode("utf-8"), mtime=0))
+        else:
+            out.write_text(dump(trace), encoding="utf-8")
         reads = sum(op == "r" for q in trace["queries"] for op, _ in q["io"])
         writes = sum(op == "w" for q in trace["queries"] for op, _ in q["io"])
         print(

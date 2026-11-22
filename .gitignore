@@ -20,3 +20,6 @@ __pycache__/
 # Python tool caches
 .pytest_cache/
 .ruff_cache/
+
+# Local traces: variants and scale checks (regenerate with the command in each scenario)
+/traces/local/

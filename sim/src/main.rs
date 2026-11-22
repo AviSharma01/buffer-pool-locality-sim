@@ -81,8 +81,35 @@ impl Input {
     }
 }
 
+/// The most a gzipped file may expand to: well above any capture, far below
+/// what would exhaust memory.
+const MAX_UNZIPPED: u64 = 1 << 30;
+
+/// A text file, or a gzipped one if its name ends in `.gz`.
 fn read(path: &Path) -> Result<String, String> {
-    fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))
+    read_limited(path, MAX_UNZIPPED)
+}
+
+fn read_limited(path: &Path, max_unzipped: u64) -> Result<String, String> {
+    let fail = |e: std::io::Error| format!("reading {}: {e}", path.display());
+    if path.extension().is_some_and(|x| x == "gz") {
+        use std::io::Read;
+        let file = fs::File::open(path).map_err(fail)?;
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(file)
+            .take(max_unzipped + 1)
+            .read_to_string(&mut text)
+            .map_err(fail)?;
+        if text.len() as u64 > max_unzipped {
+            return Err(format!(
+                "{}: unzips to more than {} MiB",
+                path.display(),
+                max_unzipped >> 20
+            ));
+        }
+        return Ok(text);
+    }
+    fs::read_to_string(path).map_err(fail)
 }
 
 fn check_frames(frames: usize, total_pages: u64, what: &str) -> Result<(), String> {
@@ -98,11 +125,21 @@ fn load_trace(path: &Path, args: &Cli) -> Result<Input, String> {
     let captured =
         CapturedTrace::from_json(&read(path)?).map_err(|e| format!("{}: {e}", path.display()))?;
     check_frames(args.frames, captured.page_count as u64, "trace")?;
-    let entries = captured.to_trace().accesses().len() * args.frames * args.policy.0.len();
+    let accesses = captured.to_trace().accesses().len();
+    let entries = accesses * args.frames * args.policy.0.len();
     if entries > MAX_FRAME_ENTRIES {
         return Err(format!(
-            "the run file would hold {entries} frame entries (limit {MAX_FRAME_ENTRIES}); \
-             use fewer --frames or policies"
+            "too long to step through in the viewer: {accesses} page requests x {} frames x {} \
+             polic{} would be {entries} frame entries (the viewer takes up to \
+             {MAX_FRAME_ENTRIES}); {}",
+            args.frames,
+            args.policy.0.len(),
+            if args.policy.0.len() == 1 { "y" } else { "ies" },
+            if accesses > MAX_FRAME_ENTRIES {
+                "the trace is too long for the viewer even with one frame and one policy"
+            } else {
+                "use fewer --frames or policies, or a shorter trace"
+            }
         ));
     }
     Ok(Input::Trace(captured))
@@ -226,4 +263,22 @@ fn run(args: Cli) -> Result<(), String> {
     }
     say(format_args!("Run written to {}", run_dir.display()));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn a_gzipped_file_that_unzips_too_far_is_refused() {
+        let path = std::env::temp_dir().join(format!("bpsim-big-{}.json.gz", std::process::id()));
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&vec![b' '; 3 << 20]).unwrap();
+        fs::write(&path, gz.finish().unwrap()).unwrap();
+        let err = read_limited(&path, 2 << 20).unwrap_err();
+        assert!(err.contains("unzips to more than 2 MiB"), "{err}");
+        assert_eq!(read_limited(&path, 4 << 20).unwrap().len(), 3 << 20);
+        fs::remove_file(path).unwrap();
+    }
 }

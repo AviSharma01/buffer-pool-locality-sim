@@ -405,7 +405,13 @@ fn rejects_bad_trace_arguments() {
     let big = tiny_trace(&out_dir("big_trace"), 600, "1");
     assert_rejected(
         &["--trace", &big, "--frames", "100", "--policy", "all"],
-        "frame entries",
+        "use fewer --frames",
+    );
+    // Past the limit with one frame and one policy: fewer frames cannot help.
+    let huge = tiny_trace(&out_dir("huge_trace"), 250_001, "1");
+    assert_rejected(
+        &["--trace", &huge, "--frames", "1", "--policy", "lru"],
+        "even with one frame and one policy",
     );
 }
 
@@ -466,4 +472,52 @@ fn the_viewer_reads_the_run_file_version_the_engine_writes() {
         [bpsim::run::VERSION],
         "viewer/index.html declares {declared:?}"
     );
+}
+
+#[test]
+fn a_gzipped_trace_replays_like_the_plain_one() {
+    use std::io::Write;
+    let out = out_dir("gzip");
+    let plain = shop_trace();
+    let zipped = out.join("shop.trace.json.gz");
+    std::fs::create_dir_all(&out).unwrap();
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(&std::fs::read(&plain).unwrap()).unwrap();
+    std::fs::write(&zipped, gz.finish().unwrap()).unwrap();
+    let run = |trace: &str| {
+        let done = sim(&[
+            "--trace",
+            trace,
+            "--policy",
+            "lru",
+            "--frames",
+            "8",
+            "--out",
+            out.to_str().unwrap(),
+        ]);
+        assert!(
+            done.status.success(),
+            "{}",
+            String::from_utf8_lossy(&done.stderr)
+        );
+        String::from_utf8(done.stdout)
+            .unwrap()
+            .lines()
+            .find(|l| l.contains("hit rate"))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(run(&plain), run(zipped.to_str().unwrap()));
+    let broken = out.join("broken.trace.json.gz");
+    std::fs::write(&broken, b"not gzip at all").unwrap();
+    let done = sim(&[
+        "--trace",
+        broken.to_str().unwrap(),
+        "--policy",
+        "lru",
+        "--frames",
+        "8",
+    ]);
+    assert!(!done.status.success());
+    assert!(String::from_utf8_lossy(&done.stderr).contains("broken.trace.json.gz"));
 }
