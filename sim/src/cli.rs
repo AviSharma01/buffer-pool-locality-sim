@@ -42,15 +42,52 @@ pub struct Cli {
     #[arg(long, default_value = "auto", value_name = "auto|off|N")]
     pub read_ahead: ReadAhead,
 
-    /// Buffer pool size in frames.
-    #[arg(long, default_value_t = 64, value_parser = positive_usize)]
-    pub frames: usize,
+    /// Buffer pool size in frames. A comma-separated list, or `sweep` for
+    /// sizes from 8 frames to the whole database, runs a sweep instead: every
+    /// policy at every size, written as sweep.json and a page of curves,
+    /// sweep.html.
+    #[arg(long, default_value = "64", value_parser = frames, value_name = "N|N,N,...|sweep")]
+    pub frames: Frames,
+
+    /// Write only summaries for a `--trace` run: no run.json or viewer.html,
+    /// so a trace of any length can run.
+    #[arg(long)]
+    pub no_viewer: bool,
 
     /// Output root. Runs go to <out>/<name>/<policy>/<timestamp>/summary.json,
     /// with `compare` for the policy and one subfolder per policy when several
-    /// run. `--trace` runs also write run.json and viewer.html there.
+    /// run, and sweeps to <out>/<name>/sweep/<timestamp>/. `--trace` runs also
+    /// write run.json and viewer.html.
     #[arg(long, default_value = "../outputs/runs")]
     pub out: PathBuf,
+}
+
+/// One pool size, or several for a sweep.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Frames {
+    One(usize),
+    /// In increasing order.
+    List(Vec<usize>),
+    /// The default sizes for the input (see `bpsim::sweep::default_sizes`).
+    Sweep,
+}
+
+fn frames(s: &str) -> Result<Frames, String> {
+    if s.eq_ignore_ascii_case("sweep") {
+        return Ok(Frames::Sweep);
+    }
+    let mut list = s
+        .split(',')
+        .map(|n| positive_usize(n.trim()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if let [one] = list[..] {
+        return Ok(Frames::One(one));
+    }
+    list.sort_unstable();
+    if let Some(w) = list.windows(2).find(|w| w[0] == w[1]) {
+        return Err(format!("{} frames is listed twice", w[0]));
+    }
+    Ok(Frames::List(list))
 }
 
 /// The policies to run, in the order given.
@@ -77,5 +114,20 @@ fn positive_usize(s: &str) -> Result<usize, String> {
         Ok(0) => Err("must be at least 1".into()),
         Ok(n) => Ok(n),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frames_are_one_size_a_sorted_list_or_a_sweep() {
+        assert_eq!(frames("64"), Ok(Frames::One(64)));
+        assert_eq!(frames("256, 8,64"), Ok(Frames::List(vec![8, 64, 256])));
+        assert_eq!(frames("Sweep"), Ok(Frames::Sweep));
+        assert!(frames("8,0").unwrap_err().contains("at least 1"));
+        assert!(frames("8,16,8").unwrap_err().contains("listed twice"));
+        assert!(frames("eight").is_err());
     }
 }

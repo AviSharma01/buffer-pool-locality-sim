@@ -568,3 +568,36 @@ fn vacuum_pays_off_on_an_ssd_through_read_ahead() {
         }
     }
 }
+
+/// Storage never changes what is cached, so a run priced for one drive knows
+/// the other's total too, to the last bit.
+#[test]
+fn one_run_prices_both_drives() {
+    for name in ["shop", "checkout", "growth"] {
+        for kind in PolicyKind::ALL {
+            let run = |storage| {
+                let cfg = SimConfig {
+                    frames: 8,
+                    policy: kind,
+                    storage,
+                    read_ahead: ReadAhead::Auto,
+                };
+                let mut sim = load(name).simulator(cfg);
+                while sim.step().is_some() {}
+                sim
+            };
+            let (ssd, hdd) = (run(StorageKind::Ssd), run(StorageKind::Hdd));
+            for storage in StorageKind::ALL {
+                assert_eq!(
+                    ssd.metrics().total_ms(storage),
+                    hdd.metrics().total_ms(storage),
+                    "{name} {kind} {storage}"
+                );
+            }
+            assert_eq!(
+                hdd.summary().total_ms,
+                ssd.metrics().total_ms(StorageKind::Hdd)
+            );
+        }
+    }
+}

@@ -6,7 +6,8 @@
 -- The capture takes a few minutes.
 --
 -- python capture/capture.py capture/scenarios/reports-big.sql --no-rows \
---   --max-pages 150000 --max-io 200000 -o traces/local/reports-big.trace.json.gz
+--   --max-pages 150000 --max-io 200000 --sqlite-cache 1024,4096,16384 \
+--   -o traces/local/reports-big.trace.json.gz
 
 -- setup
 PRAGMA page_size = 4096;

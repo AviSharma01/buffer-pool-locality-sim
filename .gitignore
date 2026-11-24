@@ -1,6 +1,7 @@
 /outputs/
 /sim/target/
 /media/
+/Claude outputs/
 
 # Python virtual env
 .venv/

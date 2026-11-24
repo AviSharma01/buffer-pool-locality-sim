@@ -47,6 +47,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,7 @@ import workload
 
 TRACE_VERSION = 2
 VFS_NAME = "bpsim-trace"
+COUNT_VFS_NAME = "bpsim-count"
 REPO = Path(__file__).resolve().parent.parent
 SQLITE_MAGIC = b"SQLite format 3\x00"
 MAX_PAGE_SIZE = 65536
@@ -206,6 +208,54 @@ class TraceVFS(apsw.VFS):
 
     def xOpen(self, name: apsw.URIFilename | str | None, flags: list[int]) -> _TraceFile:
         return _TraceFile(self, name, flags)
+
+
+class _CountingFile(apsw.VFSFile):
+    def __init__(self, vfs: CountingVFS, name: apsw.URIFilename | str | None, flags: list[int]):
+        self._vfs = vfs
+        self._main = bool(flags[0] & apsw.mapping_open_flags["SQLITE_OPEN_MAIN_DB"])
+        super().__init__("", name, flags)
+
+    def xRead(self, amount: int, offset: int) -> bytes:
+        if self._main and amount == self._vfs.page_size:
+            self._vfs.page_reads += 1
+        return super().xRead(amount, offset)
+
+
+class CountingVFS(apsw.VFS):
+    """Passes everything to the default VFS, counting whole-page reads of the
+    main database (not SQLite's 16-byte header checks)."""
+
+    def __init__(self, page_size: int):
+        self.page_size = page_size
+        self.page_reads = 0
+        super().__init__(COUNT_VFS_NAME, "")
+
+    def xOpen(self, name: apsw.URIFilename | str | None, flags: list[int]) -> _CountingFile:
+        return _CountingFile(self, name, flags)
+
+
+def sqlite_cache_reads(
+    db: Path, sql: list[str], pages: int, page_size: int, workdir: Path, limits: Limits
+) -> int:
+    """Pages SQLite reads from the file running `sql` on a copy of `db` with its
+    own page cache `pages` pages big. That cache is LRU, so this is an outside
+    check on the engine's LRU (with read-ahead off)."""
+    run_db = workdir.resolve() / "sqlite-cache.db"
+    shutil.copyfile(db, run_db)
+    vfs = CountingVFS(page_size)
+    try:
+        conn = _open(run_db, vfs=COUNT_VFS_NAME)
+        conn.execute(f"PRAGMA cache_size = {pages}; PRAGMA mmap_size = 0;")
+        _restrict(conn, limits.max_pages)
+        for i, query in enumerate(sql, start=1):
+            _run(conn, query, f"query {i} with a {pages}-page cache", limits.timeout, keep=False)
+        conn.close()
+    finally:
+        vfs.unregister()
+        for suffix in ("", "-wal", "-journal"):
+            run_db.with_name(run_db.name + suffix).unlink(missing_ok=True)
+    return vfs.page_reads
 
 
 # ---- SQLite file-format decoding (https://www.sqlite.org/fileformat2.html) ----
@@ -754,19 +804,29 @@ def _vacuum(db_path: Path, seconds: float) -> None:
 
 
 def capture(
-    scenario: Scenario, workdir: Path, limits: Limits | None = None, rows: bool = True
+    scenario: Scenario,
+    workdir: Path,
+    limits: Limits | None = None,
+    rows: bool = True,
+    sqlite_cache: Sequence[int] = (),
 ) -> dict[str, Any]:
     """Build the database, run the queries through the trace VFS, and return
-    the trace. SQLite's memory is capped at HEAP_LIMIT meanwhile."""
+    the trace. With `sqlite_cache` sizes, also run them through SQLite's own
+    page cache at each size and record the pages it reads. SQLite's memory is
+    capped at HEAP_LIMIT meanwhile."""
     previous = apsw.hard_heap_limit(HEAP_LIMIT)
     try:
-        return _capture(scenario, workdir, limits, rows)
+        return _capture(scenario, workdir, limits, rows, sqlite_cache)
     finally:
         apsw.hard_heap_limit(previous)
 
 
 def _capture(
-    scenario: Scenario, workdir: Path, limits: Limits | None, rows: bool
+    scenario: Scenario,
+    workdir: Path,
+    limits: Limits | None,
+    rows: bool,
+    sqlite_cache: Sequence[int],
 ) -> dict[str, Any]:
     limits = limits or Limits()
     if not scenario.queries:
@@ -797,7 +857,7 @@ def _capture(
     if scenario.vacuum:
         _vacuum(db_path, max(SETUP_SECONDS, limits.timeout))
     page_size, objects_before, pages_before = _layout(db_path, limits)
-    if rows:
+    if rows or sqlite_cache:
         shutil.copyfile(db_path, before_path)
 
     vfs = TraceVFS(page_size)
@@ -839,7 +899,7 @@ def _capture(
             notes.append(f"{cut} long value(s) were cut to {limits.max_cell} characters.")
     else:
         notes[2] = "Rows were left out of this trace (--no-rows)."
-    return {
+    trace: dict[str, Any] = {
         "format": "bpsim-trace",
         "version": TRACE_VERSION,
         "scenario": scenario.name,
@@ -852,6 +912,14 @@ def _capture(
         "rows": {str(p): decoded[p] for p in touched if p in decoded},
         "notes": notes,
     }
+    if sqlite_cache:
+        sql = [query for _, query in scenario.queries]
+        points = []
+        for n in sorted(sqlite_cache):
+            reads = sqlite_cache_reads(before_path, sql, n, page_size, workdir, limits)
+            points.append({"pages": n, "reads": reads})
+        trace["sqlite_cache"] = points
+    return trace
 
 
 def dump(trace: dict[str, Any]) -> str:
@@ -941,6 +1009,17 @@ def view(trace_path: Path, frames: int, policy: str, runs: Path | None = None) -
     return run_dir / "viewer.html"
 
 
+def _sizes(text: str) -> list[int]:
+    """Comma-separated page counts, for --sqlite-cache."""
+    try:
+        sizes = [int(n) for n in text.split(",")]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected page counts like 64,256: {text!r}") from None
+    if min(sizes) < 1 or len(set(sizes)) != len(sizes):
+        raise argparse.ArgumentTypeError(f"page counts must be positive and different: {text!r}")
+    return sorted(sizes)
+
+
 def main() -> None:
     defaults = Limits()
     parser = argparse.ArgumentParser(
@@ -952,6 +1031,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--seed", type=int, help="replace the seed of the scenario's workload (a local variant)"
+    )
+    parser.add_argument(
+        "--sqlite-cache",
+        type=_sizes,
+        default=[],
+        metavar="PAGES,...",
+        help="also run the queries through SQLite's own page cache at these sizes and record "
+        "the pages it reads: an outside check on the engine's LRU (slower: once per size)",
     )
     data = parser.add_argument_group("your own data")
     data.add_argument("--db", type=Path, help="existing SQLite file (a copy is used)")
@@ -989,7 +1076,7 @@ def main() -> None:
             raise ValueError("limits and --frames must be positive")
         limits = Limits(args.max_pages, args.timeout, args.max_cell, args.max_io)
         with tempfile.TemporaryDirectory() as tmp:
-            trace = capture(scenario, Path(tmp), limits, rows=not args.no_rows)
+            trace = capture(scenario, Path(tmp), limits, not args.no_rows, args.sqlite_cache)
         out = args.out or REPO / "outputs" / "traces" / f"{scenario.name}.trace.json"
         out.parent.mkdir(parents=True, exist_ok=True)
         if out.name.endswith(".gz"):
@@ -1003,6 +1090,8 @@ def main() -> None:
             f"{scenario.name}: {len(trace['queries'])} queries, {reads} page reads, "
             f"{writes} writes, {trace['page_count']} pages -> {out}"
         )
+        for point in trace.get("sqlite_cache", []):
+            print(f"  SQLite's own cache at {point['pages']} pages read {point['reads']} pages")
         if trace["rows"] and (args.db is not None or args.csv):
             print(
                 "note: rows from your data are stored in the trace and the viewer page; "

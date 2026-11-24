@@ -1,0 +1,589 @@
+<!doctype html>
+<!--
+  bpsim sweep page. `sim --frames sweep ...` writes a copy of this page with the
+  sweep file built in (sweep.html). Opened as is, it waits for a sweep.json to
+  be dropped on it, which is the quick loop while working on the page.
+
+  One chart: every policy's disk reads (or time) per query against the pool
+  size, on a log scale, with Optimal as the floor and SQLite's own cache as
+  measured dots. Pointing at a size opens the readout: each policy's value,
+  and how much more memory LRU would need to match the ones that beat it.
+  The numbers behind the chart sit folded below it.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bpsim sweep</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600&family=Geist:wght@400;500&family=Geist+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#f6f5f2; --ink:#1c1b19; --ink-2:#55514a; --muted:#6b665e; --line:#0000001f; --soft:#0000000a;
+  --accent:#9a3412;
+  --lru:#4b60c8; --pg:#3f7d4d; --innodb:#b47a12; --faint:#a29d95;
+  --panel:color-mix(in srgb,var(--ink) 4.5%,var(--bg)); --raised:color-mix(in srgb,var(--bg) 70%,#fff);
+  --f-display:"Bricolage Grotesque", ui-sans-serif, system-ui, sans-serif;
+  --f-body:"Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-mono:"Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color-scheme:light;
+}
+/* dark: the system's choice, unless the theme button picked one (data-theme on <html>) */
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#111112; --ink:#eceae6; --ink-2:#aca79f; --muted:#918c84; --line:#ffffff24; --soft:#ffffff0a;
+  --accent:#ec8a63; --lru:#8c9cf2; --pg:#86c08f; --innodb:#e5c15b; --faint:#77736c;
+  --raised:color-mix(in srgb,var(--ink) 9%,var(--bg));
+  color-scheme:dark;
+}}
+:root[data-theme="dark"]{
+  --bg:#111112; --ink:#eceae6; --ink-2:#aca79f; --muted:#918c84; --line:#ffffff24; --soft:#ffffff0a;
+  --accent:#ec8a63; --lru:#8c9cf2; --pg:#86c08f; --innodb:#e5c15b; --faint:#77736c;
+  --raised:color-mix(in srgb,var(--ink) 9%,var(--bg));
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html{background:var(--bg)}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:14px;line-height:1.5}
+[hidden]{display:none!important}
+.app{max-width:1040px;margin:0 auto;padding:28px 20px 44px;display:flex;flex-direction:column;gap:20px}
+button{font-family:var(--f-body);font-size:12.5px;color:var(--ink);background:var(--panel);border:0;border-radius:999px;height:32px;padding:0 13px;cursor:pointer}
+button:hover{background:color-mix(in srgb,var(--ink) 9%,var(--bg))}
+button:focus-visible,summary:focus-visible,svg:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.top{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px}
+.name{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.name h1{font-family:var(--f-display);font-weight:600;font-size:22px;letter-spacing:-.01em;margin:0}
+.name span{font-size:12.5px;color:var(--muted)}
+.ctrl{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.seg{display:inline-flex;background:var(--panel);border-radius:999px;padding:3px}
+.seg button{background:transparent;height:26px}
+.seg button[aria-pressed="true"]{background:var(--ink);color:var(--bg)}
+.icon{width:32px;padding:0}
+.panel{background:var(--panel);border-radius:18px;padding:16px 18px;min-width:0}
+.phead{display:flex;align-items:baseline;gap:10px;font-size:12.5px;color:var(--muted);margin-bottom:6px}
+.phead b{font-weight:500;color:var(--ink)}
+.phead .r{margin-left:auto}
+.seg.small{padding:2px}
+.seg.small button{height:22px;font-size:11.5px;padding:0 10px}
+
+/* the chart, with the readout for the size pointed at beside it */
+.chartwrap{display:grid;grid-template-columns:minmax(0,1fr) 250px;gap:16px;align-items:start}
+#chart{display:block;width:100%;height:360px;touch-action:pan-y;cursor:crosshair}
+#chart text{font-family:var(--f-body);font-size:11px;fill:var(--muted)}
+#chart .grid{stroke:var(--line);stroke-width:1}
+#chart .whole{stroke:var(--line);stroke-dasharray:3 3}
+#chart .here{stroke:var(--ink);stroke-width:1;opacity:.35}
+#chart .curve{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+#chart .curve.faint{stroke-width:1.3}
+#chart .curve.dotted{stroke-dasharray:1.5 3}
+#chart .curve.floor{stroke-width:1.6;stroke-dasharray:5 4}
+#chart .sq{fill:var(--bg);stroke:var(--accent);stroke-width:1.6}
+#chart .pt{stroke:var(--bg);stroke-width:1.5}
+.readout{background:var(--raised);border-radius:14px;padding:10px 12px;font-size:12.5px;min-height:100%}
+.readout .at{color:var(--muted);margin-bottom:5px}
+.readout .row{display:grid;grid-template-columns:10px 1fr auto;align-items:baseline;gap:7px;line-height:1.55}
+.readout .val{font-variant-numeric:tabular-nums;text-align:right}
+.readout .vs{grid-column:2 / -1;color:var(--muted);font-size:11.5px;margin-top:-3px}
+.sw{width:10px;height:3px;border-radius:2px;display:inline-block;align-self:center}
+.sw.ring{width:9px;height:9px;border-radius:50%;background:transparent!important;border:1.6px solid var(--accent)}
+.sw.dash{height:0;border-top:2px dashed var(--ink);background:transparent!important}
+.sw.dots{height:0;border-top:2px dotted var(--faint);background:transparent!important}
+.legend{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12px;color:var(--ink-2);margin-top:8px}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.note{margin:10px 0 0;font-size:12.5px;color:var(--muted);max-width:76ch}
+
+/* the numbers behind the chart */
+details>summary{cursor:pointer;font-size:13px;list-style:none}
+details>summary::-webkit-details-marker{display:none}
+details>summary::before{content:"▸";display:inline-block;width:14px;color:var(--muted);transition:transform .15s}
+details[open]>summary::before{transform:rotate(90deg)}
+.tablewrap{overflow-x:auto;margin-top:10px}
+table{border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums;width:100%}
+th,td{padding:4px 10px;text-align:right;white-space:nowrap}
+th{font-weight:500;color:var(--muted)}
+th:first-child,td:first-child{text-align:left}
+tbody tr:nth-child(odd){background:var(--soft)}
+.cmd{margin:12px 0 0;font-size:12px;color:var(--muted)}
+.cmd code{font-family:var(--f-mono);font-size:11.5px;color:var(--ink-2);word-break:break-all}
+#drop{max-width:520px;margin:18vh auto 0;padding:36px 24px;border:2px dashed var(--line);border-radius:12px;text-align:center;color:var(--ink-2)}
+#error{max-width:520px;margin:24px auto;padding:0 20px;color:var(--accent)}
+@media (max-width:640px){
+  .app{padding:18px 12px 32px}
+  #chart{height:280px}
+  .panel{padding:14px;border-radius:16px}
+  .chartwrap{grid-template-columns:minmax(0,1fr)}
+}
+</style>
+<script>
+  try {
+    const t = localStorage.getItem("bpsim.theme");
+    if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+  } catch {
+    /* follow the system */
+  }
+</script>
+</head>
+<body>
+<div id="drop" hidden>No sweep data in this page. Drop a <code>sweep.json</code> here.</div>
+<p id="error" hidden></p>
+
+<div class="app" id="app" hidden>
+  <header class="top">
+    <div class="name"><h1 id="title"></h1><span id="sub"></span></div>
+    <div class="ctrl">
+      <div class="seg" role="group" aria-label="Measure">
+        <button type="button" id="mReads" aria-pressed="true">Disk reads</button>
+        <button type="button" id="mTime" aria-pressed="false">Time per query</button>
+      </div>
+      <button type="button" class="icon" id="themeBtn"></button>
+    </div>
+  </header>
+
+  <section class="panel" aria-labelledby="what">
+    <div class="phead"><b id="what"></b>
+      <div class="seg small" role="group" aria-label="Storage" id="storageSeg" hidden>
+        <button type="button" id="sSsd" aria-pressed="true">SSD</button>
+        <button type="button" id="sHdd" aria-pressed="false">HDD</button>
+      </div><span class="r">lower is better</span></div>
+    <div class="chartwrap">
+      <svg id="chart" tabindex="0" role="img" aria-describedby="readout"></svg>
+      <div class="readout" id="readout" aria-live="polite"></div>
+    </div>
+    <div class="legend" id="legend"></div>
+    <p class="note" id="note"></p>
+  </section>
+
+  <details class="panel" id="numbers">
+    <summary>The numbers</summary>
+    <div class="tablewrap"><table id="table"></table></div>
+    <p class="cmd">Made with <code id="cmd"></code></p>
+  </details>
+</div>
+
+<script id="sweep" type="application/json">__BPSIM_SWEEP__</script>
+<script>
+"use strict";
+const FORMAT = "bpsim-sweep",
+  VERSION = 1;
+/* Drawn in this order, so the policies that matter most end up on top. */
+const POLICIES = {
+  fifo: {name: "FIFO", colour: "--faint", faint: true, dotted: true},
+  clock: {name: "Clock", colour: "--faint", faint: true},
+  lru: {name: "LRU", colour: "--lru"},
+  pg: {name: "PostgreSQL-style", colour: "--pg"},
+  innodb: {name: "InnoDB-style", colour: "--innodb"},
+  opt: {name: "Optimal", colour: "--ink", floor: true}
+};
+const MEASURES = {
+  reads: {
+    what: "Pages read from disk per query",
+    note: (s, sqlite) =>
+      `Read-ahead off, so each line shows what the policy alone keeps in memory. Optimal (dashed) knows every future request, so no policy reads less.${
+        sqlite
+          ? " Dots: SQLite's own page cache, measured on the same queries. It is LRU, so they should sit on the LRU line."
+          : ""
+      }`
+  },
+  time: {
+    what: "Time per query",
+    note: s =>
+      `With read-ahead ${s.read_ahead === "off" ? "off" : "on"}, as the drive would take it: a hit costs almost nothing, a miss costs a request to the drive. Optimal never reads ahead, so here it can be slower than a policy that does.`
+  }
+};
+const $ = id => document.getElementById(id);
+const el = (tag, cls, text) => {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+};
+const SVG = "http://www.w3.org/2000/svg";
+const svg = (tag, attrs) => {
+  const e = document.createElementNS(SVG, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  return e;
+};
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const count = n => n.toLocaleString("en-US");
+/* Three significant figures, never in exponent form. */
+function num(x) {
+  if (x === 0) return "0";
+  const digits = Math.max(0, 2 - Math.floor(Math.log10(Math.abs(x))));
+  return x.toLocaleString("en-US", {maximumFractionDigits: digits});
+}
+
+const state = {sweep: null, lines: [], measure: "reads", storage: "ssd", at: 0, decimals: 2};
+/* A value of the measure on screen, with the decimals its largest needs. */
+const fmt = v => v.toLocaleString("en-US", {minimumFractionDigits: state.decimals, maximumFractionDigits: state.decimals});
+
+/* ---------- reading the sweep ---------- */
+function check(s) {
+  if (s.format !== FORMAT) throw new Error(`not a sweep file (format ${JSON.stringify(s.format)})`);
+  if (s.version !== VERSION) throw new Error(`sweep version ${s.version}; this page reads version ${VERSION}`);
+  if (!s.sizes.length || !s.points.length) throw new Error("the sweep has no points");
+}
+/* One series per policy, in drawing order: value per size, by measure. */
+function seriesOf(s) {
+  const at = new Map(s.sizes.map((f, i) => [f, i]));
+  const by = new Map();
+  for (const p of s.points) {
+    if (!by.has(p.policy)) by.set(p.policy, new Array(s.sizes.length));
+    by.get(p.policy)[at.get(p.frames)] = p;
+  }
+  return Object.keys(POLICIES)
+    .filter(k => by.has(k))
+    .map(k => ({key: k, ...POLICIES[k], points: by.get(k)}));
+}
+const perQuery = (s, value) => value / s.queries;
+function values(series, measure) {
+  const s = state.sweep;
+  return series.points.map(p =>
+    measure === "reads" ? perQuery(s, p.disk_reads) : p[`${state.storage}_ms_per_query`]
+  );
+}
+
+/* ---------- sizes and memory ---------- */
+function memory(frames) {
+  const size = state.sweep.page_size;
+  if (!size) return "";
+  const bytes = frames * size;
+  if (bytes < 1 << 20) return `${num(bytes / 1024)} KB`;
+  if (bytes < 1 << 30) return `${num(bytes / (1 << 20))} MB`;
+  return `${num(bytes / (1 << 30))} GB`;
+}
+function share(frames) {
+  const pct = (100 * frames) / state.sweep.pages;
+  if (pct >= 99.95) return "all of the database";
+  return `${pct >= 10 ? Math.round(pct) : num(pct)}% of the database`;
+}
+
+/* The memory LRU needs to read no more than `target` per query, as measured:
+   more than the last size swept where it still reads more, at most the first
+   where it does not. Nothing in between is guessed: near a cliff, such as the
+   whole database starting to fit, a straight line between two sizes would be
+   far off. Null when the sweep has no LRU or LRU never gets there. */
+function lruNeeds(target) {
+  const lru = state.lines.find(l => l.key === "lru");
+  if (!lru) return null;
+  const sizes = state.sweep.sizes,
+    r = values(lru, "reads");
+  const i = r.findIndex(v => v <= target + 1e-12);
+  if (i < 0) return null;
+  return {over: i > 0 ? sizes[i - 1] : 0, atMost: sizes[i]};
+}
+/* A ratio of sizes, to two figures: 1.5, 2, 2.7, 12. */
+const times = x => num(Number(x.toPrecision(2)));
+
+/* ---------- the chart ---------- */
+const PAD = {l: 46, r: 22, t: 14, b: 54};
+function frame() {
+  const box = $("chart").getBoundingClientRect();
+  const s = state.sweep,
+    lo = Math.log(s.sizes[0]),
+    hi = Math.log(s.sizes[s.sizes.length - 1]);
+  const w = box.width - PAD.l - PAD.r,
+    h = box.height - PAD.t - PAD.b;
+  const all = state.lines.flatMap(l => values(l, state.measure));
+  if (state.measure === "reads") all.push(...sqliteDots().map(d => d.v));
+  const {top, step} = scale(Math.max(...all));
+  return {
+    box,
+    top,
+    step,
+    x: f => PAD.l + (hi > lo ? ((Math.log(f) - lo) / (hi - lo)) * w : w / 2),
+    y: v => PAD.t + h - (v / top) * h,
+    w,
+    h
+  };
+}
+/* About four gridlines, each 1, 2, 2.5 or 5 times a power of ten. */
+function scale(max) {
+  const rough = (max || 1) / 4,
+    power = 10 ** Math.floor(Math.log10(rough));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * power).find(m => m >= rough);
+  return {top: Math.ceil(max / step - 1e-9) * step, step};
+}
+function sqliteDots() {
+  const s = state.sweep;
+  return (s.sqlite_cache || [])
+    .filter(d => d.pages >= s.sizes[0] && d.pages <= s.sizes[s.sizes.length - 1])
+    .map(d => ({frames: d.pages, v: perQuery(s, d.reads)}));
+}
+/* Powers of two, thinned so the labels never touch. */
+function ticks(fr) {
+  const s = state.sweep,
+    out = [];
+  for (let p = 1; p <= s.sizes[s.sizes.length - 1]; p *= 2) if (p >= s.sizes[0]) out.push(p);
+  let every = 1;
+  while (out.length / every > Math.max(2, fr.w / 64)) every *= 2;
+  return out.filter((_, i) => i % every === 0);
+}
+function draw() {
+  const s = state.sweep,
+    chart = $("chart");
+  chart.replaceChildren();
+  const fr = frame();
+  chart.setAttribute("viewBox", `0 0 ${fr.box.width} ${fr.box.height}`);
+  for (let i = 0; i * fr.step <= fr.top + 1e-9; i++) {
+    const v = i * fr.step,
+      y = fr.y(v);
+    chart.append(svg("line", {class: "grid", x1: PAD.l, x2: PAD.l + fr.w, y1: y, y2: y}));
+    const t = svg("text", {x: PAD.l - 8, y: y + 4, "text-anchor": "end"});
+    t.textContent = num(v);
+    chart.append(t);
+  }
+  for (const f of ticks(fr)) {
+    const x = fr.x(f),
+      anchor = x > PAD.l + fr.w - 24 ? "end" : "middle";
+    const a = svg("text", {x, y: PAD.t + fr.h + 16, "text-anchor": anchor});
+    a.textContent = count(f);
+    const b = svg("text", {x, y: PAD.t + fr.h + 31, "text-anchor": anchor});
+    b.textContent = memory(f);
+    chart.append(a, b);
+  }
+  const whole = fr.x(s.pages);
+  if (s.pages <= s.sizes[s.sizes.length - 1]) {
+    chart.append(svg("line", {class: "whole", x1: whole, x2: whole, y1: PAD.t, y2: PAD.t + fr.h}));
+  }
+  const ax = svg("text", {x: PAD.l, y: fr.box.height - 2});
+  ax.textContent = s.page_size ? "frames in the pool, and the memory they take" : "frames in the pool";
+  chart.append(ax);
+  for (const l of state.lines) {
+    const v = values(l, state.measure);
+    const pts = s.sizes.map((f, i) => `${fr.x(f)},${fr.y(v[i])}`).join(" ");
+    const cls = `curve${l.faint ? " faint" : ""}${l.dotted ? " dotted" : ""}${l.floor ? " floor" : ""}`;
+    chart.append(svg("polyline", {class: cls, points: pts, stroke: css(l.colour)}));
+  }
+  if (state.measure === "reads") {
+    for (const d of sqliteDots()) chart.append(svg("circle", {class: "sq", cx: fr.x(d.frames), cy: fr.y(d.v), r: 4}));
+  }
+  const f = s.sizes[state.at],
+    x = fr.x(f);
+  chart.append(svg("line", {class: "here", x1: x, x2: x, y1: PAD.t, y2: PAD.t + fr.h}));
+  for (const l of state.lines) {
+    const v = values(l, state.measure)[state.at];
+    chart.append(svg("circle", {class: "pt", cx: x, cy: fr.y(v), r: 3.5, fill: css(l.colour)}));
+  }
+  chart.setAttribute("aria-label", `${MEASURES[state.measure].what} against pool size, for ${state.lines.length} policies. Use the arrow keys to move between sizes.`);
+  showReadout();
+}
+
+/* ---------- the readout ---------- */
+function swatch(l) {
+  const sw = el("span", `sw${l.floor ? " dash" : ""}${l.dotted ? " dots" : ""}`);
+  sw.style.background = css(l.colour);
+  if (l.floor) sw.style.borderTopColor = css(l.colour);
+  return sw;
+}
+function showReadout() {
+  const s = state.sweep,
+    f = s.sizes[state.at],
+    ro = $("readout");
+  const mem = memory(f);
+  const head = el("div", "at", `${count(f)} frames${mem ? ` · ${mem}` : ""} · ${share(f)}`);
+  const unit = state.measure === "reads" ? "reads per query" : `ms per query, ${state.storage.toUpperCase()}`;
+  const rows = state.lines
+    .map(l => ({l, v: values(l, state.measure)[state.at]}))
+    .sort((a, b) => a.v - b.v);
+  const lru = rows.find(r => r.l.key === "lru");
+  ro.replaceChildren(head, el("div", "at", unit));
+  for (const {l, v} of rows) {
+    const row = el("div", "row");
+    row.append(swatch(l), el("span", "", l.name), el("span", "val", fmt(v)));
+    if (state.measure === "reads" && lru && !l.floor && l.key !== "lru" && v < lru.v) {
+      const need = lruNeeds(v);
+      const say = !need
+        ? "LRU never reads this little at the sizes swept"
+        : need.over <= f
+          ? `LRU would need up to ${times(need.atMost / f)}× the memory`
+          : `LRU would need ${times(need.over / f)}–${times(need.atMost / f)}× the memory`;
+      row.append(el("span", "vs", say));
+    }
+    ro.append(row);
+  }
+  const dot = state.measure === "reads" && sqliteDots().find(d => d.frames === f);
+  if (dot) {
+    const row = el("div", "row");
+    row.append(el("span", "sw ring"), el("span", "", "SQLite's own cache"), el("span", "val", fmt(dot.v)));
+    ro.append(row);
+  }
+}
+
+/* ---------- legend, note, numbers ---------- */
+function legend() {
+  const g = $("legend");
+  g.replaceChildren();
+  for (const l of [...state.lines].reverse()) {
+    const item = el("span");
+    const floor = l.floor && state.measure === "reads";
+    item.append(swatch(l), document.createTextNode(floor ? `${l.name} (the floor)` : l.name));
+    g.append(item);
+  }
+  if (state.measure === "reads" && sqliteDots().length) {
+    const item = el("span");
+    item.append(el("span", "sw ring"), document.createTextNode("SQLite's own cache, measured"));
+    g.append(item);
+  }
+}
+function table() {
+  const s = state.sweep,
+    t = $("table"),
+    dots = state.measure === "reads" ? sqliteDots() : [];
+  const head = el("tr");
+  head.append(el("th", "", "Frames"));
+  if (s.page_size) head.append(el("th", "", "Memory"));
+  for (const l of state.lines) head.append(el("th", "", l.name));
+  if (dots.length) head.append(el("th", "", "SQLite"));
+  const body = el("tbody");
+  s.sizes.forEach((f, i) => {
+    const tr = el("tr");
+    tr.append(el("td", "", count(f)));
+    if (s.page_size) tr.append(el("td", "", memory(f)));
+    for (const l of state.lines) tr.append(el("td", "", fmt(values(l, state.measure)[i])));
+    if (dots.length) {
+      const d = dots.find(d => d.frames === f);
+      tr.append(el("td", "", d ? fmt(d.v) : ""));
+    }
+    body.append(tr);
+  });
+  const thead = el("thead");
+  thead.append(head);
+  t.replaceChildren(thead, body);
+}
+function render() {
+  const m = MEASURES[state.measure],
+    s = state.sweep;
+  const largest = Math.max(...state.lines.flatMap(l => values(l, state.measure)));
+  state.decimals = Math.max(0, 2 - Math.floor(Math.log10(largest || 1)));
+  $("what").textContent = state.measure === "reads" ? m.what : `${m.what}, ${state.storage.toUpperCase()}`;
+  $("note").textContent = m.note(s, sqliteDots().length > 0);
+  $("storageSeg").hidden = state.measure !== "time";
+  $("mReads").setAttribute("aria-pressed", state.measure === "reads");
+  $("mTime").setAttribute("aria-pressed", state.measure === "time");
+  $("sSsd").setAttribute("aria-pressed", state.storage === "ssd");
+  $("sHdd").setAttribute("aria-pressed", state.storage === "hdd");
+  legend();
+  table();
+  draw();
+}
+
+/* ---------- moving between sizes ---------- */
+function nearest(clientX) {
+  const fr = frame(),
+    s = state.sweep;
+  const x = clientX - fr.box.left;
+  let best = 0;
+  s.sizes.forEach((f, i) => {
+    if (Math.abs(fr.x(f) - x) < Math.abs(fr.x(s.sizes[best]) - x)) best = i;
+  });
+  return best;
+}
+function moveTo(i) {
+  const n = state.sweep.sizes.length;
+  i = Math.max(0, Math.min(n - 1, i));
+  if (i !== state.at) {
+    state.at = i;
+    draw();
+  }
+}
+$("chart").addEventListener("pointermove", e => moveTo(nearest(e.clientX)));
+$("chart").addEventListener("pointerdown", e => moveTo(nearest(e.clientX)));
+$("chart").addEventListener("keydown", e => {
+  const n = state.sweep.sizes.length;
+  const to = {ArrowLeft: state.at - 1, ArrowRight: state.at + 1, Home: 0, End: n - 1}[e.key];
+  if (to === undefined) return;
+  e.preventDefault();
+  moveTo(to);
+});
+const pick = (key, value) => () => {
+  state[key] = value;
+  render();
+};
+$("mReads").addEventListener("click", pick("measure", "reads"));
+$("mTime").addEventListener("click", pick("measure", "time"));
+$("sSsd").addEventListener("click", pick("storage", "ssd"));
+$("sHdd").addEventListener("click", pick("storage", "hdd"));
+new ResizeObserver(() => state.sweep && draw()).observe($("chart"));
+
+/* ---------- theme: the same switch and memory as the viewer ---------- */
+const isDark = () =>
+  document.documentElement.dataset.theme
+    ? document.documentElement.dataset.theme === "dark"
+    : matchMedia("(prefers-color-scheme: dark)").matches;
+const SUN =
+  '<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><circle cx="8" cy="8" r="3" fill="currentColor"/><g stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M8 1.5v1.6M8 12.9v1.6M1.5 8h1.6M12.9 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M3.4 12.6l1.1-1.1M11.5 4.5l1.1-1.1"/></g></svg>';
+const MOON =
+  '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M13.5 10.2A6 6 0 0 1 5.8 2.5a6 6 0 1 0 7.7 7.7z" fill="currentColor"/></svg>';
+function showTheme() {
+  const dark = isDark(),
+    b = $("themeBtn");
+  b.innerHTML = dark ? SUN : MOON;
+  b.setAttribute("aria-label", dark ? "Switch to light" : "Switch to dark");
+  b.title = b.getAttribute("aria-label");
+  if (state.sweep) render();
+}
+$("themeBtn").addEventListener("click", () => {
+  const t = isDark() ? "light" : "dark";
+  document.documentElement.dataset.theme = t;
+  try {
+    localStorage.setItem("bpsim.theme", t);
+  } catch {
+    /* this visit only */
+  }
+  showTheme();
+});
+showTheme();
+/* the chart is drawn in the page's colours, which change with the theme */
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", showTheme);
+
+/* for verify/browser.py */
+window.bpsim = Object.freeze({
+  version: VERSION,
+  at: () => state.at,
+  size: () => state.sweep.sizes[state.at],
+  theme: () => (isDark() ? "dark" : "light")
+});
+
+/* ---------- loading ---------- */
+function load(text) {
+  const s = JSON.parse(text);
+  check(s);
+  state.sweep = s;
+  state.lines = seriesOf(s);
+  /* open on the size nearest half the database: a pool that holds part of it */
+  const half = s.pages / 2;
+  state.at = s.sizes.reduce((b, f, i) => (Math.abs(f - half) < Math.abs(s.sizes[b] - half) ? i : b), 0);
+  const mem = memory(s.pages);
+  $("title").textContent = `${s.name}.db`;
+  $("sub").textContent = `${count(s.pages)} pages${mem ? ` (${mem})` : ""} · ${count(s.queries)} queries · ${count(s.accesses)} page requests · ${state.lines.length} policies × ${s.sizes.length} sizes`;
+  document.title = `${s.name}: bpsim sweep`;
+  $("cmd").textContent = s.command;
+  $("drop").hidden = true;
+  $("error").hidden = true;
+  $("app").hidden = false;
+  render();
+}
+function fail(err) {
+  const p = $("error");
+  p.textContent = `Could not show this sweep: ${err.message}`;
+  p.hidden = false;
+}
+const embedded = $("sweep").textContent.trim();
+if (embedded.startsWith("{")) {
+  try {
+    load(embedded);
+  } catch (err) {
+    fail(err);
+  }
+} else {
+  $("drop").hidden = false;
+  addEventListener("dragover", e => e.preventDefault());
+  addEventListener("drop", e => {
+    e.preventDefault();
+    const file = e.dataTransfer.files[0];
+    if (file) file.text().then(load).catch(fail);
+  });
+}
+</script>
+</body>
+</html>

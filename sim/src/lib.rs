@@ -19,6 +19,7 @@ pub mod run;
 pub mod sim;
 pub mod storage;
 pub mod summary;
+pub mod sweep;
 pub mod trace;
 pub mod workload;
 

@@ -12,12 +12,18 @@ in dark mode:
 - race, the arrow keys and dragging on the chart work, and dropping a run file
   of an older version shows an error instead of a page.
 
+And the sweep page, for a sweep with SQLite's cache measured, a small one and
+one of a workload: the lines are a faithful plot of the sweep's numbers, the
+table shows them, the readout's "LRU would need N× the memory" holds when the
+engine runs LRU at that size, and the switches, keys and theme work.
+
 Install Playwright once: pip install playwright && python -m playwright install chromium
 """
 
 from __future__ import annotations
 
 import json
+import math
 import random
 import shutil
 import subprocess
@@ -33,6 +39,7 @@ import model  # noqa: E402
 
 try:
     from playwright.sync_api import Page, sync_playwright
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
 except ImportError:
     print(
         __doc__.split("Install Playwright once: ")[1].strip().join(["Playwright is missing: ", ""])
@@ -267,7 +274,12 @@ def check_mem(page: Page, run: dict) -> list[str]:
     if page.evaluate("document.getElementById('mem').open"):
         problems.append("Memory over time is open before being asked for")
     page.click("#mem summary")
-    page.wait_for_function("() => document.getElementById('memCanvas').clientHeight > 0")
+    # The chart draws on the panel's toggle event, a moment after the click
+    # (a canvas has a height before it is drawn), so wait for its labels.
+    try:
+        page.wait_for_function("() => document.querySelector('.memlabel')", timeout=3000)
+    except PlaywrightTimeout:
+        problems.append("memory chart drew nothing within 3 s of opening")
     focus = page.evaluate("bpsim.focus()")
     by = {r["policy"]: r for r in run["runs"]}
     for p, r in by.items():
@@ -609,6 +621,225 @@ def check_motion(page: Page, reduced: bool) -> list[str]:
     return problems
 
 
+SWEEP_ALL = ["--policy", "all", "--frames", "sweep"]
+SWEEPS = [
+    ("reports sweep, with SQLite's cache",
+     ["--trace", str(TRACE_DIR / "reports.trace.json.gz"), *SWEEP_ALL]),
+    ("shop sweep", ["--trace", str(TRACE_DIR / "shop.trace.json"), *SWEEP_ALL]),
+    ("workload sweep, no LRU, no page size",
+     ["--policy", "pg,opt", "--frames", "8,16,64", "--ticks", "300"]),
+]  # fmt: skip
+ORDER = ["fifo", "clock", "lru", "pg", "innodb", "opt"]  # as the page draws them
+DROP = """t => {
+    const dt = new DataTransfer();
+    dt.items.add(new File([t], 'sweep.json'));
+    const init = {dataTransfer: dt, bubbles: true, cancelable: true};
+    document.dispatchEvent(new DragEvent('drop', init));
+}"""
+
+
+def decimals(values: list[float]) -> int:
+    """As the page picks them: enough for three figures of the largest."""
+    return max(0, 2 - math.floor(math.log10(max(values) or 1)))
+
+
+def plotted(sweep: dict, policy: str, measure: str) -> list[float]:
+    by_size = {p["frames"]: p for p in sweep["points"] if p["policy"] == policy}
+    if measure == "reads":
+        return [by_size[f]["disk_reads"] / sweep["queries"] for f in sweep["sizes"]]
+    return [by_size[f][f"{measure}_ms_per_query"] for f in sweep["sizes"]]
+
+
+def check_sweep_page(page: Page, sweep: dict, measure: str) -> list[str]:
+    """The lines plot the sweep's numbers, and the table shows them."""
+    problems = []
+    if page.evaluate("document.documentElement.scrollWidth > innerWidth"):
+        problems.append("the page scrolls sideways")
+    policies = [p for p in ORDER if p in sweep["policies"]]
+    lines = page.evaluate(
+        "[...document.querySelectorAll('#chart polyline')].map(l => l.getAttribute('points'))"
+    )
+    if len(lines) != len(policies):
+        return problems + [f"{len(lines)} lines drawn for {len(policies)} policies"]
+    xs, ys, vs = [], [], []
+    for policy, line in zip(policies, lines, strict=True):
+        pts = [tuple(map(float, xy.split(","))) for xy in line.split()]
+        values = plotted(sweep, policy, measure)
+        if len(pts) != len(sweep["sizes"]):
+            problems.append(f"{policy}: {len(pts)} points for {len(sweep['sizes'])} sizes")
+            continue
+        xs += [(x, math.log(f)) for (x, _), f in zip(pts, sweep["sizes"], strict=True)]
+        ys += [y for _, y in pts]
+        vs += values
+    # y must be a straight-line function of the value, x of the log of the size
+    for name, pairs in [("height", list(zip(vs, ys, strict=True))), ("position", xs)]:
+        (a0, b0), (a1, b1) = min(pairs), max(pairs)
+        off = max(abs(b0 + (a - a0) * (b1 - b0) / (a1 - a0) - b) for a, b in pairs)
+        if off > 0.5:
+            problems.append(f"a point's {name} is {off:.1f}px off a faithful plot")
+    dots = len(page.query_selector_all("#chart circle.sq"))
+    sizes = sweep["sizes"]
+    in_range = sum(sizes[0] <= d["pages"] <= sizes[-1] for d in sweep["sqlite_cache"])
+    want = in_range if measure == "reads" else 0
+    if dots != want:
+        problems.append(f"{dots} SQLite dots on the {measure} chart, expected {want}")
+    cells = page.evaluate(
+        """[...document.querySelectorAll('#table tbody tr')]
+            .map(r => [...r.cells].map(c => c.textContent))"""
+    )
+    every = [v for p in policies for v in plotted(sweep, p, measure)]
+    d = decimals(every)
+    first = 2 if sweep.get("page_size") else 1
+    for row, f in zip(cells, sizes, strict=True):
+        for cell, policy in zip(row[first : first + len(policies)], policies, strict=True):
+            want_v = plotted(sweep, policy, measure)[sizes.index(f)]
+            if abs(float(cell.replace(",", "")) - want_v) > 0.5 * 10**-d + 1e-9:
+                problems.append(f"table, {policy} at {f}: {cell}, expected {want_v:.{d + 2}f}")
+    return problems
+
+
+def readout(page: Page) -> list[dict]:
+    return page.evaluate(
+        """[...document.querySelectorAll('#readout .row')].map(r => ({
+            name: r.children[1].textContent, value: r.querySelector('.val').textContent,
+            vs: r.querySelector('.vs')?.textContent ?? null}))"""
+    )
+
+
+def lru_disk_reads(trace: Path, frames: int, queries: int, work: Path) -> float:
+    """Pages per query the engine's LRU reads at `frames`, read-ahead off."""
+    out = work / f"lru-{frames}"
+    cmd = [str(compare.SIM), "--trace", str(trace), "--policy", "lru", "--frames", str(frames)]
+    cmd += ["--read-ahead", "off", "--no-viewer", "--out", str(out)]
+    subprocess.run(cmd, check=True, capture_output=True)
+    summary = json.loads(next(out.glob("**/summary.json")).read_text(encoding="utf-8"))
+    return (summary["misses"] - summary["fresh_pages"]) / queries
+
+
+def check_sweep_readout(page: Page, sweep: dict, trace: Path, work: Path) -> list[str]:
+    """Opens near half the database. Where a policy beats LRU, the range of
+    memory it says LRU would need holds when the engine runs LRU at both ends:
+    still more reads at the low end, no more at the high end."""
+    problems = []
+    sizes = sweep["sizes"]
+    half = min(range(len(sizes)), key=lambda i: abs(sizes[i] - sweep["pages"] / 2))
+    if page.evaluate("bpsim.at()") != half:
+        problems.append(f"the readout opened at size {page.evaluate('bpsim.size()')}")
+    names = {"PostgreSQL-style": "pg", "InnoDB-style": "innodb", "Clock": "clock", "FIFO": "fifo"}
+    lru = plotted(sweep, "lru", "reads")[half]
+    nearest = lambda ratio: min(sizes, key=lambda f: abs(f - ratio * sizes[half]))  # noqa: E731
+    claims = 0
+    for row in readout(page):
+        policy = names.get(row["name"])
+        if policy is None:
+            continue
+        target = plotted(sweep, policy, "reads")[half]
+        if target < lru and row["vs"] is None:
+            problems.append(f"{row['name']} beats LRU but the readout says nothing")
+        if row["vs"] is None:
+            continue
+        claims += 1
+        ratios = row["vs"].split("need ")[1].split("×")[0].removeprefix("up to ").split("–")
+        ends = [nearest(float(r)) for r in ratios]
+        if len(ends) == 2 and lru_disk_reads(trace, ends[0], sweep["queries"], work) <= target:
+            problems.append(f"LRU already matches {row['name']} at {ends[0]} frames")
+        if lru_disk_reads(trace, ends[-1], sweep["queries"], work) > target + 1e-12:
+            problems.append(f"LRU at {ends[-1]} frames still reads more than {row['name']}")
+    if not claims:
+        problems.append("no policy showed how much memory LRU would need")
+    page.focus("#chart")
+    page.keyboard.press("ArrowRight")
+    if page.evaluate("bpsim.at()") != half + 1:
+        problems.append("the right arrow did not move to the next size")
+    page.keyboard.press("Home")
+    shown = page.inner_text("#readout")
+    if page.evaluate("bpsim.size()") != sizes[0] or f"{sizes[0]} frames" not in shown:
+        problems.append("Home did not move the readout to the smallest size")
+    page.keyboard.press("End")
+    if page.evaluate("bpsim.size()") != sizes[-1]:
+        problems.append("End did not move to the largest size")
+    box = page.query_selector("#chart").bounding_box()
+    page.mouse.move(box["x"] + 50, box["y"] + box["height"] / 2)
+    if page.evaluate("bpsim.at()") != 0:
+        problems.append("pointing at the left of the chart did not pick the smallest size")
+    return problems
+
+
+def check_sweep_controls(page: Page, sweep: dict, scheme: str) -> list[str]:
+    """Time on each drive; the storage switch only for time; the theme."""
+    problems = []
+    page.click("#mTime")
+    if not page.is_visible("#storageSeg"):
+        problems.append("the storage switch is hidden in the time view")
+    problems += [f"time, SSD: {p}" for p in check_sweep_page(page, sweep, "ssd")]
+    if "(the floor)" in page.inner_text("#legend"):
+        problems.append("Optimal is called the floor in the time view")
+    page.click("#sHdd")
+    problems += [f"time, HDD: {p}" for p in check_sweep_page(page, sweep, "hdd")]
+    page.click("#mReads")
+    if page.is_visible("#storageSeg"):
+        problems.append("the storage switch shows in the disk reads view")
+    before = page.evaluate("getComputedStyle(document.body).backgroundColor")
+    page.click("#themeBtn")
+    if (
+        page.evaluate("bpsim.theme()") == scheme
+        or page.evaluate("getComputedStyle(document.body).backgroundColor") == before
+    ):
+        problems.append("the theme button did not switch the page")
+    page.reload()
+    page.wait_for_selector("#chart polyline")
+    if page.evaluate("bpsim.theme()") == scheme:
+        problems.append("the chosen theme was not remembered")
+    page.evaluate(
+        """() => { localStorage.removeItem('bpsim.theme');
+        delete document.documentElement.dataset.theme; }"""
+    )
+    return problems
+
+
+def check_sweep_drop(page: Page, sweep: dict) -> list[str]:
+    """The page as shipped waits for a file, and refuses one of another version."""
+    page.goto((compare.REPO / "viewer" / "sweep.html").as_uri())
+    if not page.is_visible("#drop"):
+        return ["the empty page does not ask for a sweep.json"]
+    newer = dict(sweep, version=sweep["version"] + 1)
+    page.evaluate(DROP, json.dumps(newer))
+    page.wait_for_timeout(200)
+    if "this page reads version" not in page.inner_text("#error"):
+        return ["a sweep of another version was not refused with a clear error"]
+    page.evaluate(DROP, json.dumps(sweep))
+    page.wait_for_selector("#chart polyline")
+    return []
+
+
+def check_sweeps(browser, work: Path) -> tuple[int, list[str]]:  # noqa: ANN001
+    problems, checked = [], 0
+    for i, (label, args) in enumerate(SWEEPS):
+        out = work / f"sweep{i}"
+        cmd = [str(compare.SIM), *args, "--out", str(out)]
+        subprocess.run(cmd, check=True, capture_output=True)
+        html = next(out.glob("**/sweep.html"))
+        sweep = json.loads((html.parent / "sweep.json").read_text(encoding="utf-8"))
+        for width, scheme in [(1280, "light"), (400, "dark")]:
+            page = browser.new_page(viewport={"width": width, "height": 1000}, color_scheme=scheme)
+            errors: list[str] = []
+            page.on("pageerror", lambda e, errors=errors: errors.append(str(e)))
+            page.goto(html.as_uri())
+            page.wait_for_selector("#chart polyline")
+            found = check_sweep_page(page, sweep, "reads")
+            if i == 0:
+                found += check_sweep_controls(page, sweep, scheme)
+                if width == 1280:
+                    trace = Path(args[1])
+                    found += check_sweep_readout(page, sweep, trace, work)
+                    found += check_sweep_drop(page, sweep)
+            found += [f"script error: {e}" for e in errors]
+            problems += [f"{label} ({width}px {scheme}): {p}" for p in found]
+            checked += 1
+            page.close()
+    return checked, problems
+
+
 def main() -> int:
     if not compare.SIM.is_file():
         print(f"build the engine first: cd sim && cargo build --release ({compare.SIM} missing)")
@@ -661,6 +892,9 @@ def main() -> int:
                 problems += [f"{label} (reduce motion): {p}" for p in found]
                 checked += 1
                 page.close()
+        sweep_pages, sweep_problems = check_sweeps(browser, work)
+        checked += sweep_pages
+        problems += sweep_problems
         browser.close()
     for p in problems:
         print("PROBLEM", p)

@@ -521,3 +521,148 @@ fn a_gzipped_trace_replays_like_the_plain_one() {
     assert!(!done.status.success());
     assert!(String::from_utf8_lossy(&done.stderr).contains("broken.trace.json.gz"));
 }
+
+/// The folder a run or sweep was written to, from its last line of output.
+fn written_to(out: &Output) -> PathBuf {
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let last = stdout.lines().last().unwrap();
+    PathBuf::from(last.split(" written to ").nth(1).unwrap())
+}
+
+fn embedded_sweep(html: &Path) -> Value {
+    let html = std::fs::read_to_string(html).unwrap();
+    let open = r#"<script id="sweep" type="application/json">"#;
+    let start = html.find(open).unwrap() + open.len();
+    let end = start + html[start..].find("</script>").unwrap();
+    serde_json::from_str(&html[start..end]).unwrap()
+}
+
+/// Every sweep point equals the single runs it stands for: read-ahead off
+/// for disk reads, the default read-ahead for time on each drive. Checkout
+/// writes a page it never read, which must not count as a disk read.
+#[test]
+fn a_sweep_point_matches_the_single_runs_it_stands_for() {
+    let dir = out_dir("sweep");
+    let trace = format!(
+        "{}/../traces/checkout.trace.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let out = dir.to_str().unwrap();
+    let swept = written_to(&sim(&[
+        "--trace",
+        &trace,
+        "--policy",
+        "lru,innodb",
+        "--frames",
+        "24,8",
+        "--out",
+        out,
+    ]));
+    let sweep = read_json(&swept.join("sweep.json"));
+    assert_eq!(embedded_sweep(&swept.join("sweep.html")), sweep);
+    assert_eq!(sweep["sizes"], serde_json::json!([8, 24]));
+    assert_eq!(sweep["pages"], 32);
+    let points = sweep["points"].as_array().unwrap();
+    let order: Vec<(&str, u64)> = points
+        .iter()
+        .map(|p| (p["policy"].as_str().unwrap(), p["frames"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(
+        order,
+        [("lru", 8), ("lru", 24), ("innodb", 8), ("innodb", 24)]
+    );
+    let mut fresh_seen = 0;
+    for p in points {
+        let (policy, frames) = (p["policy"].as_str().unwrap(), p["frames"].to_string());
+        let single = |extra: &[&str]| {
+            let mut args = vec![
+                "--trace",
+                &trace,
+                "--policy",
+                policy,
+                "--frames",
+                &frames,
+                "--no-viewer",
+                "--out",
+                out,
+            ];
+            args.extend(extra);
+            read_json(&written_to(&sim(&args)).join("summary.json"))
+        };
+        let off = single(&["--read-ahead", "off"]);
+        assert_eq!(p["hits"], off["hits"], "{policy} {frames}");
+        assert_eq!(p["misses"], off["misses"]);
+        let fresh = off["fresh_pages"].as_u64().unwrap();
+        fresh_seen += fresh;
+        assert_eq!(p["disk_reads"], off["misses"].as_u64().unwrap() - fresh);
+        let ssd = single(&[]);
+        assert_eq!(p["read_requests"], ssd["read_requests"]);
+        let read = ssd["misses"].as_u64().unwrap() - ssd["fresh_pages"].as_u64().unwrap()
+            + ssd["pages_read_ahead"].as_u64().unwrap();
+        assert_eq!(p["pages_read"], read);
+        assert_eq!(p["ssd_ms_per_query"], ssd["mean_ms_per_query"]);
+        let hdd = single(&["--storage", "hdd"]);
+        assert_eq!(p["hdd_ms_per_query"], hdd["mean_ms_per_query"]);
+    }
+    assert!(
+        fresh_seen > 0,
+        "the trace must have pages written without a read"
+    );
+}
+
+#[test]
+fn a_default_sweep_runs_every_policy_from_8_frames_to_the_whole_database() {
+    let dir = out_dir("sweep_default");
+    let swept = written_to(&sim(&[
+        "--trace",
+        &shop_trace(),
+        "--policy",
+        "all",
+        "--frames",
+        "sweep",
+        "--out",
+        dir.to_str().unwrap(),
+    ]));
+    let sweep = read_json(&swept.join("sweep.json"));
+    assert_eq!(
+        sweep["sizes"],
+        serde_json::json!([8, 12, 16, 24, 32, 48, 64, 80])
+    );
+    assert_eq!(sweep["points"].as_array().unwrap().len(), 6 * 8);
+    assert_eq!(sweep["format"], "bpsim-sweep");
+    assert!(
+        sweep["command"]
+            .as_str()
+            .unwrap()
+            .starts_with("sim --trace ")
+    );
+    assert_rejected(
+        &["--trace", &shop_trace(), "--frames", "8,500"],
+        "exceeds the trace's total pages (80)",
+    );
+}
+
+/// --no-viewer writes only summaries, so a trace past the viewer's limit runs.
+#[test]
+fn without_the_viewer_a_trace_of_any_length_runs() {
+    let dir = out_dir("no_viewer");
+    let huge = tiny_trace(&dir.join("trace"), 250_001, "1");
+    let run = written_to(&sim(&[
+        "--trace",
+        &huge,
+        "--policy",
+        "lru",
+        "--frames",
+        "4",
+        "--no-viewer",
+        "--out",
+        dir.to_str().unwrap(),
+    ]));
+    assert_eq!(read_json(&run.join("summary.json"))["accesses"], 250_001);
+    assert!(!run.join("run.json").exists() && !run.join("viewer.html").exists());
+}

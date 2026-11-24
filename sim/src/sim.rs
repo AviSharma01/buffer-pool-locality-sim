@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::policy::{Ctx, Log, Note, PolicyKind};
 pub use crate::pool::{BufferPool, Evicted, FrameView, Outcome};
 pub use crate::readahead::ReadAhead;
-use crate::storage::{Read, StorageKind};
+use crate::storage::{PerStorage, Profile, Read, StorageKind};
 use crate::summary::RunSummary;
 use crate::trace::{Access, Trace};
 use crate::workload::Workload;
@@ -71,10 +71,15 @@ pub struct Metrics {
     pub read_ahead_unused: u64,
     pub evictions: u64,
     pub dirty_evictions: u64,
-    pub total_ms: f64,
+    /// Time under each kind of storage.
+    pub ms: PerStorage,
 }
 
 impl Metrics {
+    pub fn total_ms(&self, storage: StorageKind) -> f64 {
+        self.ms.get(storage)
+    }
+
     pub fn hit_rate(&self) -> f64 {
         let total = self.hits + self.misses;
         if total == 0 {
@@ -88,7 +93,7 @@ impl Metrics {
 /// What serving one access did, for its event.
 #[derive(Default)]
 struct Done {
-    ms: f64,
+    ms: PerStorage,
     read: Option<Read>,
     ahead: Vec<PageId>,
     ahead_evicted: Vec<Evicted>,
@@ -224,13 +229,14 @@ impl Simulator {
                 query: q,
                 scan: a.scan,
             };
-            self.metrics.total_ms += self.access(a, ctx);
+            let ms = self.access(a, ctx);
+            self.metrics.ms += ms;
         }
         Some(self.tick())
     }
 
-    /// Serve one access; returns its time in milliseconds.
-    fn access(&mut self, a: Access, ctx: Ctx) -> f64 {
+    /// Serve one access; returns its time under each kind of storage.
+    fn access(&mut self, a: Access, ctx: Ctx) -> PerStorage {
         // Each table or index is its own stream: does this access follow the
         // previous access to the same object?
         let owner = self.trace.owner_of(a.page);
@@ -238,12 +244,11 @@ impl Simulator {
             .and_then(|o| self.streams.insert(o, a.page))
             .is_some_and(|last| last.checked_add(1) == Some(a.page));
         let (frame, outcome) = self.pool.access(a, ctx, &mut self.log);
-        let profile = self.cfg.storage.profile();
         let mut done = Done::default();
         match outcome {
             Outcome::Hit => {
                 self.metrics.hits += 1;
-                done.ms = profile.hit_ms;
+                done.ms = PerStorage::priced(|p| p.hit_ms);
                 done.read_ahead_hit = self.waiting.remove(&a.page);
                 self.metrics.read_ahead_hits += u64::from(done.read_ahead_hit);
             }
@@ -264,12 +269,12 @@ impl Simulator {
 
     /// Count an eviction and price its write-back: a separate write request
     /// that leaves the read stream where it was.
-    fn evicted(&mut self, evicted: Option<Evicted>, ms: &mut f64) {
+    fn evicted(&mut self, evicted: Option<Evicted>, ms: &mut PerStorage) {
         if let Some(e) = evicted {
             self.metrics.evictions += 1;
             if e.dirty {
                 self.metrics.dirty_evictions += 1;
-                *ms += self.cfg.storage.profile().write_ms();
+                *ms += PerStorage::priced(Profile::write_ms);
             }
             if self.waiting.remove(&e.page) {
                 self.metrics.read_ahead_unused += 1;
@@ -309,10 +314,11 @@ impl Simulator {
         self.metrics.pages_read_ahead += u64::from(pages);
         self.last_read = Some(a.page + pages);
         done.read = Some(read);
-        done.ms += self.cfg.storage.profile().read_ms(read, 1 + pages);
+        done.ms += PerStorage::priced(|p| p.read_ms(read, 1 + pages));
     }
 
-    /// Keep the event if events are being recorded; returns its time.
+    /// Keep the event if events are being recorded; returns its time under
+    /// each kind of storage.
     fn record(
         &mut self,
         a: Access,
@@ -320,7 +326,7 @@ impl Simulator {
         frame: FrameIdx,
         outcome: Outcome,
         done: Done,
-    ) -> f64 {
+    ) -> PerStorage {
         if let Some(events) = &mut self.events {
             events.push(Event {
                 ctx,
@@ -343,6 +349,7 @@ impl Simulator {
     pub fn summary(&self) -> RunSummary {
         let m = &self.metrics;
         let queries = self.tick();
+        let total_ms = m.total_ms(self.cfg.storage);
         RunSummary {
             policy: self.cfg.policy.name().to_string(),
             frames: self.cfg.frames,
@@ -368,11 +375,11 @@ impl Simulator {
             dirty_at_end: self.pool.frame_views().iter().filter(|f| f.dirty).count() as u64,
             evictions: m.evictions,
             dirty_evictions: m.dirty_evictions,
-            total_ms: m.total_ms,
+            total_ms,
             mean_ms_per_query: if queries == 0 {
                 0.0
             } else {
-                m.total_ms / queries as f64
+                total_ms / queries as f64
             },
         }
     }
@@ -446,7 +453,8 @@ mod tests {
         );
         let p = StorageKind::Hdd.profile();
         let ms: f64 = expect.iter().map(|&r| p.read_ms(r, 1)).sum::<f64>() + 2.0 * p.write_ms();
-        assert!((m.total_ms - ms).abs() < 1e-9, "{} vs {ms}", m.total_ms);
+        let total = m.total_ms(StorageKind::Hdd);
+        assert!((total - ms).abs() < 1e-9, "{total} vs {ms}");
     }
 
     /// A page SQLite writes without reading costs no read and leaves the
@@ -482,7 +490,7 @@ mod tests {
         );
         let hdd = StorageKind::Hdd.profile();
         let ms = hdd.read_ms(Read::Jump, 1) + hdd.read_ms(Read::Ahead { skipped: 1 }, 1);
-        assert!((m.total_ms - ms).abs() < 1e-9);
+        assert!((m.total_ms(StorageKind::Hdd) - ms).abs() < 1e-9);
     }
 
     /// Writing a modified page back does not move the read stream: page 21
@@ -600,7 +608,8 @@ mod tests {
             + p.hit_ms
             + p.read_ms(Read::Next, 1)
             + p.read_ms(Read::Next, 5);
-        assert!((m.total_ms - ms).abs() < 1e-12, "{} vs {ms}", m.total_ms);
+        let total = m.total_ms(StorageKind::Ssd);
+        assert!((total - ms).abs() < 1e-12, "{total} vs {ms}");
     }
 
     #[test]

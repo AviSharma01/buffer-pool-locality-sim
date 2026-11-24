@@ -33,6 +33,8 @@ Rules, in brief:
 
 from __future__ import annotations
 
+import functools
+import gzip
 import json
 from pathlib import Path
 
@@ -46,8 +48,16 @@ PROFILES = {
 
 def load(path: Path | str) -> tuple[dict, list[list[list]], dict[int, str]]:
     """The trace, its queries as [page, dirty, scan_size, fresh] accesses, and
-    each page's owning table or index."""
-    t = json.loads(Path(path).read_text(encoding="utf-8"))
+    each page's owning table or index. Kept per file and modification time,
+    since a sweep check replays one trace many times; nothing changes them."""
+    path = Path(path)
+    return _load(path, path.stat().st_mtime_ns)
+
+
+@functools.lru_cache(maxsize=4)
+def _load(path: Path, _mtime: int) -> tuple[dict, list[list[list]], dict[int, str]]:
+    raw = gzip.decompress(path.read_bytes()) if path.suffix == ".gz" else path.read_bytes()
+    t = json.loads(raw.decode("utf-8"))
     owner = {p["page"]: p["object"] for p in t["pages"] if p["object"] is not None}
     size: dict[str, int] = {}
     for o in owner.values():

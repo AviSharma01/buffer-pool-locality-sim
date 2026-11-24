@@ -5,7 +5,8 @@
 -- capture builds a byte-identical database.
 --
 -- python capture/capture.py capture/scenarios/reports.sql --no-rows \
---   --max-pages 20000 -o traces/reports.trace.json.gz
+--   --max-pages 20000 --sqlite-cache 64,128,256,512,1024,2048,4096 \
+--   -o traces/reports.trace.json.gz
 
 -- setup
 PRAGMA page_size = 4096;

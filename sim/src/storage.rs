@@ -132,6 +132,30 @@ impl StorageKind {
     }
 }
 
+/// A time in milliseconds under each kind of storage. Storage never changes
+/// which pages are cached, so one run can price every profile as it goes.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PerStorage([f64; 2]);
+
+impl PerStorage {
+    /// The same cost under every profile.
+    pub fn priced(cost: impl Fn(&Profile) -> f64) -> Self {
+        Self(StorageKind::ALL.map(|k| cost(&k.profile())))
+    }
+
+    pub fn get(&self, storage: StorageKind) -> f64 {
+        self.0[storage as usize]
+    }
+}
+
+impl std::ops::AddAssign for PerStorage {
+    fn add_assign(&mut self, other: Self) {
+        for (a, b) in self.0.iter_mut().zip(other.0) {
+            *a += b;
+        }
+    }
+}
+
 impl fmt::Display for StorageKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())

@@ -2,6 +2,9 @@
 //! future. Needs the whole trace, so it is a yardstick, not a real policy:
 //! no policy can have fewer misses on the same trace.
 
+use std::cmp::Reverse;
+use std::collections::BTreeSet;
+
 use super::{Ctx, FrameState, Log, Note, Policy, Why};
 use crate::FrameIdx;
 
@@ -10,6 +13,9 @@ pub struct Opt {
     next_use: Vec<usize>,
     /// Next-use position of the page in each frame.
     frame_next: Vec<usize>,
+    /// Every frame, ordered so the last is the victim: furthest next use,
+    /// ties (e.g. several never used again) to the lowest frame.
+    by_next: BTreeSet<(usize, Reverse<FrameIdx>)>,
 }
 
 impl Opt {
@@ -17,7 +23,16 @@ impl Opt {
         Self {
             next_use,
             frame_next: vec![usize::MAX; frames],
+            by_next: (0..frames).map(|f| (usize::MAX, Reverse(f))).collect(),
         }
+    }
+
+    fn used(&mut self, frame: FrameIdx, ctx: Ctx) {
+        let next = self.next_use[ctx.pos];
+        self.by_next
+            .remove(&(self.frame_next[frame], Reverse(frame)));
+        self.by_next.insert((next, Reverse(frame)));
+        self.frame_next[frame] = next;
     }
 }
 
@@ -33,21 +48,19 @@ impl Policy for Opt {
     }
 
     fn on_hit(&mut self, frame: FrameIdx, ctx: Ctx, _log: &mut Log) {
-        self.frame_next[frame] = self.next_use[ctx.pos];
+        self.used(frame, ctx);
     }
 
     fn on_load(&mut self, frame: FrameIdx, ctx: Ctx, _log: &mut Log) {
-        self.frame_next[frame] = self.next_use[ctx.pos];
+        self.used(frame, ctx);
     }
 
     fn victim(&mut self, _ctx: Ctx, pinned: Option<FrameIdx>, log: &mut Log) -> FrameIdx {
-        // Furthest next use; ties (e.g. several never-used-again) -> lowest index.
-        let (frame, &next) = self
-            .frame_next
+        let &(next, Reverse(frame)) = self
+            .by_next
             .iter()
-            .enumerate()
-            .filter(|&(i, _)| Some(i) != pinned)
-            .max_by_key(|&(i, &next)| (next, std::cmp::Reverse(i)))
+            .rev()
+            .find(|&&(_, Reverse(f))| Some(f) != pinned)
             .expect("pool has frames");
         log.push(Note::Evict {
             frame,

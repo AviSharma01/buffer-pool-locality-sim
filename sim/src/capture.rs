@@ -47,6 +47,19 @@ pub struct CapturedTrace {
     /// Decoded contents of the pages the queries touch.
     pub rows: BTreeMap<u32, PageRows>,
     pub notes: Vec<String>,
+    /// Pages SQLite's own page cache read from the file when the same queries
+    /// ran with `cache_size` set to `pages` (capture.py --sqlite-cache).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sqlite_cache: Vec<SqliteCacheReads>,
+}
+
+/// SQLite's cache is LRU, so the engine's LRU with read-ahead off should read
+/// about as many pages. Not exactly: SQLite pins the pages a query is using,
+/// and checks page 1 with a 16-byte header read instead of reading it.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct SqliteCacheReads {
+    pub pages: usize,
+    pub reads: u64,
 }
 
 /// A table or index.
@@ -240,6 +253,36 @@ mod tests {
                "queries":[{{"title":"q","sql":"SELECT 1;","plan":["SCAN x"],"scans":{scans},
                             "io":{io}}}]}}"#
         )
+    }
+
+    #[test]
+    fn sqlite_cache_reads_are_optional() {
+        let plain = trace_json(FORMAT, VERSION, "[]");
+        assert!(
+            CapturedTrace::from_json(&plain)
+                .unwrap()
+                .sqlite_cache
+                .is_empty()
+        );
+        let with = plain.replacen(
+            r#""notes":[]"#,
+            r#""notes":[],"sqlite_cache":[{"pages":64,"reads":900},{"pages":128,"reads":700}]"#,
+            1,
+        );
+        let t = CapturedTrace::from_json(&with).unwrap();
+        assert_eq!(
+            t.sqlite_cache,
+            [
+                SqliteCacheReads {
+                    pages: 64,
+                    reads: 900
+                },
+                SqliteCacheReads {
+                    pages: 128,
+                    reads: 700
+                }
+            ]
+        );
     }
 
     fn accesses(io: &str) -> Vec<(u32, bool)> {

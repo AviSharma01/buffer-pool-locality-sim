@@ -7,6 +7,10 @@ both drives, read-ahead auto, off, 1 and 3 pages. About 2,200 runs, ~10 s.
 Optimal is compared on hits only: when several pages are never needed again,
 any of them is an optimal victim, and the two may pick different ones (same
 hits, different write-backs).
+
+compare_sweep checks a sweep the same way: every policy at one size on the
+reports workload trace, disk reads with read-ahead off and time on both
+drives with it on (about 30 s).
 """
 
 from __future__ import annotations
@@ -106,6 +110,44 @@ def compare(sim: Path | None = None) -> tuple[int, list[str]]:
     return runs, mismatches
 
 
+SWEEP_TRACE = REPO / "traces" / "reports.trace.json.gz"
+SWEEP_FRAMES = 512
+
+
+def compare_sweep(sim: Path | None = None) -> tuple[int, list[str]]:
+    """Every point of a one-size sweep against the model. Returns (model runs,
+    mismatch descriptions)."""
+    sim = sim or build()
+    runs, mismatches = 0, []
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        args = ["--trace", str(SWEEP_TRACE), "--policy", "all", "--frames", f"{SWEEP_FRAMES},8"]
+        subprocess.run([str(sim), *args, "--out", str(out)], check=True, capture_output=True)
+        sweep = json.loads(next(out.glob("**/sweep.json")).read_text(encoding="utf-8"))
+    for p in (p for p in sweep["points"] if p["frames"] == SWEEP_FRAMES):
+        policy, f = p["policy"], SWEEP_FRAMES
+        off = model.run(SWEEP_TRACE, policy, f, "ssd", "off")
+        ssd = model.run(SWEEP_TRACE, policy, f, "ssd", "auto")
+        hdd = model.run(SWEEP_TRACE, policy, f, "hdd", "auto")
+        runs += 3
+        reads = lambda m: m["next_page_reads"] + m["ahead_reads"] + m["jump_reads"]  # noqa: E731
+        want = {"hits": off["hits"]}
+        if policy != "opt":
+            want |= {
+                "disk_reads": reads(off),
+                "read_requests": ssd["read_requests"],
+                "pages_read": reads(ssd) + ssd["pages_read_ahead"],
+                "ssd_ms_per_query": ssd["total_ms"] / sweep["queries"],
+                "hdd_ms_per_query": hdd["total_ms"] / sweep["queries"],
+            }
+        for key, value in want.items():
+            if abs(p[key] - value) > 1e-6 * max(1.0, abs(value)):
+                mismatches.append(
+                    f"sweep, {policy}, {f} frames: {key} engine {p[key]} model {value}"
+                )
+    return runs, mismatches
+
+
 def main() -> int:
     try:
         sim = build()
@@ -113,9 +155,12 @@ def main() -> int:
         print(f"cannot build the engine: {e}")
         return 2
     runs, mismatches = compare(sim)
+    swept, sweep_mismatches = compare_sweep(sim)
+    mismatches += sweep_mismatches
     for m in mismatches[:20]:
         print("MISMATCH", m)
     print(f"{runs} runs compared, {len(mismatches)} mismatches (Optimal: hits only)")
+    print(f"sweep: {swept} model runs at {SWEEP_FRAMES} frames on {SWEEP_TRACE.name}")
     return 1 if mismatches else 0
 
 

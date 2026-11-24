@@ -15,17 +15,26 @@
 //! skips moving pages already in the youngest quarter; here the split applies
 //! from the first page and every young hit moves to the head.
 
+use super::list::FrameList;
 use super::{Ctx, FrameState, Log, Note, Policy, Region, Why};
 use crate::FrameIdx;
 
 pub struct InnoDb {
     /// Frames from head (most protected) to tail (next victim).
-    list: Vec<FrameIdx>,
+    list: FrameList,
+    /// Head of the old sublist (None while it is empty), how many frames run
+    /// from it to the tail, and which listed frames are in it. Kept exact
+    /// through every change; `relabel` then moves the head to the 3/8 mark.
+    old_head: Option<FrameIdx>,
+    old_count: usize,
+    in_old: Vec<bool>,
     /// Query of each frame's first use; None for a page read ahead and not
     /// used yet (innodb_old_blocks_time counts from the first access).
     loaded_in: Vec<Option<usize>>,
-    /// Region of each listed frame as of the last change.
+    /// Region of each listed frame as of the last relabel.
     region: Vec<Region>,
+    /// Frames that crossed the boundary since the last relabel.
+    crossed: Vec<FrameIdx>,
 }
 
 /// Old sublist length for a list of `len` pages: 3/8 rounded, and at least
@@ -37,40 +46,84 @@ fn old_len(len: usize) -> usize {
 impl InnoDb {
     pub fn new(frames: usize) -> Self {
         Self {
-            list: Vec::with_capacity(frames),
+            list: FrameList::new(frames),
+            old_head: None,
+            old_count: 0,
+            in_old: vec![false; frames],
             loaded_in: vec![None; frames],
             region: vec![Region::Young; frames],
+            crossed: Vec::new(),
         }
     }
 
-    fn position(&self, frame: FrameIdx) -> usize {
-        self.list
-            .iter()
-            .position(|&f| f == frame)
-            .expect("frame is in the list")
+    fn remove(&mut self, frame: FrameIdx) {
+        if self.in_old[frame] {
+            self.in_old[frame] = false;
+            self.old_count -= 1;
+            if self.old_head == Some(frame) {
+                self.old_head = self.list.next(frame);
+            }
+        }
+        self.list.remove(frame);
     }
 
     fn move_to_head(&mut self, frame: FrameIdx) {
-        let i = self.position(frame);
-        self.list.remove(i);
-        self.list.insert(0, frame);
+        self.remove(frame);
+        self.list.push_front(frame);
     }
 
-    /// Recompute regions after a move and note frames the boundary passed
-    /// (other than `moved`, whose own note already says where it went).
-    fn relabel(&mut self, moved: FrameIdx, log: &mut Log) {
-        let boundary = self.list.len() - old_len(self.list.len());
-        for (i, &frame) in self.list.iter().enumerate() {
-            let region = if i < boundary {
-                Region::Young
-            } else {
-                Region::Old
-            };
-            if self.region[frame] != region && frame != moved {
-                log.push(Note::Relabeled { frame, region });
-            }
-            self.region[frame] = region;
+    /// Move the old head until `count` frames run from it to the tail.
+    fn set_old_count(&mut self, count: usize) {
+        while self.old_count > count {
+            let frame = self.old_head.expect("old sublist is not empty");
+            self.cross(frame, false);
+            self.old_head = self.list.next(frame);
+            self.old_count -= 1;
         }
+        while self.old_count < count {
+            let frame = match self.old_head {
+                Some(head) => self.list.prev(head),
+                None => self.list.back(),
+            }
+            .expect("list is long enough");
+            self.cross(frame, true);
+            self.old_head = Some(frame);
+            self.old_count += 1;
+        }
+    }
+
+    fn cross(&mut self, frame: FrameIdx, old: bool) {
+        self.in_old[frame] = old;
+        self.crossed.push(frame);
+    }
+
+    fn side(&self, frame: FrameIdx) -> Region {
+        if self.in_old[frame] {
+            Region::Old
+        } else {
+            Region::Young
+        }
+    }
+
+    /// Put the boundary at the 3/8 mark and note frames it passed (other
+    /// than `moved`, whose own note already says where it went).
+    fn relabel(&mut self, moved: FrameIdx, log: &mut Log) {
+        self.set_old_count(old_len(self.list.len()));
+        self.region[moved] = self.side(moved);
+        let mut crossed = std::mem::take(&mut self.crossed);
+        for &frame in &crossed {
+            let region = self.side(frame);
+            if frame != moved && self.list.contains(frame) && self.region[frame] != region {
+                log.push(Note::Relabeled { frame, region });
+                self.region[frame] = region;
+            }
+        }
+        crossed.clear();
+        self.crossed = crossed;
+        debug_assert!(
+            self.list.iter().all(|f| self.region[f] == self.side(f)),
+            "a frame's region went stale"
+        );
     }
 }
 
@@ -92,9 +145,15 @@ impl Policy for InnoDb {
     }
 
     fn on_load(&mut self, frame: FrameIdx, ctx: Ctx, log: &mut Log) {
-        let len = self.list.len() + 1;
-        let midpoint = len - old_len(len);
-        self.list.insert(midpoint, frame);
+        // Enter as the head of old: old_len of the longer list, counting itself.
+        self.set_old_count(old_len(self.list.len() + 1) - 1);
+        match self.old_head {
+            Some(head) => self.list.insert_before(frame, head),
+            None => self.list.push_back(frame),
+        }
+        self.in_old[frame] = true;
+        self.old_head = Some(frame);
+        self.old_count += 1;
         self.loaded_in[frame] = Some(ctx.query);
         log.push(Note::Inserted { frame });
         self.relabel(frame, log);
@@ -109,12 +168,11 @@ impl Policy for InnoDb {
 
     fn victim(&mut self, _ctx: Ctx, pinned: Option<FrameIdx>, log: &mut Log) -> FrameIdx {
         // The tail, or the frame before it if the tail is pinned.
-        let at = self
+        let frame = self
             .list
-            .iter()
-            .rposition(|&f| Some(f) != pinned)
+            .back_except(pinned)
             .expect("pool has an unpinned frame");
-        let frame = self.list.remove(at);
+        self.remove(frame);
         log.push(Note::Evict {
             frame,
             why: Why::OldTail,
@@ -125,7 +183,7 @@ impl Policy for InnoDb {
     fn state(&self, frame: FrameIdx) -> FrameState {
         FrameState::InnoDb {
             region: self.region[frame],
-            rank: self.list.len() - 1 - self.position(frame),
+            rank: self.list.behind(frame),
         }
     }
 }
@@ -134,6 +192,10 @@ impl Policy for InnoDb {
 mod tests {
     use super::*;
     use crate::policy::test_util::{at, log};
+
+    fn order(p: &InnoDb) -> Vec<FrameIdx> {
+        p.list.iter().collect()
+    }
 
     fn filled(frames: usize) -> InnoDb {
         let mut p = InnoDb::new(frames);
@@ -173,7 +235,7 @@ mod tests {
     #[test]
     fn old_pages_are_promoted_only_by_a_later_query() {
         let mut p = filled(8);
-        let old = p.list[7];
+        let old = order(&p)[7];
         let mut l = log();
         p.on_hit(old, at(8, 0), &mut l);
         assert_eq!(l.take(), [Note::StaysOld { frame: old }]);
@@ -202,18 +264,18 @@ mod tests {
     fn a_one_query_scan_only_churns_the_old_sublist() {
         let mut p = filled(8);
         // Touch every young page again so they look hot.
-        let young: Vec<FrameIdx> = p.list[..5].to_vec();
+        let young = order(&p)[..5].to_vec();
         for (pos, &f) in young.iter().enumerate() {
             p.on_hit(f, at(10 + pos, 1), &mut log());
         }
-        let young_before: Vec<FrameIdx> = p.list[..5].to_vec();
+        let young_before = order(&p)[..5].to_vec();
         for pos in 20..40 {
             let ctx = at(pos, 2);
             let f = p.victim(ctx, None, &mut log());
             p.on_load(f, ctx, &mut log());
             p.on_hit(f, ctx, &mut log());
         }
-        assert_eq!(p.list[..5], young_before);
+        assert_eq!(order(&p)[..5], young_before);
     }
 
     /// A page read ahead also enters at the head of old, but its first use

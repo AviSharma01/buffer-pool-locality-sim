@@ -15,6 +15,7 @@
 mod clock;
 mod fifo;
 mod innodb;
+mod list;
 mod lru;
 mod opt;
 mod pg;
