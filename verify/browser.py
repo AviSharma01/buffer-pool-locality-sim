@@ -701,9 +701,56 @@ def check_sweep_page(page: Page, sweep: dict, measure: str) -> list[str]:
 def readout(page: Page) -> list[dict]:
     return page.evaluate(
         """[...document.querySelectorAll('#readout .row')].map(r => ({
-            name: r.children[1].textContent, value: r.querySelector('.val').textContent,
-            vs: r.querySelector('.vs')?.textContent ?? null}))"""
+            name: r.children[1].textContent, cmp: r.querySelector('.cmp').textContent}))"""
     )
+
+
+NAMES = {
+    "fifo": "FIFO", "clock": "Clock", "lru": "LRU",
+    "pg": "PostgreSQL-style", "innodb": "InnoDB-style", "opt": "Optimal",
+}  # fmt: skip
+
+
+def js_round(x: float) -> int:
+    """Math.round: halves go up."""
+    return math.floor(x + 0.5)
+
+
+def standings(sweep: dict, measure: str, i: int) -> tuple[dict, str, float | None]:
+    """Each policy's value at size i, the best real policy (not Optimal), and
+    LRU's value (None without LRU)."""
+    values = {p: plotted(sweep, p, measure)[i] for p in sweep["policies"]}
+    best = min((p for p in values if p != "opt"), key=lambda p: values[p])
+    return values, best, values.get("lru")
+
+
+def expected_answer(sweep: dict, measure: str) -> str:
+    """The facts the top line must state, for the size the page opens on."""
+    sizes = sweep["sizes"]
+    half = min(range(len(sizes)), key=lambda i: abs(sizes[i] - sweep["pages"] / 2))
+    values, best, lru = standings(sweep, measure, half)
+    name = NAMES[best]
+    if lru is None:
+        return f"{name} reads the fewest pages" if measure == "reads" else f"{name} is fastest"
+    if best == "lru":
+        return "no policy here reads fewer" if measure == "reads" else "no policy here is faster"
+    pct = js_round(100 * (1 - values[best] / lru))
+    if pct == 0:
+        return f"{name} and LRU"
+    if measure == "reads":
+        return f"{name} reads {pct}% fewer pages from disk than LRU"
+    return f"{name} queries take {pct}% less time than LRU's"
+
+
+def check_answer(page: Page, sweep: dict, measure: str) -> list[str]:
+    text = page.inner_text("#answer")
+    want = expected_answer(sweep, measure)
+    if want not in text:
+        return [f"the top line says {text!r}, expected it to say {want!r}"]
+    drive = {"ssd": "On an SSD", "hdd": "On a hard drive"}.get(measure)
+    if drive and not text.startswith(drive):
+        return [f"the top line for time does not name the drive: {text!r}"]
+    return []
 
 
 def lru_disk_reads(trace: Path, frames: int, queries: int, work: Path) -> float:
@@ -717,43 +764,52 @@ def lru_disk_reads(trace: Path, frames: int, queries: int, work: Path) -> float:
 
 
 def check_sweep_readout(page: Page, sweep: dict, trace: Path, work: Path) -> list[str]:
-    """Opens near half the database. Where a policy beats LRU, the range of
-    memory it says LRU would need holds when the engine runs LRU at both ends:
-    still more reads at the low end, no more at the high end."""
+    """Opens near half the database, with each policy against LRU. The range
+    of memory it says LRU needs to match the best policy holds when the engine
+    runs LRU at both ends (still more reads at the low end, no more at the
+    high end), and the top line says the same. Moving the readout leaves the
+    top line alone."""
     problems = []
     sizes = sweep["sizes"]
     half = min(range(len(sizes)), key=lambda i: abs(sizes[i] - sweep["pages"] / 2))
     if page.evaluate("bpsim.at()") != half:
         problems.append(f"the readout opened at size {page.evaluate('bpsim.size()')}")
-    names = {"PostgreSQL-style": "pg", "InnoDB-style": "innodb", "Clock": "clock", "FIFO": "fifo"}
-    lru = plotted(sweep, "lru", "reads")[half]
-    nearest = lambda ratio: min(sizes, key=lambda f: abs(f - ratio * sizes[half]))  # noqa: E731
-    claims = 0
+    values, best, lru = standings(sweep, "reads", half)
+    keys = {v: k for k, v in NAMES.items()}
     for row in readout(page):
-        policy = names.get(row["name"])
-        if policy is None:
-            continue
-        target = plotted(sweep, policy, "reads")[half]
-        if target < lru and row["vs"] is None:
-            problems.append(f"{row['name']} beats LRU but the readout says nothing")
-        if row["vs"] is None:
-            continue
-        claims += 1
-        ratios = row["vs"].split("need ")[1].split("×")[0].removeprefix("up to ").split("–")
-        ends = [nearest(float(r)) for r in ratios]
-        if len(ends) == 2 and lru_disk_reads(trace, ends[0], sweep["queries"], work) <= target:
-            problems.append(f"LRU already matches {row['name']} at {ends[0]} frames")
-        if lru_disk_reads(trace, ends[-1], sweep["queries"], work) > target + 1e-12:
-            problems.append(f"LRU at {ends[-1]} frames still reads more than {row['name']}")
-    if not claims:
-        problems.append("no policy showed how much memory LRU would need")
+        policy = keys[row["name"]]
+        pct = js_round(100 * (1 - values[policy] / lru))
+        want = (
+            "baseline" if policy == "lru"
+            else "same" if pct == 0
+            else f"{abs(pct)}% {'fewer' if pct > 0 else 'more'}"
+        )  # fmt: skip
+        if row["cmp"] != want:
+            problems.append(f"readout, {row['name']}: {row['cmp']!r}, expected {want!r}")
+    need = page.eval_on_selector_all("#readout .need", "ns => ns.map(n => n.textContent)")
+    if len(need) != 1 or not need[0].endswith(f"the memory to match {NAMES[best]}"):
+        return problems + [f"the readout's memory line is {need}, about {NAMES[best]}"]
+    range_text = need[0].split("needs ")[1].split(" the memory")[0]
+    if f"LRU needs {range_text} the memory to do as well" not in page.inner_text("#answer"):
+        problems.append("the top line and the readout give LRU different memory")
+    nearest = lambda ratio: min(sizes, key=lambda f: abs(f - ratio * sizes[half]))  # noqa: E731
+    ends = [nearest(float(r)) for r in range_text.removeprefix("up to ").rstrip("×").split("–")]
+    target = values[best]
+    if len(ends) == 2 and lru_disk_reads(trace, ends[0], sweep["queries"], work) <= target:
+        problems.append(f"LRU already matches {NAMES[best]} at {ends[0]} frames")
+    if lru_disk_reads(trace, ends[-1], sweep["queries"], work) > target + 1e-12:
+        problems.append(f"LRU at {ends[-1]} frames still reads more than {NAMES[best]}")
+    if "same as LRU" not in page.inner_text("#readout"):
+        problems.append("the readout does not say SQLite's own cache reads the same as LRU")
+    top = page.inner_text("#answer")
     page.focus("#chart")
     page.keyboard.press("ArrowRight")
     if page.evaluate("bpsim.at()") != half + 1:
         problems.append("the right arrow did not move to the next size")
     page.keyboard.press("Home")
-    shown = page.inner_text("#readout")
-    if page.evaluate("bpsim.size()") != sizes[0] or f"{sizes[0]} frames" not in shown:
+    head = page.inner_text("#readout .at")
+    kb = sizes[0] * sweep["page_size"] // 1024
+    if page.evaluate("bpsim.size()") != sizes[0] or not head.startswith(f"{kb} KB ·"):
         problems.append("Home did not move the readout to the smallest size")
     page.keyboard.press("End")
     if page.evaluate("bpsim.size()") != sizes[-1]:
@@ -762,6 +818,10 @@ def check_sweep_readout(page: Page, sweep: dict, trace: Path, work: Path) -> lis
     page.mouse.move(box["x"] + 50, box["y"] + box["height"] / 2)
     if page.evaluate("bpsim.at()") != 0:
         problems.append("pointing at the left of the chart did not pick the smallest size")
+    page.click("#mTime")
+    page.click("#mReads")
+    if page.inner_text("#answer") != top:
+        problems.append("after moving the readout, the top line is about another size")
     return problems
 
 
@@ -772,10 +832,16 @@ def check_sweep_controls(page: Page, sweep: dict, scheme: str) -> list[str]:
     if not page.is_visible("#storageSeg"):
         problems.append("the storage switch is hidden in the time view")
     problems += [f"time, SSD: {p}" for p in check_sweep_page(page, sweep, "ssd")]
+    problems += [f"time, SSD: {p}" for p in check_answer(page, sweep, "ssd")]
+    if page.inner_text("#what") != "Time per query (ms), SSD":
+        problems.append(f"the time chart's heading is {page.inner_text('#what')!r}")
     if "(the floor)" in page.inner_text("#legend"):
         problems.append("Optimal is called the floor in the time view")
     page.click("#sHdd")
     problems += [f"time, HDD: {p}" for p in check_sweep_page(page, sweep, "hdd")]
+    problems += [f"time, HDD: {p}" for p in check_answer(page, sweep, "hdd")]
+    if page.inner_text("#what") != "Time per query (ms), HDD":
+        problems.append(f"the time chart's heading is {page.inner_text('#what')!r} on HDD")
     page.click("#mReads")
     if page.is_visible("#storageSeg"):
         problems.append("the storage switch shows in the disk reads view")
@@ -826,7 +892,7 @@ def check_sweeps(browser, work: Path) -> tuple[int, list[str]]:  # noqa: ANN001
             page.on("pageerror", lambda e, errors=errors: errors.append(str(e)))
             page.goto(html.as_uri())
             page.wait_for_selector("#chart polyline")
-            found = check_sweep_page(page, sweep, "reads")
+            found = check_sweep_page(page, sweep, "reads") + check_answer(page, sweep, "reads")
             if i == 0:
                 found += check_sweep_controls(page, sweep, scheme)
                 if width == 1280:

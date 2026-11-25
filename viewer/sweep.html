@@ -54,6 +54,7 @@ button:focus-visible,summary:focus-visible,svg:focus-visible{outline:2px solid v
 .name{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
 .name h1{font-family:var(--f-display);font-weight:600;font-size:22px;letter-spacing:-.01em;margin:0}
 .name span{font-size:12.5px;color:var(--muted)}
+.answer{margin:-6px 0 0;font-size:15px;line-height:1.5;max-width:70ch}
 .ctrl{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .seg{display:inline-flex;background:var(--panel);border-radius:999px;padding:3px}
 .seg button{background:transparent;height:26px}
@@ -67,7 +68,7 @@ button:focus-visible,summary:focus-visible,svg:focus-visible{outline:2px solid v
 .seg.small button{height:22px;font-size:11.5px;padding:0 10px}
 
 /* the chart, with the readout for the size pointed at beside it */
-.chartwrap{display:grid;grid-template-columns:minmax(0,1fr) 250px;gap:16px;align-items:start}
+.chartwrap{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:16px;align-items:start}
 #chart{display:block;width:100%;height:360px;touch-action:pan-y;cursor:crosshair}
 #chart text{font-family:var(--f-body);font-size:11px;fill:var(--muted)}
 #chart .grid{stroke:var(--line);stroke-width:1}
@@ -80,10 +81,13 @@ button:focus-visible,summary:focus-visible,svg:focus-visible{outline:2px solid v
 #chart .sq{fill:var(--bg);stroke:var(--accent);stroke-width:1.6}
 #chart .pt{stroke:var(--bg);stroke-width:1.5}
 .readout{background:var(--raised);border-radius:14px;padding:10px 12px;font-size:12.5px;min-height:100%}
-.readout .at{color:var(--muted);margin-bottom:5px}
-.readout .row{display:grid;grid-template-columns:10px 1fr auto;align-items:baseline;gap:7px;line-height:1.55}
-.readout .val{font-variant-numeric:tabular-nums;text-align:right}
-.readout .vs{grid-column:2 / -1;color:var(--muted);font-size:11.5px;margin-top:-3px}
+.readout .at{color:var(--muted);margin-bottom:6px}
+.readout .row{display:grid;grid-template-columns:10px 1fr auto 3.2em;align-items:baseline;gap:7px;line-height:1.6}
+.readout .row.best{font-weight:500}
+.readout .cmp,.readout .val{font-variant-numeric:tabular-nums;text-align:right}
+.readout .val{color:var(--muted);font-size:11.5px}
+.readout .foot{color:var(--muted);font-size:12px;margin-top:8px;padding-top:7px;box-shadow:0 -1px 0 var(--line)}
+.readout .foot+.foot{margin-top:2px;padding-top:0;box-shadow:none}
 .sw{width:10px;height:3px;border-radius:2px;display:inline-block;align-self:center}
 .sw.ring{width:9px;height:9px;border-radius:50%;background:transparent!important;border:1.6px solid var(--accent)}
 .sw.dash{height:0;border-top:2px dashed var(--ink);background:transparent!important}
@@ -138,6 +142,7 @@ tbody tr:nth-child(odd){background:var(--soft)}
       <button type="button" class="icon" id="themeBtn"></button>
     </div>
   </header>
+  <p class="answer" id="answer" aria-live="polite"></p>
 
   <section class="panel" aria-labelledby="what">
     <div class="phead"><b id="what"></b>
@@ -177,17 +182,14 @@ const POLICIES = {
 const MEASURES = {
   reads: {
     what: "Pages read from disk per query",
-    note: (s, sqlite) =>
-      `Read-ahead off, so each line shows what the policy alone keeps in memory. Optimal (dashed) knows every future request, so no policy reads less.${
-        sqlite
-          ? " Dots: SQLite's own page cache, measured on the same queries. It is LRU, so they should sit on the LRU line."
-          : ""
-      }`
+    note: () => "Read-ahead off, so each line is the policy alone. Optimal is the best any policy could do."
   },
   time: {
     what: "Time per query",
     note: s =>
-      `With read-ahead ${s.read_ahead === "off" ? "off" : "on"}, as the drive would take it: a hit costs almost nothing, a miss costs a request to the drive. Optimal never reads ahead, so here it can be slower than a policy that does.`
+      s.read_ahead === "off"
+        ? "Read-ahead off, as the drive would take it."
+        : "Read-ahead on, as the drive would take it. Optimal never reads ahead, so it can be slower here."
   }
 };
 const $ = id => document.getElementById(id);
@@ -212,7 +214,7 @@ function num(x) {
   return x.toLocaleString("en-US", {maximumFractionDigits: digits});
 }
 
-const state = {sweep: null, lines: [], measure: "reads", storage: "ssd", at: 0, decimals: 2};
+const state = {sweep: null, lines: [], measure: "reads", storage: "ssd", at: 0, half: 0, decimals: 2};
 /* A value of the measure on screen, with the decimals its largest needs. */
 const fmt = v => v.toLocaleString("en-US", {minimumFractionDigits: state.decimals, maximumFractionDigits: state.decimals});
 
@@ -254,7 +256,8 @@ function memory(frames) {
 function share(frames) {
   const pct = (100 * frames) / state.sweep.pages;
   if (pct >= 99.95) return "all of the database";
-  return `${pct >= 10 ? Math.round(pct) : num(pct)}% of the database`;
+  if (Math.abs(pct - 50) <= 5) return "half the database";
+  return `${pct >= 10 ? Math.round(pct) : Number(pct.toPrecision(2))}% of the database`;
 }
 
 /* The memory LRU needs to read no more than `target` per query, as measured:
@@ -375,39 +378,85 @@ function swatch(l) {
   if (l.floor) sw.style.borderTopColor = css(l.colour);
   return sw;
 }
+/* Every policy at size `i`, lowest first, with LRU and the best real policy
+   (not Optimal) picked out. The top line and the readout both read this. */
+function standings(i) {
+  const rows = state.lines
+    .map(l => ({l, v: values(l, state.measure)[i]}))
+    .sort((a, b) => a.v - b.v);
+  return {rows, lru: rows.find(r => r.l.key === "lru"), best: rows.find(r => !r.l.floor)};
+}
+/* Against LRU, in whole percent: positive when lower (better). */
+const vsLru = (v, lru) => Math.round(100 * (1 - v / lru));
+function against(v, lru) {
+  const pct = vsLru(v, lru);
+  if (pct === 0) return "same";
+  const fewer = state.measure === "reads" ? "fewer" : "less";
+  return `${Math.abs(pct)}% ${pct > 0 ? fewer : "more"}`;
+}
+/* How much memory LRU needs to read as little as `v` at size `f`, as words. */
+function lruRange(v, f) {
+  const need = lruNeeds(v);
+  if (!need) return null;
+  const top = times(need.atMost / f);
+  return need.over <= f ? `up to ${top}×` : `${times(need.over / f)}–${top}×`;
+}
 function showReadout() {
   const s = state.sweep,
     f = s.sizes[state.at],
     ro = $("readout");
   const mem = memory(f);
-  const head = el("div", "at", `${count(f)} frames${mem ? ` · ${mem}` : ""} · ${share(f)}`);
-  const unit = state.measure === "reads" ? "reads per query" : `ms per query, ${state.storage.toUpperCase()}`;
-  const rows = state.lines
-    .map(l => ({l, v: values(l, state.measure)[state.at]}))
-    .sort((a, b) => a.v - b.v);
-  const lru = rows.find(r => r.l.key === "lru");
-  ro.replaceChildren(head, el("div", "at", unit));
+  const head = el("div", "at", `${mem || `${count(f)} frames`} · ${share(f)}`);
+  const {rows, lru, best} = standings(state.at);
+  ro.replaceChildren(head);
   for (const {l, v} of rows) {
-    const row = el("div", "row");
-    row.append(swatch(l), el("span", "", l.name), el("span", "val", fmt(v)));
-    if (state.measure === "reads" && lru && !l.floor && l.key !== "lru" && v < lru.v) {
-      const need = lruNeeds(v);
-      const say = !need
-        ? "LRU never reads this little at the sizes swept"
-        : need.over <= f
-          ? `LRU would need up to ${times(need.atMost / f)}× the memory`
-          : `LRU would need ${times(need.over / f)}–${times(need.atMost / f)}× the memory`;
-      row.append(el("span", "vs", say));
-    }
+    const row = el("div", `row${l === best.l && lru && best !== lru ? " best" : ""}`);
+    const cmp = !lru ? "" : l.key === "lru" ? "baseline" : against(v, lru.v);
+    row.append(swatch(l), el("span", "", l.name), el("span", "cmp", cmp), el("span", "val", fmt(v)));
     ro.append(row);
   }
-  const dot = state.measure === "reads" && sqliteDots().find(d => d.frames === f);
+  if (state.measure !== "reads") return;
+  if (lru && best !== lru && vsLru(best.v, lru.v) > 0) {
+    const range = lruRange(best.v, f);
+    const say = range
+      ? `LRU needs ${range} the memory to match ${best.l.name}`
+      : `LRU doesn't match ${best.l.name} at any size swept`;
+    ro.append(el("div", "foot need", say));
+  }
+  const dot = sqliteDots().find(d => d.frames === f);
   if (dot) {
-    const row = el("div", "row");
-    row.append(el("span", "sw ring"), el("span", "", "SQLite's own cache"), el("span", "val", fmt(dot.v)));
-    ro.append(row);
+    const same = lru && Math.abs(dot.v - lru.v) <= 0.005 * lru.v;
+    const vs = !lru ? "" : same ? ", same as LRU" : `, LRU ${fmt(lru.v)}`;
+    ro.append(el("div", "foot", `SQLite's own cache: ${fmt(dot.v)}${vs}`));
   }
 }
+
+/* The one-line answer above the chart, about the size the page opens on. */
+function answer() {
+  const s = state.sweep,
+    i = state.half,
+    f = s.sizes[i];
+  const {lru, best} = standings(i);
+  const where = `with ${share(f)} in memory`;
+  const name = best.l.name;
+  if (state.measure === "reads") {
+    if (!lru) return `${cap(where)}, ${name} reads the fewest pages from disk: ${fmt(best.v)} per query.`;
+    if (best === lru) return `${cap(where)}, no policy here reads fewer pages from disk than LRU.`;
+    const pct = vsLru(best.v, lru.v);
+    if (pct === 0) return `${cap(where)}, ${name} and LRU read about as many pages from disk.`;
+    const range = lruRange(best.v, f);
+    const then = range ? `LRU needs ${range} the memory to do as well.` : "LRU doesn't get there at any size swept.";
+    return `${cap(where)}, ${name} reads ${pct}% fewer pages from disk than LRU. ${then}`;
+  }
+  const drive = state.storage === "ssd" ? "On an SSD" : "On a hard drive";
+  const ms = v => `${fmt(v)} ms`;
+  if (!lru) return `${drive} ${where}, ${name} is fastest: ${ms(best.v)} per query.`;
+  if (best === lru) return `${drive} ${where}, no policy here is faster than LRU.`;
+  const pct = vsLru(best.v, lru.v);
+  if (pct === 0) return `${drive} ${where}, ${name} and LRU take about the same time.`;
+  return `${drive} ${where}, ${name} queries take ${pct}% less time than LRU's (${ms(best.v)} vs ${ms(lru.v)}).`;
+}
+const cap = t => t[0].toUpperCase() + t.slice(1);
 
 /* ---------- legend, note, numbers ---------- */
 function legend() {
@@ -421,7 +470,7 @@ function legend() {
   }
   if (state.measure === "reads" && sqliteDots().length) {
     const item = el("span");
-    item.append(el("span", "sw ring"), document.createTextNode("SQLite's own cache, measured"));
+    item.append(el("span", "sw ring"), document.createTextNode("SQLite's own cache (measured)"));
     g.append(item);
   }
 }
@@ -455,8 +504,8 @@ function render() {
     s = state.sweep;
   const largest = Math.max(...state.lines.flatMap(l => values(l, state.measure)));
   state.decimals = Math.max(0, 2 - Math.floor(Math.log10(largest || 1)));
-  $("what").textContent = state.measure === "reads" ? m.what : `${m.what}, ${state.storage.toUpperCase()}`;
-  $("note").textContent = m.note(s, sqliteDots().length > 0);
+  $("what").textContent = state.measure === "reads" ? m.what : `${m.what} (ms), ${state.storage.toUpperCase()}`;
+  $("note").textContent = m.note(s);
   $("storageSeg").hidden = state.measure !== "time";
   $("mReads").setAttribute("aria-pressed", state.measure === "reads");
   $("mTime").setAttribute("aria-pressed", state.measure === "time");
@@ -465,6 +514,7 @@ function render() {
   legend();
   table();
   draw();
+  $("answer").textContent = answer();
 }
 
 /* ---------- moving between sizes ---------- */
@@ -552,10 +602,12 @@ function load(text) {
   state.lines = seriesOf(s);
   /* open on the size nearest half the database: a pool that holds part of it */
   const half = s.pages / 2;
-  state.at = s.sizes.reduce((b, f, i) => (Math.abs(f - half) < Math.abs(s.sizes[b] - half) ? i : b), 0);
+  state.half = s.sizes.reduce((b, f, i) => (Math.abs(f - half) < Math.abs(s.sizes[b] - half) ? i : b), 0);
+  state.at = state.half;
   const mem = memory(s.pages);
-  $("title").textContent = `${s.name}.db`;
-  $("sub").textContent = `${count(s.pages)} pages${mem ? ` (${mem})` : ""} · ${count(s.queries)} queries · ${count(s.accesses)} page requests · ${state.lines.length} policies × ${s.sizes.length} sizes`;
+  /* a workload is generated, so there is no database file to name */
+  $("title").textContent = s.input === "trace" ? `${s.name}.db` : `${s.name} workload`;
+  $("sub").textContent = `${count(s.pages)} pages${mem ? ` (${mem})` : ""} · ${count(s.queries)} queries`;
   document.title = `${s.name}: bpsim sweep`;
   $("cmd").textContent = s.command;
   $("drop").hidden = true;
