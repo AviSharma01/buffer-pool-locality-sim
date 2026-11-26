@@ -1,79 +1,69 @@
-# db-locality-sim
+# buffer-pool-locality-sim
 
-A database buffer pool simulator that demonstrates how **physical table clustering** affects I/O cost. The simulator tracks query co-access patterns and periodically reclusters tables on disk into an arrangement that minimizes weighted seek distance.
+Replays real SQLite page reads through six buffer-pool eviction policies, to
+see how much memory each one needs for the same work.
 
-## Motivation
+![Pages read from disk per query against pool size, for each policy](docs/sweep.png)
 
-UBC's Computer Hardware and Operating Systems course provided an interesting idea of how real database systems manage memory dynamically, not just through simple caching but through access-aware buffer pool policies and workload driven optimization.
+## What it found
 
-These mechanisms are critical for performance, yet they are difficult to observe directly. This project was motivated by a desire to make those internal behaviours visible. I wanted to build a small-scale simulation to provide an intuitive, time-evolving view of how memory locality emerges and how buffer management policies influence performance.
-
-## What it shows
-
-Databases that store frequently-joined tables physically close together on disk incur lower seek costs when those joins run. This simulator makes that measurable:
-
-| metric | no reclustering | with reclustering | delta |
-|---|---|---|---|
-| avg I/O cost (EMA) | 87.4 | 82.3 | **−5.9%** |
-| locality score (↓ better) | 2.02 | 1.16 | **−43%** |
-
-Both runs start from the same randomly scrambled disk layout (same seed → fair comparison).
-
-## Visualizations
-
-| Reclustering enabled | Baseline (no reclustering) |
-|---|---|
-| ![recluster](docs/recluster.gif) | ![no_recluster](docs/no_recluster.gif) |
-
-*Gold vertical lines mark recluster events. Disk layout shown below each frame title.*
+<!-- findings:headline -->
+On `reports`, a workload with periodic full-table reports, InnoDB-style and PostgreSQL-style eviction read 16–30% fewer pages from disk than LRU with half the database in memory, and LRU needs 1.4–1.6× the memory to match. Without the reports, PostgreSQL-style is within 3% of LRU.
+<!-- /findings:headline -->
+Two more findings and the full numbers: [FINDINGS.md](FINDINGS.md).
 
 ## How it works
 
-**Simulator** (`sim/` — Rust)
-- 64-frame buffer pool with **clock page replacement**
-- Tracks co-access counts between every table pair across queries
-- On recluster events: solves **Minimum Linear Arrangement** (brute-force over 6! = 720 permutations) to find the slot ordering that minimizes `Σ co_access(a,b) × |slot(a) − slot(b)|`
-- Miss cost = base (10) + **seek cost** proportional to disk distance from last fetched page + dirty write penalty (20)
+- `capture/` runs a scenario in SQLite through a VFS that logs every page read
+  and write, and saves it as a trace.
+- `sim/` (Rust) replays the trace through FIFO, LRU, Clock, PostgreSQL-style
+  (clock sweep with a scan ring), InnoDB-style (midpoint insertion) and
+  Optimal, on a modelled SSD or HDD.
+- It writes either a sweep across pool sizes (above) or a viewer that steps
+  through every access and explains each eviction (below).
 
-**Visualizer** (`viz/` — Python / matplotlib)
-- Renders each snapshot as a frame: buffer pool grid on the left, rolling time-series (hit rate, avg cost EMA, locality score) on the right
-- Assembles frames into a GIF via `imageio`
+![The viewer, partway through a full-table scan](docs/viewer.png)
 
-## Running
+## How it's checked
 
-### Simulator
+- An independent Python model replays every shipped trace, and the engine must
+  agree with it exactly. A fuzzer does the same on random traces.
+- The engine's LRU reads within 1% of the pages SQLite's own page cache reads
+  on the same queries, and within 0.1% from 256 pages up.
+- `verify/findings.py --check` recomputes every number in FINDINGS.md and in
+  the section above, and fails if a claim stops holding.
 
-```bash
-cd sim
-cargo build --release
+## Run it
 
-# baseline (no reclustering)
-./target/release/sim --recluster=false --seed 42
+Needs Rust 1.85+ and Python 3.11+ with `pip install -r capture/requirements.txt`.
 
-# with reclustering
-./target/release/sim --recluster=true --seed 42
+```sh
+cd sim && cargo build --release
+./target/release/sim --trace ../traces/reports.trace.json.gz --policy all --frames sweep
+./target/release/sim --trace ../traces/shop.trace.json --policy all --frames 8
 ```
 
-Snapshots are written to `outputs/runs/{recluster|no_recluster}/<timestamp>/snapshots/`.
+Each run prints the folder it wrote, with `sweep.html` or `viewer.html` inside.
+To capture a trace from a scenario, from the repo root (the bigger scenarios
+give their exact command in their opening comment):
 
-**CLI flags**
-
-| flag | default | description |
-|---|---|---|
-| `--seed` | 42 | RNG seed (use same seed for A/B) |
-| `--ticks` | 5000 | simulation length |
-| `--frames` | 64 | buffer pool size |
-| `--recluster` | true | enable/disable reclustering |
-| `--recluster-every` | 500 | ticks between recluster events |
-| `--snapshot-every` | 10 | ticks between snapshot writes |
-
-### Visualizer
-
-```bash
-cd viz
-pip install -r requirements.txt
-python render.py ../outputs/runs/recluster/<timestamp>
-python render.py ../outputs/runs/no_recluster/<timestamp>
+```sh
+python capture/capture.py capture/scenarios/shop.sql -o traces/local/shop.trace.json
 ```
 
-Output GIF is written next to the run directory as `<timestamp>.gif`.
+Checks: `cargo test` in `sim/`, `pytest` in `capture/`, and the scripts in
+[verify/](verify/README.md).
+
+## Layout
+
+- `capture/`: trace capture, scenarios and their tests
+- `sim/`: the engine and its command line
+- `viewer/`: the two pages the engine fills in
+- `verify/`: checks that don't trust the engine's own tests
+- `traces/`: committed traces (big ones and variants go in `traces/local/`)
+
+## Limits
+
+The workloads were written for this project, and the InnoDB- and
+PostgreSQL-style policies are models of those systems' eviction, not the
+systems. [FINDINGS.md](FINDINGS.md) says what the findings do and don't cover.

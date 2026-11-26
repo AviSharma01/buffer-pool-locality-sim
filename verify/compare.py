@@ -50,7 +50,7 @@ def build() -> Path:
     """Build the release engine, so the check never runs a stale binary.
     Without cargo, an existing binary is used as it is."""
     if shutil.which("cargo"):
-        cmd = ["cargo", "build", "--release", "--quiet"]
+        cmd = ["cargo", "build", "--release", "--locked", "--quiet"]
         subprocess.run(cmd, cwd=REPO / "sim", check=True)
     if not SIM.is_file():
         raise FileNotFoundError(f"no engine at {SIM}: install Rust, or build it with cargo")

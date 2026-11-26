@@ -1,4 +1,4 @@
-"""Workloads: queries made from templates with seeded random parameters (4a)."""
+"""Workloads: queries made from templates with seeded random parameters."""
 
 from __future__ import annotations
 

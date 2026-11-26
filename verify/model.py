@@ -1,12 +1,12 @@
 """An independent model of the engine, for checking it.
 
-Written from the rules in CLAUDE.md and the step plans, never from the engine's
-code, so a mistake in the engine shows up as a disagreement instead of being
-copied. The six policies were written by a separate reviewer that had not seen
-how the engine was built (2026-11-18). The pricing (3.4b) and read-ahead (3.4c)
-rules were added afterwards from the approved plans. So this model checks that
-the engine does what the plans say; it cannot show that the plans match real
-systems. That is what the sources in CLAUDE.md and linux_readahead.py are for.
+Written from a written description of the rules (below), never from the
+engine's code, so a mistake in the engine shows up as a disagreement instead of
+being copied. The six policies were written by a reviewer that had not seen the
+engine's code; the pricing and read-ahead rules were added later from the same
+description. So this model checks that the engine follows the rules; it cannot
+show that the rules match real systems. The datasheets cited in
+sim/src/storage.rs and verify/linux_readahead.py are for that.
 
 Rules, in brief:
 
@@ -39,7 +39,7 @@ import json
 from pathlib import Path
 
 # Milliseconds: hit, read request (R), near request (O), write request (W),
-# one page's transfer (T). From the datasheets cited in CLAUDE.md (3.4b).
+# one page's transfer (T). From the datasheets cited in sim/src/storage.rs.
 PROFILES = {
     "ssd": {"hit": 0.0001, "R": 0.044, "O": 0.044, "W": 0.012, "T": 0.0006},
     "hdd": {"hit": 0.0001, "R": 12.7, "O": 0.2, "W": 13.2, "T": 0.02},

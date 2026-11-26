@@ -112,14 +112,15 @@ def engine_disk_reads(trace: Path, n: int, out: Path) -> int:
 @pytest.mark.parametrize("name", ["oltp", "reports", "ranges"])
 def test_engine_lru_reads_what_sqlites_own_cache_read(tmp_path: Path, name: str) -> None:
     """Within 1% below 256 pages, where SQLite's pinning matters most (the
-    worst seen is 0.9%), and within 0.2% from 256 pages (the worst seen is
-    0.06%). Page 1 is left in: a dozen reads at most here."""
+    worst seen is 0.9%), and within 0.1% from 256 pages (the worst seen is
+    0.06%): the figures README.md and FINDINGS.md give. Page 1 is left in: a
+    dozen reads at most here."""
     path = TRACES / f"{name}.trace.json.gz"
     points = json.loads(gzip.decompress(path.read_bytes()))["sqlite_cache"]
     assert [p["pages"] for p in points] == [64, 128, 256, 512, 1024, 2048, 4096]
     for p in points:
         ours = engine_disk_reads(path, p["pages"], tmp_path)
-        tolerance = 0.01 if p["pages"] < 256 else 0.002
+        tolerance = 0.01 if p["pages"] < 256 else 0.001
         assert abs(ours - p["reads"]) <= tolerance * p["reads"], (
             f"{name} at {p['pages']} pages: engine {ours}, SQLite {p['reads']}"
         )

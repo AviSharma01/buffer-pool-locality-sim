@@ -42,9 +42,10 @@ def good() -> tuple[dict, dict]:
 
 def test_good_numbers_pass() -> None:
     m, uses = good()
-    summary, failed = findings.claims(m, uses)
+    texts, failed = findings.claims(m, uses)
     assert failed == []
-    assert "24% fewer pages" in summary or "22–24% fewer pages" in summary
+    assert "22–24% fewer pages" in texts["summary"]
+    assert "22–24% fewer pages from disk than LRU" in texts["headline"]
 
 
 @pytest.mark.parametrize(
@@ -68,13 +69,15 @@ def test_numbers_that_contradict_a_claim_fail_it(change, claim: str) -> None:
     assert any(claim in f for f in failed), failed
 
 
-def test_the_document_must_have_every_block() -> None:
+def test_the_document_must_have_every_block_and_no_others() -> None:
     doc = "<!-- findings:summary -->\nold\n<!-- /findings:summary -->\n"
-    assert findings.fill(doc, {"summary": "new"}) == (
+    assert findings.fill(doc, {"summary": "new"}, "README.md") == (
         "<!-- findings:summary -->\nnew\n<!-- /findings:summary -->\n"
     )
-    with pytest.raises(SystemExit, match="no block for"):
-        findings.fill(doc, {"summary": "new", "results": "x"})
+    with pytest.raises(SystemExit, match="README.md has no block for"):
+        findings.fill(doc, {"summary": "new", "results": "x"}, "README.md")
+    with pytest.raises(SystemExit, match="README.md has a block findings.py doesn't write"):
+        findings.fill(doc, {"headline": "new"}, "README.md")
 
 
 def test_a_reused_variant_must_be_the_one_it_should_be(tmp_path: Path, monkeypatch) -> None:
@@ -91,3 +94,11 @@ def test_a_reused_variant_must_be_the_one_it_should_be(tmp_path: Path, monkeypat
     skew = {"params": ["user=zipf(0.9, 1..100000)"]}
     path.write_bytes(gzip.compress(json.dumps({"variant": skew}).encode()))
     assert findings.capture("oltp", "skew 0.9", None, "user=zipf(0.9,  1..100000)") == path
+
+
+def test_the_saving_share_says_all_rather_than_over_100_percent() -> None:
+    text = findings.warm_text({"oltp": 1.15, "ranges": 0.75})
+    assert "all of the saving on `oltp` and 75% of it on `ranges`." in text
+    assert "On `oltp`, InnoDB-style reads pages used fewer times" in text
+    assert "115%" not in text
+    assert " On " not in findings.warm_text({"oltp": 0.9, "ranges": 0.75})

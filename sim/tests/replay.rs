@@ -12,9 +12,8 @@ use bpsim::{CapturedTrace, PolicyKind, SimConfig, Simulator, StorageKind};
 
 fn load(name: &str) -> CapturedTrace {
     let path = format!("{}/../traces/{name}.trace.json", env!("CARGO_MANIFEST_DIR"));
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!("{path}: {e} (regenerate with capture/capture.py, see CLAUDE.md)")
-    });
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{path}: {e} (regenerate it with capture/capture.py)"));
     CapturedTrace::from_json(&text).unwrap()
 }
 
@@ -74,9 +73,8 @@ fn replay(policy: PolicyKind, frames: usize) -> bpsim::summary::RunSummary {
 const TRACES: [&str; 5] = ["shop", "checkout", "growth", "growth-vacuum", "shop-vacuum"];
 
 /// LRU with 8 frames: next-page, further-on and jump reads, and total time on
-/// SSD and HDD. From the independent model in the 3.4b check (the reviewer's
-/// policy model with the pricing rules written from the plan), which agreed
-/// with the engine on 708 runs.
+/// SSD and HDD. From the independent model (verify/model.py), which agreed
+/// with the engine on 708 runs when the pricing was added.
 struct Pinned {
     name: &'static str,
     reads: (u64, u64, u64),
@@ -504,8 +502,9 @@ fn the_vacuum_lessons_hold_for_any_reasonable_drive_overhead() {
 }
 
 /// LRU with 8 frames and read-ahead on (up to 2 pages): hits, requests,
-/// pages read ahead, and time on SSD and HDD, from the independent model in
-/// the 3.4c check (it agreed with the engine on 2,220 runs).
+/// pages read ahead, and time on SSD and HDD, from the independent model
+/// (verify/model.py), which agreed with the engine on 2,220 runs when
+/// read-ahead was added.
 #[test]
 fn read_ahead_numbers_match_the_independent_model() {
     let pinned = [

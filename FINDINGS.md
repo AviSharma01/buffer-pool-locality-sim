@@ -7,7 +7,7 @@ fails if a claim stops holding.
 
 <!-- findings:summary -->
 1. **Full scans are where the policies differ most.** On `reports` with half the database in memory, InnoDB-style and PostgreSQL-style read 16–30% fewer pages than LRU, and LRU needs 1.4–1.6× the memory to match. Without the full scans (`oltp` is the same queries minus the reports, `ranges` has only short ones), PostgreSQL-style is within 3% of LRU.
-2. **InnoDB-style helps without full scans too:** 6–9% fewer reads than LRU with a quarter of the database in memory, on `oltp` and `ranges`. 75–100% of the saving is on pages used by 10 or more queries. A page enters InnoDB-style's list partway down, at the head of its old sublist, and moves up only when a later query uses it, so pages used a few times don't push out pages used often, as they do under LRU.
+2. **InnoDB-style helps without full scans too:** 6–9% fewer reads than LRU with a quarter of the database in memory, on `oltp` and `ranges`. Pages used by 10 or more queries account for all of the saving on `oltp` and 75% of it on `ranges`. On `oltp`, InnoDB-style reads pages used fewer times a little more than LRU does. A page enters InnoDB-style's list partway down, at the head of its old sublist, and moves up only when a later query uses it, so pages used a few times don't push out pages used often, as they do under LRU.
 3. Optimal reads 33–45% less than LRU with a quarter of the database in memory, so most of the possible saving is still unclaimed.
 <!-- /findings:summary -->
 

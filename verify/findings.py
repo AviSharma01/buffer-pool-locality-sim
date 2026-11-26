@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure the findings in FINDINGS.md and write their numbers into it.
+"""Measure the findings in FINDINGS.md and write their numbers into it and the README.
 
     python verify/findings.py               # measure, then rewrite FINDINGS.md's numbers
     python verify/findings.py --check       # measure; fail if FINDINGS.md is stale or a claim fails
@@ -30,7 +30,8 @@ import compare  # noqa: E402
 import model  # noqa: E402
 
 REPO = compare.REPO
-DOC = REPO / "FINDINGS.md"
+# Each document and the blocks findings.py writes in it.
+DOCS = {REPO / "FINDINGS.md": ("summary", "results", "uses"), REPO / "README.md": ("headline",)}
 VARIANT_DIR = REPO / "traces" / "local" / "variants"
 CAPTURE = REPO / "capture" / "capture.py"
 
@@ -162,12 +163,31 @@ def span(values: list[float], form=pct) -> str:
     return lo if lo == hi else f"{lo.rstrip('%×')}–{hi}"
 
 
+def warm_text(share: dict[str, float]) -> str:
+    """How much of InnoDB-style's saving is on pages 10+ queries use. Over 100% means
+    it reads the other pages more than LRU does, so the saving is all theirs."""
+    parts = [
+        f"{'all' if x >= 1 else pct(x)} of {'the saving' if n == 0 else 'it'} on `{t}`"
+        for n, (t, x) in enumerate(share.items())
+    ]
+    text = f"Pages used by 10 or more queries account for {' and '.join(parts)}."
+    if over := [f"`{t}`" for t, x in share.items() if x > 1]:
+        text += (
+            f" On {', '.join(over)}, InnoDB-style reads pages used fewer times a little more "
+            f"than LRU does."
+        )
+    return text
+
+
 def times(x: float) -> str:
     return f"{x:.1f}×"
 
 
-def claims(m: dict[tuple[str, str], Measured], uses: dict[str, dict]) -> tuple[str, list[str]]:
-    """The summary, and every claim in it that the numbers contradict."""
+def claims(
+    m: dict[tuple[str, str], Measured], uses: dict[str, dict]
+) -> tuple[dict[str, str], list[str]]:
+    """The summary and the README's headline, and every claim in them that the
+    numbers contradict."""
     failed = []
 
     def need(ok: bool, what: str) -> None:
@@ -191,7 +211,7 @@ def claims(m: dict[tuple[str, str], Measured], uses: dict[str, dict]) -> tuple[s
 
     inno = [m[t, v].fewer("1/4", "innodb") for t in ("oltp", "ranges") for v in labels]
     need(min(inno) >= 0.03, "without full scans, InnoDB-style reads 3%+ less than LRU at 1/4")
-    warm_share = []
+    warm_share = {}
     for t, r in uses.items():
         net = sum(r["lru"].values()) - sum(r["innodb"].values())
         warm = sum(r["lru"][n] - r["innodb"][n] for n in ("10–99", "100+"))
@@ -199,7 +219,7 @@ def claims(m: dict[tuple[str, str], Measured], uses: dict[str, dict]) -> tuple[s
             net > 0 and warm >= 2 / 3 * net,
             f"{t}: most of InnoDB-style's saving is on pages 10+ queries use",
         )
-        warm_share.append(min(1.0, warm / net) if net > 0 else 0.0)
+        warm_share[t] = warm / net if net > 0 else 0.0
 
     room = [m[t, v].fewer("1/4", "opt") for t in TRACES for v in labels]
     need(min(room) >= 0.3, "Optimal reads 30%+ less than LRU at 1/4 on every trace")
@@ -214,7 +234,7 @@ def claims(m: dict[tuple[str, str], Measured], uses: dict[str, dict]) -> tuple[s
             f"only short ones), PostgreSQL-style is within {pg_gap} of LRU.",
             f"2. **InnoDB-style helps without full scans too:** {span(inno)} fewer reads than LRU "
             f"with a quarter of the database in memory, on `oltp` and `ranges`. "
-            f"{span(warm_share)} of the saving is on pages used by 10 or more queries. A page "
+            f"{warm_text(warm_share)} A page "
             f"enters InnoDB-style's list partway down, at the head of its old sublist, and moves "
             f"up only when a later query uses it, so pages used a few times don't push out pages "
             f"used often, as they do under LRU.",
@@ -222,7 +242,13 @@ def claims(m: dict[tuple[str, str], Measured], uses: dict[str, dict]) -> tuple[s
             f"memory, so most of the possible saving is still unclaimed.",
         ]
     )
-    return summary, failed
+    headline = (
+        f"On `reports`, a workload with periodic full-table reports, InnoDB-style and "
+        f"PostgreSQL-style eviction read {span(scans)} fewer pages from disk than LRU with half "
+        f"the database in memory, and LRU needs {span(scan_mem, times)} the memory to match. "
+        f"Without the reports, PostgreSQL-style is within {pg_gap} of LRU."
+    )
+    return {"summary": summary, "headline": headline}, failed
 
 
 # ---------- tables ----------
@@ -262,23 +288,27 @@ def uses_table(uses: dict[str, dict[str, dict[str, int]]]) -> str:
 BLOCK = re.compile(r"(<!-- findings:(\w+) -->\n)(.*?)(<!-- /findings:\2 -->)", re.S)
 
 
-def fill(doc: str, blocks: dict[str, str]) -> str:
+def fill(doc: str, blocks: dict[str, str], name: str) -> str:
     seen = set()
 
     def put(m: re.Match) -> str:
+        if m[2] not in blocks:
+            raise SystemExit(f"{name} has a block findings.py doesn't write: {m[2]}")
         seen.add(m[2])
         return m[1] + blocks[m[2]] + "\n" + m[4]
 
     out = BLOCK.sub(put, doc)
     if missing := blocks.keys() - seen:
-        raise SystemExit(f"FINDINGS.md has no block for {sorted(missing)}")
+        raise SystemExit(f"{name} has no block for {sorted(missing)}")
     return out
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument(
-        "--check", action="store_true", help="fail if FINDINGS.md is stale; change nothing"
+        "--check",
+        action="store_true",
+        help="fail if FINDINGS.md or README.md is stale; change nothing",
     )
     ap.add_argument("--recapture", action="store_true", help="capture the variants again first")
     args = ap.parse_args()
@@ -293,22 +323,26 @@ def main() -> int:
         t: reads_by_uses(trace_path(t, "seed 7"), m[t, "seed 7"].pools["1/4"])
         for t in ("oltp", "ranges")
     }
-    summary, failed = claims(m, uses)
-    blocks = {"summary": summary, "results": results_table(m), "uses": uses_table(uses)}
-    doc = DOC.read_text(encoding="utf-8")
-    new = fill(doc, blocks)
+    texts, failed = claims(m, uses)
+    blocks = {**texts, "results": results_table(m), "uses": uses_table(uses)}
     for f in failed:
         print("CLAIM FAILS:", f)
+    stale = []
+    for doc, names in DOCS.items():
+        old = doc.read_text(encoding="utf-8")
+        new = fill(old, {n: blocks[n] for n in names}, doc.name)
+        if new != old:
+            stale.append(doc.name)
+            if not args.check:
+                doc.write_text(new, encoding="utf-8")
     if args.check:
-        stale = new != doc
         print(
-            "FINDINGS.md is out of date: run verify/findings.py"
+            f"{', '.join(stale)} out of date: run verify/findings.py"
             if stale
-            else "FINDINGS.md is up to date"
+            else "FINDINGS.md and README.md are up to date"
         )
         return 1 if failed or stale else 0
-    DOC.write_text(new, encoding="utf-8")
-    print(f"FINDINGS.md written; {len(failed)} claim(s) fail")
+    print(f"written: {', '.join(stale) or 'nothing changed'}; {len(failed)} claim(s) fail")
     return 1 if failed else 0
 
 
