@@ -351,6 +351,9 @@ def run(
         0,
     )
     m["total_ms"] = 0.0
+    # how often each page was read from disk, for breakdowns
+    reads_by_page: dict[int, int] = {}
+    m["reads_by_page"] = reads_by_page
     used = [0]
 
     def make_room(q, pos, scan, pinned=None):
@@ -389,6 +392,7 @@ def run(
         if fresh:
             m["fresh_pages"] += 1
             continue
+        reads_by_page[p] = reads_by_page.get(p, 0) + 1
         if last is not None and p == last + 1:
             m["next_page_reads"] += 1
             fixed = min(c["O"], c["R"])

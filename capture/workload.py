@@ -51,6 +51,7 @@ _EVERY = re.compile(r"^--\s+every\s+(\d+)\s+(\S.*)$")
 _RANGE = re.compile(r"^\s*(-?\d+)\s*\.\.\s*(-?\d+)\s*$")
 _NUMBER = re.compile(r"^-?\d+(?:\.\d+)?$")
 _PLACEHOLDER = re.compile(r"\{([a-z_][a-z0-9_]*)\}")
+_OVERRIDE = re.compile(r"^([a-z_][a-z0-9_]*)\s*=\s*([a-z]+)\((.*)\)$")
 
 
 def is_header(line: str) -> bool:
@@ -244,6 +245,19 @@ def parse(lines: list[tuple[int, str]], single_statement) -> Workload:
     for name in params.keys() - used:
         raise ValueError(f"parameter {name} is declared but no template uses it")
     return Workload(count, seed, params, templates)
+
+
+def override(w: Workload, spec: str) -> None:
+    """Replace a declared parameter with `name=dist(args)` (capture --param),
+    checked exactly like a '-- param' line, for a local variant."""
+    m = _OVERRIDE.match(spec.strip())
+    if not m:
+        raise ValueError(f"--param {spec!r}: expected name=dist(args), like user=zipf(0.9, 1..100)")
+    name = m[1]
+    if name not in w.params:
+        known = ", ".join(sorted(w.params))
+        raise ValueError(f"--param {name}: the workload has no such parameter (it has {known})")
+    w.params[name] = _param(name, m[2], m[3], f"--param {name}")
 
 
 def generate(w: Workload) -> list[tuple[str, str]]:

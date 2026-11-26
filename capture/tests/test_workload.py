@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections
 import gzip
+import json
 import re
 import subprocess
 import sys
@@ -179,3 +180,58 @@ def test_shipped_workloads_parse_and_generate(name: str) -> None:
     queries = parse_scenario(text, name).queries
     declared = int(text.split("-- workload: ")[1].split(" queries")[0])
     assert len(queries) == declared
+
+
+def ids(queries: list[tuple[str, str]]) -> list[int]:
+    return [int(m[1]) for _, sql in queries if (m := re.search(r"id = (-?\d+)", sql))]
+
+
+def test_a_parameter_can_be_replaced_for_a_variant() -> None:
+    text = SETUP + GOOD
+    before = ids(parse_scenario(text, "w").queries)
+    after = parse_scenario(text, "w", params=["id = uniform(5..6)"])
+    assert set(ids(after.queries)) == {5, 6}
+    assert set(before) != {5, 6}
+    assert after.variant == {"params": ["id = uniform(5..6)"]}
+    assert parse_scenario(text, "w").variant == {}
+    assert parse_scenario(text, "w", seed=9).variant == {"seed": 9}
+
+
+@pytest.mark.parametrize(
+    ("spec", "error"),
+    [
+        ("nobody=uniform(1..2)", "--param nobody: the workload has no such parameter (it has id)"),
+        ("id", "expected name=dist(args)"),
+        ("id=zipf(0, 1..10)", "--param id: zipf's skew must be between 0 and 5"),
+        ("id=uniform(1..9999999)", "--param id: a range may span at most"),
+        ("id=shell(1..2)", "--param id: unknown distribution 'shell'"),
+        ("id=choice('a'); DROP TABLE t; --)", "--param id: choice values are numbers or"),
+    ],
+)
+def test_a_replacement_is_checked_like_a_declared_parameter(spec: str, error: str) -> None:
+    with pytest.raises(ValueError, match=re.escape(error)):
+        parse_scenario(SETUP + GOOD, "w", params=[spec])
+
+
+def test_seed_and_param_need_a_workload() -> None:
+    plain = SETUP + "-- query: q\nSELECT 1;"
+    for kwargs in [{"seed": 3}, {"params": ["x=uniform(1..2)"]}]:
+        with pytest.raises(ValueError, match="this scenario has none"):
+            parse_scenario(plain, "p", **kwargs)
+
+
+def test_a_variant_says_what_it_changed_and_a_plain_capture_says_nothing(tmp_path: Path) -> None:
+    scenario = tmp_path / "w.sql"
+    scenario.write_text(SETUP + GOOD.replace("2000 queries", "50 queries").replace("400", "25"))
+    script = [sys.executable, str(ROOT / "capture" / "capture.py"), str(scenario)]
+    plain, variant = tmp_path / "plain.json", tmp_path / "variant.json"
+    done = subprocess.run([*script, "-o", str(plain)], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    args = ["--seed", "4", "--param", "id=zipf(0.9,  1..400)", "-o", str(variant)]
+    done = subprocess.run([*script, *args], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    assert "variant" not in json.loads(plain.read_text())
+    assert json.loads(variant.read_text())["variant"] == {
+        "seed": 4,
+        "params": ["id=zipf(0.9, 1..400)"],
+    }

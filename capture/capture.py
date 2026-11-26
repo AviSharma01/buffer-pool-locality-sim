@@ -116,6 +116,8 @@ class Scenario:
     db: Path | None = None
     csvs: list[tuple[str, Path]] = field(default_factory=list)
     indexes: list[str] = field(default_factory=list)
+    # how this run's workload differs from the scenario file (--seed, --param)
+    variant: dict[str, Any] = field(default_factory=dict)
     vacuum: bool = False
 
 
@@ -129,14 +131,19 @@ def _check_single_statement(title: str, sql: str) -> str:
 
 
 def parse_scenario(
-    text: str, name: str, setup_required: bool = True, seed: int | None = None
+    text: str,
+    name: str,
+    setup_required: bool = True,
+    seed: int | None = None,
+    params: Sequence[str] = (),
 ) -> Scenario:
     """Split a scenario file into its setup SQL and titled queries.
 
     With `setup_required=False` (the database comes from `--db` or `--csv`)
     the file may hold only `-- query:` sections. A last `-- workload:`
     section adds many queries made from templates (see workload.py); `seed`
-    replaces the seed it names, for a local variant.
+    replaces the seed it names and each of `params` one of its parameters,
+    for a local variant.
     """
     setup: list[str] | None = None
     queries: list[tuple[str, list[str]]] = []
@@ -152,6 +159,8 @@ def parse_scenario(
             load = workload.parse(rest, _check_single_statement)
             if seed is not None:
                 load.seed = seed
+            for spec in params:
+                workload.override(load, spec)
             break
         if stripped == "-- setup":
             if setup is not None:
@@ -175,10 +184,17 @@ def parse_scenario(
         raise ValueError("scenario has no '-- setup' section")
     if not queries and load is None and setup_required:
         raise ValueError("scenario has no '-- query:' or '-- workload:' sections")
+    if load is None and (seed is not None or params):
+        raise ValueError("--seed and --param change a workload, and this scenario has none")
     parsed = [(title, _check_single_statement(title, "\n".join(body))) for title, body in queries]
+    variant: dict[str, Any] = {}
     if load is not None:
         parsed += workload.generate(load)
-    return Scenario(name=name, setup="\n".join(setup or []), queries=parsed)
+        if seed is not None:
+            variant["seed"] = seed
+        if params:
+            variant["params"] = [" ".join(p.split()) for p in params]
+    return Scenario(name=name, setup="\n".join(setup or []), queries=parsed, variant=variant)
 
 
 class _TraceFile(apsw.VFSFile):
@@ -912,6 +928,8 @@ def _capture(
         "rows": {str(p): decoded[p] for p in touched if p in decoded},
         "notes": notes,
     }
+    if scenario.variant:
+        trace["variant"] = scenario.variant
     if sqlite_cache:
         sql = [query for _, query in scenario.queries]
         points = []
@@ -960,10 +978,12 @@ def build_scenario(args: argparse.Namespace) -> Scenario:
     own_data = args.db is not None or bool(args.csv)
     if args.scenario is not None:
         text = args.scenario.read_text(encoding="utf-8")
-        scenario = parse_scenario(
-            text, args.scenario.stem, setup_required=not own_data, seed=args.seed
-        )
+        scenario = parse_scenario(text, args.scenario.stem, not own_data, args.seed, args.param)
     elif own_data:
+        if args.seed is not None or args.param:
+            raise ValueError(
+                "--seed and --param change a scenario's workload; give the scenario file"
+            )
         scenario = Scenario(name="", setup="", queries=[])
     else:
         raise ValueError("give a scenario .sql file, or your own data with --db or --csv")
@@ -1031,6 +1051,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--seed", type=int, help="replace the seed of the scenario's workload (a local variant)"
+    )
+    parser.add_argument(
+        "--param",
+        action="append",
+        default=[],
+        metavar="NAME=DIST(...)",
+        help="replace one of the workload's parameters, like user=zipf(0.9, 1..100000); "
+        "checked like a '-- param' line (a local variant; repeat for more)",
     )
     parser.add_argument(
         "--sqlite-cache",

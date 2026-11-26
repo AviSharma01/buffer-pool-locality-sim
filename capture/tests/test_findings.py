@@ -1,0 +1,93 @@
+"""verify/findings.py fails when the numbers contradict a claim in FINDINGS.md.
+
+Each case starts from numbers that satisfy every claim and breaks one.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "verify"))
+import findings  # noqa: E402
+from findings import Measured, Point  # noqa: E402
+
+LABELS = [label for label, _, _ in findings.VARIANTS]
+
+
+def run(lru: int, innodb: int, pg: int, opt: int) -> Measured:
+    pools = {"1/8": 100, "1/4": 200, "1/2": 400}
+    reads = {"lru": lru, "innodb": innodb, "pg": pg, "opt": opt}
+    points = {(pool, p): Point(r, 300) for pool in pools for p, r in reads.items()}
+    return Measured(800, pools, points)
+
+
+def good() -> tuple[dict, dict]:
+    m = {}
+    for label in LABELS:
+        m["reports", label] = run(1000, 760, 780, 470)
+        m["oltp", label] = run(1000, 920, 990, 600)
+        m["ranges", label] = run(1000, 910, 980, 600)
+    uses = {
+        t: {
+            "lru": {"1": 10, "2–9": 500, "10–99": 300, "100+": 5},
+            "innodb": {"1": 10, "2–9": 510, "10–99": 150, "100+": 5},
+        }
+        for t in ("oltp", "ranges")
+    }
+    return m, uses
+
+
+def test_good_numbers_pass() -> None:
+    m, uses = good()
+    summary, failed = findings.claims(m, uses)
+    assert failed == []
+    assert "24% fewer pages" in summary or "22–24% fewer pages" in summary
+
+
+@pytest.mark.parametrize(
+    ("change", "claim"),
+    [
+        (lambda m, u: m.__setitem__(("reports", "seed 11"), run(1000, 900, 780, 470)), "15%+"),
+        (lambda m, u: m.__setitem__(("oltp", "skew 0.9"), run(1000, 920, 950, 600)), "within 3%"),
+        (lambda m, u: m.__setitem__(("ranges", "seed 23"), run(1000, 990, 980, 600)), "3%+ less"),
+        # saves plenty, but on pages few queries use
+        (
+            lambda m, u: u["oltp"]["innodb"].update({"2–9": 300, "10–99": 290}),
+            "pages 10+ queries use",
+        ),
+        (lambda m, u: m.__setitem__(("oltp", "seed 7"), run(1000, 920, 990, 800)), "30%+"),
+    ],
+)
+def test_numbers_that_contradict_a_claim_fail_it(change, claim: str) -> None:
+    m, uses = good()
+    change(m, uses)
+    _, failed = findings.claims(m, uses)
+    assert any(claim in f for f in failed), failed
+
+
+def test_the_document_must_have_every_block() -> None:
+    doc = "<!-- findings:summary -->\nold\n<!-- /findings:summary -->\n"
+    assert findings.fill(doc, {"summary": "new"}) == (
+        "<!-- findings:summary -->\nnew\n<!-- /findings:summary -->\n"
+    )
+    with pytest.raises(SystemExit, match="no block for"):
+        findings.fill(doc, {"summary": "new", "results": "x"})
+
+
+def test_a_reused_variant_must_be_the_one_it_should_be(tmp_path: Path, monkeypatch) -> None:
+    import gzip
+    import json
+
+    path = tmp_path / "oltp-seed-11.trace.json.gz"
+    monkeypatch.setattr(findings, "trace_path", lambda trace, label: path)
+    path.write_bytes(gzip.compress(json.dumps({"variant": {"seed": 23}}).encode()))
+    with pytest.raises(SystemExit, match="records {'seed': 23}; run with --recapture"):
+        findings.capture("oltp", "seed 11", 11, None)
+    path.write_bytes(gzip.compress(json.dumps({"variant": {"seed": 11}}).encode()))
+    assert findings.capture("oltp", "seed 11", 11, None) == path
+    skew = {"params": ["user=zipf(0.9, 1..100000)"]}
+    path.write_bytes(gzip.compress(json.dumps({"variant": skew}).encode()))
+    assert findings.capture("oltp", "skew 0.9", None, "user=zipf(0.9,  1..100000)") == path
