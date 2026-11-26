@@ -764,11 +764,10 @@ def lru_disk_reads(trace: Path, frames: int, queries: int, work: Path) -> float:
 
 
 def check_sweep_readout(page: Page, sweep: dict, trace: Path, work: Path) -> list[str]:
-    """Opens near half the database, with each policy against LRU. The range
-    of memory it says LRU needs to match the best policy holds when the engine
-    runs LRU at both ends (still more reads at the low end, no more at the
-    high end), and the top line says the same. Moving the readout leaves the
-    top line alone."""
+    """Opens near half the database, with each policy against LRU. The memory
+    it says LRU needs to match the best policy is the smallest pool
+    where the engine's LRU reads no more (one frame less reads more), and the
+    top line says the same. Moving the readout leaves the top line alone."""
     problems = []
     sizes = sweep["sizes"]
     half = min(range(len(sizes)), key=lambda i: abs(sizes[i] - sweep["pages"] / 2))
@@ -789,16 +788,19 @@ def check_sweep_readout(page: Page, sweep: dict, trace: Path, work: Path) -> lis
     need = page.eval_on_selector_all("#readout .need", "ns => ns.map(n => n.textContent)")
     if len(need) != 1 or not need[0].endswith(f"the memory to match {NAMES[best]}"):
         return problems + [f"the readout's memory line is {need}, about {NAMES[best]}"]
-    range_text = need[0].split("needs ")[1].split(" the memory")[0]
-    if f"LRU needs {range_text} the memory to do as well" not in page.inner_text("#answer"):
+    shown = need[0].split("needs ")[1].split("×")[0]
+    if f"LRU needs {shown}× the memory to do as well" not in page.inner_text("#answer"):
         problems.append("the top line and the readout give LRU different memory")
-    nearest = lambda ratio: min(sizes, key=lambda f: abs(f - ratio * sizes[half]))  # noqa: E731
-    ends = [nearest(float(r)) for r in range_text.removeprefix("up to ").rstrip("×").split("–")]
+    point = next(p for p in sweep["points"] if p["policy"] == best and p["frames"] == sizes[half])
+    frames = point["lru_frames"]
+    if shown != f"{frames / sizes[half]:.2g}":
+        problems.append(f"the readout says {shown}×, the sweep {frames} / {sizes[half]} frames")
     target = values[best]
-    if len(ends) == 2 and lru_disk_reads(trace, ends[0], sweep["queries"], work) <= target:
-        problems.append(f"LRU already matches {NAMES[best]} at {ends[0]} frames")
-    if lru_disk_reads(trace, ends[-1], sweep["queries"], work) > target + 1e-12:
-        problems.append(f"LRU at {ends[-1]} frames still reads more than {NAMES[best]}")
+    # the smallest pool where LRU reads no more: one frame less reads more
+    if lru_disk_reads(trace, frames, sweep["queries"], work) > target + 1e-12:
+        problems.append(f"LRU at {frames} frames still reads more than {NAMES[best]}")
+    if lru_disk_reads(trace, frames - 1, sweep["queries"], work) <= target + 1e-12:
+        problems.append(f"LRU already matches {NAMES[best]} at {frames - 1} frames")
     if "same as LRU" not in page.inner_text("#readout"):
         problems.append("the readout does not say SQLite's own cache reads the same as LRU")
     top = page.inner_text("#answer")

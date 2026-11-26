@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use bpsim::lru_curve::LruCurve;
 use bpsim::run::RunFile;
 use bpsim::sweep::{self, SweepFile};
 use bpsim::trace::Trace;
@@ -331,6 +332,7 @@ fn run_sweep(input: &Input, sizes: Vec<usize>, args: &Cli) -> Result<(), String>
     check_frames(*sizes.last().expect("at least one size"), input)?;
     let started = Instant::now();
     let trace = input.trace(args);
+    let lru = LruCurve::new(&trace);
     let jobs: Vec<(PolicyKind, usize)> = args
         .policy
         .0
@@ -338,7 +340,7 @@ fn run_sweep(input: &Input, sizes: Vec<usize>, args: &Cli) -> Result<(), String>
         .flat_map(|&p| sizes.iter().map(move |&f| (p, f)))
         .collect();
     let points = in_parallel(&jobs, |&(policy, frames)| {
-        sweep::point(&trace, policy, frames, args.read_ahead)
+        sweep::point(&trace, &lru, policy, frames, args.read_ahead)
     });
     let name = input.name();
     let (page_size, sqlite_cache) = match input {

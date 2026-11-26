@@ -12,6 +12,7 @@
 
 pub mod capture;
 pub mod example;
+pub mod lru_curve;
 pub mod policy;
 pub mod pool;
 pub mod readahead;

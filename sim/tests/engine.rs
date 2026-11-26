@@ -443,3 +443,57 @@ fn guarantees_hold_with_read_ahead_on_random_traces() {
     // The traces must actually exercise read-ahead.
     assert!(read_ahead_pages > 50 * seeds(100), "{read_ahead_pages}");
 }
+
+/// The one-pass LRU curve is the engine's LRU with read-ahead off, at every
+/// pool size, on random traces with fresh pages; frames_for is the smallest
+/// pool that reads no more.
+#[test]
+fn the_lru_curve_is_the_engines_lru_at_every_size() {
+    use bpsim::lru_curve::LruCurve;
+    use bpsim::sim::ReadAhead;
+    for seed in 0..seeds(300) {
+        let (trace, pages) = random_trace(seed);
+        let curve = LruCurve::new(&trace);
+        let mut reads = Vec::new();
+        for frames in 1..=pages as usize {
+            let cfg = SimConfig {
+                frames,
+                policy: PolicyKind::Lru,
+                storage: StorageKind::Ssd,
+                read_ahead: ReadAhead::Off,
+            };
+            let mut sim = Simulator::new(trace.clone(), cfg);
+            while sim.step().is_some() {}
+            let m = sim.metrics();
+            assert_eq!(
+                curve.misses(frames),
+                m.misses,
+                "seed {seed}, {frames} frames"
+            );
+            assert_eq!(
+                curve.disk_reads(frames),
+                m.misses - m.fresh_pages,
+                "seed {seed}"
+            );
+            reads.push(m.misses - m.fresh_pages);
+        }
+        for (i, &target) in reads.iter().enumerate() {
+            let smallest = reads.iter().position(|&r| r <= target).unwrap() + 1;
+            assert_eq!(
+                curve.frames_for(target),
+                Some(smallest),
+                "seed {seed}, pool {}",
+                i + 1
+            );
+        }
+        let floor = *reads.last().unwrap();
+        assert_eq!(
+            floor,
+            curve.disk_reads(10_000),
+            "seed {seed}: no pool reads less"
+        );
+        if floor > 0 {
+            assert_eq!(curve.frames_for(floor - 1), None);
+        }
+    }
+}

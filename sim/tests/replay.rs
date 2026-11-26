@@ -601,3 +601,55 @@ fn one_run_prices_both_drives() {
         }
     }
 }
+
+/// A shipped trace, gzipped or not.
+fn load_any(name: &str) -> CapturedTrace {
+    use std::io::Read;
+    let dir = format!("{}/../traces", env!("CARGO_MANIFEST_DIR"));
+    let gz = format!("{dir}/{name}.trace.json.gz");
+    if !std::path::Path::new(&gz).exists() {
+        return load(name);
+    }
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(&gz).unwrap())
+        .read_to_string(&mut text)
+        .unwrap();
+    CapturedTrace::from_json(&text).unwrap()
+}
+
+/// The one-pass LRU curve the sweep uses equals the engine's LRU with
+/// read-ahead off on every shipped trace: at every size for the small ones,
+/// and for the workload traces at every fourth size a default sweep runs and
+/// the whole database (every size takes over a minute in a debug build; the
+/// random traces in engine.rs check every size).
+#[test]
+fn the_lru_curve_matches_the_engine_on_every_shipped_trace() {
+    use bpsim::lru_curve::LruCurve;
+    let small = ["shop", "shop-vacuum", "checkout", "growth", "growth-vacuum"];
+    for name in small.into_iter().chain(["oltp", "reports", "ranges"]) {
+        let captured = load_any(name);
+        let pages = captured.page_count as usize;
+        let sizes: Vec<usize> = if small.contains(&name) {
+            (1..=pages).collect()
+        } else {
+            let all = bpsim::sweep::default_sizes(pages);
+            let mut some: Vec<usize> = all.iter().copied().step_by(4).collect();
+            some.push(pages);
+            some
+        };
+        let curve = LruCurve::new(&captured.to_trace());
+        for frames in sizes {
+            let cfg = SimConfig {
+                frames,
+                policy: PolicyKind::Lru,
+                storage: StorageKind::Ssd,
+                read_ahead: ReadAhead::Off,
+            };
+            let mut sim = captured.simulator(cfg);
+            while sim.step().is_some() {}
+            let m = sim.metrics();
+            assert_eq!(curve.misses(frames), m.misses, "{name}, {frames} frames");
+            assert_eq!(curve.disk_reads(frames), m.misses - m.fresh_pages, "{name}");
+        }
+    }
+}

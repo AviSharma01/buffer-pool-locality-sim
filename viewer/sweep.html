@@ -169,7 +169,7 @@ tbody tr:nth-child(odd){background:var(--soft)}
 <script>
 "use strict";
 const FORMAT = "bpsim-sweep",
-  VERSION = 1;
+  VERSION = 2;
 /* Drawn in this order, so the policies that matter most end up on top. */
 const POLICIES = {
   fifo: {name: "FIFO", colour: "--faint", faint: true, dotted: true},
@@ -260,19 +260,12 @@ function share(frames) {
   return `${pct >= 10 ? Math.round(pct) : Number(pct.toPrecision(2))}% of the database`;
 }
 
-/* The memory LRU needs to read no more than `target` per query, as measured:
-   more than the last size swept where it still reads more, at most the first
-   where it does not. Nothing in between is guessed: near a cliff, such as the
-   whole database starting to fit, a straight line between two sizes would be
-   far off. Null when the sweep has no LRU or LRU never gets there. */
-function lruNeeds(target) {
-  const lru = state.lines.find(l => l.key === "lru");
-  if (!lru) return null;
-  const sizes = state.sweep.sizes,
-    r = values(lru, "reads");
-  const i = r.findIndex(v => v <= target + 1e-12);
-  if (i < 0) return null;
-  return {over: i > 0 ? sizes[i - 1] : 0, atMost: sizes[i]};
+/* How much more memory LRU needs to read no more from disk than policy `l`
+   at size `i`: exact, from the sweep's smallest such pool. Null when no pool
+   gets LRU that low. */
+function lruNeed(l, i) {
+  const frames = l.points[i].lru_frames;
+  return frames == null ? null : `${times(frames / state.sweep.sizes[i])}×`;
 }
 /* A ratio of sizes, to two figures: 1.5, 2, 2.7, 12. */
 const times = x => num(Number(x.toPrecision(2)));
@@ -395,12 +388,6 @@ function against(v, lru) {
   return `${Math.abs(pct)}% ${pct > 0 ? fewer : "more"}`;
 }
 /* How much memory LRU needs to read as little as `v` at size `f`, as words. */
-function lruRange(v, f) {
-  const need = lruNeeds(v);
-  if (!need) return null;
-  const top = times(need.atMost / f);
-  return need.over <= f ? `up to ${top}×` : `${times(need.over / f)}–${top}×`;
-}
 function showReadout() {
   const s = state.sweep,
     f = s.sizes[state.at],
@@ -417,10 +404,10 @@ function showReadout() {
   }
   if (state.measure !== "reads") return;
   if (lru && best !== lru && vsLru(best.v, lru.v) > 0) {
-    const range = lruRange(best.v, f);
-    const say = range
-      ? `LRU needs ${range} the memory to match ${best.l.name}`
-      : `LRU doesn't match ${best.l.name} at any size swept`;
+    const need = lruNeed(best.l, state.at);
+    const say = need
+      ? `LRU needs ${need} the memory to match ${best.l.name}`
+      : `LRU doesn't match ${best.l.name} at any pool size`;
     ro.append(el("div", "foot need", say));
   }
   const dot = sqliteDots().find(d => d.frames === f);
@@ -444,8 +431,8 @@ function answer() {
     if (best === lru) return `${cap(where)}, no policy here reads fewer pages from disk than LRU.`;
     const pct = vsLru(best.v, lru.v);
     if (pct === 0) return `${cap(where)}, ${name} and LRU read about as many pages from disk.`;
-    const range = lruRange(best.v, f);
-    const then = range ? `LRU needs ${range} the memory to do as well.` : "LRU doesn't get there at any size swept.";
+    const need = lruNeed(best.l, i);
+    const then = need ? `LRU needs ${need} the memory to do as well.` : "LRU doesn't get there at any pool size.";
     return `${cap(where)}, ${name} reads ${pct}% fewer pages from disk than LRU. ${then}`;
   }
   const drive = state.storage === "ssd" ? "On an SSD" : "On a hard drive";

@@ -10,6 +10,7 @@ use serde::Serialize;
 
 use crate::PolicyKind;
 use crate::capture::SqliteCacheReads;
+use crate::lru_curve::LruCurve;
 use crate::readahead::ReadAhead;
 use crate::sim::{SimConfig, Simulator};
 use crate::storage::StorageKind;
@@ -52,6 +53,9 @@ pub struct Point {
     pub pages_read: u64,
     pub ssd_ms_per_query: f64,
     pub hdd_ms_per_query: f64,
+    /// The smallest pool in which LRU reads no more pages from disk than
+    /// this point (read-ahead off), from the exact LRU curve.
+    pub lru_frames: Option<usize>,
 }
 
 /// A sweep as the CLI writes it (`sweep.json`) and the sweep page reads it.
@@ -81,11 +85,18 @@ pub struct SweepFile<'a> {
 }
 
 pub const FORMAT: &str = "bpsim-sweep";
-pub const VERSION: u32 = 1;
+/// 2: points carry `lru_frames`.
+pub const VERSION: u32 = 2;
 
 /// Replay `trace` with `policy` in a pool of `frames`, twice: read-ahead off
-/// for disk reads, `read_ahead` for time.
-pub fn point(trace: &Trace, policy: PolicyKind, frames: usize, read_ahead: ReadAhead) -> Point {
+/// for disk reads, `read_ahead` for time. `lru` is the trace's LRU curve.
+pub fn point(
+    trace: &Trace,
+    lru: &LruCurve,
+    policy: PolicyKind,
+    frames: usize,
+    read_ahead: ReadAhead,
+) -> Point {
     let run = |read_ahead| {
         let cfg = SimConfig {
             frames,
@@ -102,16 +113,18 @@ pub fn point(trace: &Trace, policy: PolicyKind, frames: usize, read_ahead: ReadA
     let timed = with_read_ahead.as_ref().unwrap_or(&off);
     let (m, t) = (off.metrics(), timed.metrics());
     let queries = timed.tick().max(1) as f64;
+    let disk_reads = m.misses - m.fresh_pages;
     Point {
         policy: policy.name(),
         frames,
         hits: m.hits,
         misses: m.misses,
-        disk_reads: m.misses - m.fresh_pages,
+        disk_reads,
         read_requests: t.next_page_reads + t.ahead_reads + t.jump_reads,
         pages_read: t.misses - t.fresh_pages + t.pages_read_ahead,
         ssd_ms_per_query: t.total_ms(StorageKind::Ssd) / queries,
         hdd_ms_per_query: t.total_ms(StorageKind::Hdd) / queries,
+        lru_frames: lru.frames_for(disk_reads),
     }
 }
 

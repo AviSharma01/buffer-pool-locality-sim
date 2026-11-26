@@ -457,21 +457,22 @@ fn runs_started_in_the_same_second_get_their_own_folders() {
     }
 }
 
-/// The viewer refuses run files of another version, so its VERSION must move
-/// with the engine's.
-#[test]
-fn the_viewer_reads_the_run_file_version_the_engine_writes() {
-    let page = include_str!("../../viewer/index.html");
-    let declared: Vec<u32> = page
-        .lines()
+/// The `VERSION = n;` a page declares.
+fn page_version(page: &str) -> Vec<u32> {
+    page.lines()
         .filter_map(|l| l.trim().strip_prefix("VERSION = "))
         .map(|v| v.trim_end_matches(';').parse().expect("a number"))
-        .collect();
-    assert_eq!(
-        declared,
-        [bpsim::run::VERSION],
-        "viewer/index.html declares {declared:?}"
-    );
+        .collect()
+}
+
+/// The viewer and the sweep page refuse files of another version, so their
+/// VERSION must move with the engine's.
+#[test]
+fn the_pages_read_the_file_versions_the_engine_writes() {
+    let viewer = page_version(include_str!("../../viewer/index.html"));
+    assert_eq!(viewer, [bpsim::run::VERSION], "viewer/index.html");
+    let sweep = page_version(include_str!("../../viewer/sweep.html"));
+    assert_eq!(sweep, [bpsim::sweep::VERSION], "viewer/sweep.html");
 }
 
 #[test]
@@ -608,6 +609,32 @@ fn a_sweep_point_matches_the_single_runs_it_stands_for() {
         assert_eq!(p["ssd_ms_per_query"], ssd["mean_ms_per_query"]);
         let hdd = single(&["--storage", "hdd"]);
         assert_eq!(p["hdd_ms_per_query"], hdd["mean_ms_per_query"]);
+        // The smallest pool where LRU reads no more: one frame less reads more.
+        let lru_reads = |frames: u64| {
+            let f = frames.to_string();
+            let args = [
+                "--trace",
+                &trace,
+                "--policy",
+                "lru",
+                "--frames",
+                &f,
+                "--read-ahead",
+                "off",
+                "--no-viewer",
+                "--out",
+                out,
+            ];
+            let s = read_json(&written_to(&sim(&args)).join("summary.json"));
+            s["misses"].as_u64().unwrap() - s["fresh_pages"].as_u64().unwrap()
+        };
+        let need = p["lru_frames"].as_u64().unwrap();
+        let reads = p["disk_reads"].as_u64().unwrap();
+        assert!(lru_reads(need) <= reads, "{policy} {frames}: LRU at {need}");
+        assert!(
+            need == 1 || lru_reads(need - 1) > reads,
+            "{policy} {frames}: {need} is not the least"
+        );
     }
     assert!(
         fresh_seen > 0,
