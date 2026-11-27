@@ -2,10 +2,10 @@
 
 The shipped traces exercise few shapes. These are small random databases:
 tables laid out in runs of pages with free pages between them, queries that
-walk forward, jump or write, and random scans; every policy at several pool
-sizes, both drives, read-ahead auto, off and 3. A disagreement or an engine
-crash is a bug in one of the two. This is how the 3.5a review found the
-PostgreSQL ring crash and the LRU read-ahead order.
+walk forward, jump or write, and random scans; every policy and setting in
+compare.POLICIES at several pool sizes, both drives, read-ahead auto, off and
+3. A disagreement or an engine crash is a bug in one of the two. This is how
+an earlier review found the PostgreSQL ring crash and the LRU read-ahead order.
 
     python verify/fuzz.py                   # 150 traces, seed 1, ~1 min
     python verify/fuzz.py --seed 7 --traces 500
@@ -91,7 +91,8 @@ def fuzz(seed: int, count: int, keep: Path | None = None, sim: Path | None = Non
                     for storage in ["ssd", "hdd"]:
                         out = work / "out"
                         shutil.rmtree(out, ignore_errors=True)
-                        args = ["--trace", str(path), "--policy", "all", "--frames", str(frames)]
+                        args = ["--trace", str(path), "--policy", ",".join(compare.POLICIES)]
+                        args += ["--frames", str(frames)]
                         args += ["--read-ahead", read_ahead, "--storage", storage]
                         done = subprocess.run(
                             [str(sim), *args, "--out", str(out)],
@@ -107,7 +108,7 @@ def fuzz(seed: int, count: int, keep: Path | None = None, sim: Path | None = Non
                             continue
                         run_file = next(out.glob("*/compare/*/run.json"))
                         found = compare.check_run(run_file, path, frames, storage, read_ahead)
-                        result["runs"] += len(compare.model.POLICIES) + 1
+                        result["runs"] += len(compare.POLICIES)
                         if found:
                             result["mismatches"] += 1
                             result["problems"] += found[:2]

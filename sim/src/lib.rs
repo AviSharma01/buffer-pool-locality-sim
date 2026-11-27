@@ -29,7 +29,7 @@ pub type TableId = u16;
 pub type FrameIdx = usize;
 
 pub use capture::CapturedTrace;
-pub use policy::PolicyKind;
+pub use policy::{InnoDbSettings, PgSettings, PolicyKind, Promote};
 pub use sim::{SimConfig, Simulator, build_scenario};
 pub use storage::StorageKind;
 pub use workload::Workload;

@@ -19,7 +19,9 @@ pub struct Cli {
 
     /// Page replacement policy: fifo, lru, clock, pg (PostgreSQL-style),
     /// innodb (InnoDB-style) or opt. A comma-separated list, or `all`, runs
-    /// several on the same input.
+    /// several on the same input. Settings follow a colon: `pg:ring=off`,
+    /// `innodb:old=20` (old sublist %, 5-95), `innodb:promote=any` (an old page
+    /// moves up on any re-use, not only in a later query); join two with `:`.
     #[arg(long, default_value = "clock", value_parser = policies)]
     pub policy: Policies,
 
@@ -120,6 +122,17 @@ fn positive_usize(s: &str) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policies_with_settings_are_distinct_but_a_default_is_not() {
+        let Policies(list) = policies("innodb,innodb:old=20,pg:ring=off").unwrap();
+        let ids: Vec<_> = list.iter().map(|p| p.id()).collect();
+        assert_eq!(ids, ["innodb", "innodb:old=20", "pg:ring=off"]);
+        let err = policies("pg,pg:ring=on").unwrap_err();
+        assert!(err.contains("listed twice"), "{err}");
+        let err = policies("innodb:old=20:promote=any,innodb:promote=any:old=20").unwrap_err();
+        assert!(err.contains("listed twice"), "{err}");
+    }
 
     #[test]
     fn frames_are_one_size_a_sorted_list_or_a_sweep() {

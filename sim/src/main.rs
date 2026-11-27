@@ -265,9 +265,9 @@ fn run_policies(input: &Input, frames: usize, args: &Cli) -> Result<(), String> 
 
     let ts = Local::now().format("%Y-%m-%dT%H-%M-%S").to_string();
     let folder = if compare {
-        "compare"
+        "compare".to_string()
     } else {
-        policies[0].name()
+        policies[0].file_name()
     };
     let run_dir = new_run_dir(&args.out.join(&name).join(folder), &ts)?;
 
@@ -284,7 +284,7 @@ fn run_policies(input: &Input, frames: usize, args: &Cli) -> Result<(), String> 
             sim.record_events();
         }
         let dir = if compare {
-            run_dir.join(policy.name())
+            run_dir.join(policy.file_name())
         } else {
             run_dir.clone()
         };
@@ -358,7 +358,7 @@ fn run_sweep(input: &Input, sizes: Vec<usize>, args: &Cli) -> Result<(), String>
         accesses: trace.accesses().len(),
         read_ahead: args.read_ahead,
         command: command_line(),
-        policies: args.policy.0.iter().map(|p| p.name()).collect(),
+        policies: args.policy.0.iter().map(|p| p.id()).collect(),
         sizes,
         points,
         sqlite_cache,

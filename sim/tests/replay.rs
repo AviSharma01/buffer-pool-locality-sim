@@ -8,7 +8,21 @@
 
 use bpsim::policy::{FrameState, Note, Why};
 use bpsim::sim::{Event, Outcome, ReadAhead};
-use bpsim::{CapturedTrace, PolicyKind, SimConfig, Simulator, StorageKind};
+use bpsim::{
+    CapturedTrace, InnoDbSettings, PgSettings, PolicyKind, SimConfig, Simulator, StorageKind,
+};
+
+/// Every policy, and each setting that changes how one works.
+fn every_kind() -> Vec<PolicyKind> {
+    let settings = [
+        "pg:ring=off",
+        "innodb:old=5",
+        "innodb:old=95",
+        "innodb:promote=any",
+    ];
+    let with = settings.map(|s| s.parse::<PolicyKind>().unwrap());
+    PolicyKind::ALL.into_iter().chain(with).collect()
+}
 
 fn load(name: &str) -> CapturedTrace {
     let path = format!("{}/../traces/{name}.trace.json", env!("CARGO_MANIFEST_DIR"));
@@ -184,17 +198,23 @@ fn optimal_with_8_frames_matches_the_design_numbers() {
 
 #[test]
 fn real_world_policies_with_8_frames_match_the_design_numbers() {
-    assert_eq!(replay(PolicyKind::Pg, 8).hits, 18);
-    assert_eq!(replay(PolicyKind::InnoDb, 8).hits, 20);
+    assert_eq!(replay(PolicyKind::Pg(PgSettings::DEFAULT), 8).hits, 18);
+    assert_eq!(
+        replay(PolicyKind::InnoDb(InnoDbSettings::DEFAULT), 8).hits,
+        20
+    );
     // While the pool fills, the old sublist is 3/8 of the pages loaded so far,
     // so lookups promoted before the report stay young through it.
-    assert_eq!(replay(PolicyKind::InnoDb, 16).hits, 20);
+    assert_eq!(
+        replay(PolicyKind::InnoDb(InnoDbSettings::DEFAULT), 16).hits,
+        20
+    );
     // What the report cost the lookups that follow it (14 accesses): LRU lets
     // the scan flush them, the scan-aware designs keep most, OPT keeps all.
     let after: Vec<usize> = [
         PolicyKind::Lru,
-        PolicyKind::Pg,
-        PolicyKind::InnoDb,
+        PolicyKind::Pg(PgSettings::DEFAULT),
+        PolicyKind::InnoDb(InnoDbSettings::DEFAULT),
         PolicyKind::Opt,
     ]
     .into_iter()
@@ -205,7 +225,7 @@ fn real_world_policies_with_8_frames_match_the_design_numbers() {
 
 #[test]
 fn events_explain_every_access() {
-    for kind in PolicyKind::ALL {
+    for kind in every_kind() {
         for frames in [1, 2, 3, 8, 16, 80] {
             let sim = run(kind, frames, true);
             let s = sim.summary();
@@ -261,7 +281,7 @@ fn the_report_uses_a_ring_under_pg_and_stays_old_under_innodb() {
 
     // 8 frames give a 2-frame ring: two frames join it, the other 14 scan
     // misses recycle them.
-    let pg = notes(&report(PolicyKind::Pg));
+    let pg = notes(&report(PolicyKind::Pg(PgSettings::DEFAULT)));
     let joined = pg
         .iter()
         .filter(|n| matches!(n, Note::JoinedRing { .. }))
@@ -281,7 +301,7 @@ fn the_report_uses_a_ring_under_pg_and_stays_old_under_innodb() {
     assert_eq!((joined, reused), (2, 14));
 
     // Scan pages are read once each, so none is promoted to young.
-    let inno = notes(&report(PolicyKind::InnoDb));
+    let inno = notes(&report(PolicyKind::InnoDb(InnoDbSettings::DEFAULT)));
     assert!(!inno.iter().any(|n| matches!(n, Note::Promoted { .. })));
     assert_eq!(
         inno.iter()
@@ -295,7 +315,7 @@ fn the_report_uses_a_ring_under_pg_and_stays_old_under_innodb() {
 fn no_policy_beats_optimal_on_the_real_trace() {
     for frames in [2, 4, 8, 16, 32] {
         let best = replay(PolicyKind::Opt, frames).misses;
-        for kind in PolicyKind::ALL {
+        for kind in every_kind() {
             let s = replay(kind, frames);
             assert_eq!(s.accesses, 45, "{kind} at {frames} frames");
             let m = s.misses;
@@ -497,8 +517,17 @@ fn the_vacuum_lessons_hold_for_any_reasonable_drive_overhead() {
     }
     // At the profile's own figure, pricing events matches the engine's total.
     let hdd = StorageKind::Hdd.profile();
-    let engine = summary("checkout", PolicyKind::Pg, 8, StorageKind::Hdd).total_ms;
-    assert!((priced_with("checkout", PolicyKind::Pg, 8, hdd) - engine).abs() < 1e-9);
+    let engine = summary(
+        "checkout",
+        PolicyKind::Pg(PgSettings::DEFAULT),
+        8,
+        StorageKind::Hdd,
+    )
+    .total_ms;
+    assert!(
+        (priced_with("checkout", PolicyKind::Pg(PgSettings::DEFAULT), 8, hdd) - engine).abs()
+            < 1e-9
+    );
 }
 
 /// LRU with 8 frames and read-ahead on (up to 2 pages): hits, requests,
@@ -560,7 +589,7 @@ fn vacuum_pays_off_on_an_ssd_through_read_ahead() {
             v.read_requests < g.read_requests,
             "{kind}: fewer, larger requests"
         );
-        if kind != PolicyKind::Pg {
+        if kind != PolicyKind::Pg(PgSettings::DEFAULT) {
             // Their trigger needs two pages of a table in a row; PostgreSQL
             // reads ahead for any scan, so it finds a few short runs.
             assert_eq!(g.pages_read_ahead, 0, "{kind}");

@@ -1,9 +1,9 @@
 """The engine against the independent model in verify/ (see verify/model.py).
 
 The comparison covers every shipped trace and a free-page scenario: every
-policy, pool sizes 1-32, both drives, read-ahead auto/off/1/3 (about 2,800
-runs, ~10 s), and every policy at one size of a sweep of a workload trace
-(~30 s). A short fuzz adds random traces (verify/fuzz.py, ~10 s). Both build
+policy and setting in compare.POLICIES, pool sizes 1-32, both drives,
+read-ahead auto/off/1/3 (about 4,700 runs), and each of them at one size of a
+sweep of a workload trace. A short fuzz adds random traces (verify/fuzz.py, ~10 s). Both build
 the release engine first, so they never test a stale binary."""
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ def test_engine_agrees_with_the_independent_model() -> None:
 @needs_engine
 def test_a_sweep_agrees_with_the_independent_model() -> None:
     runs, mismatches = compare.compare_sweep()
-    assert runs == 18
+    assert runs == 3 * len(compare.POLICIES), "three model runs per policy"
     assert not mismatches, "\n".join(mismatches[:10])
 
 

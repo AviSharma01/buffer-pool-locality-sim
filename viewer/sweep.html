@@ -78,6 +78,7 @@ button:focus-visible,summary:focus-visible,svg:focus-visible{outline:2px solid v
 #chart .curve.faint{stroke-width:1.3}
 #chart .curve.dotted{stroke-dasharray:1.5 3}
 #chart .curve.floor{stroke-width:1.6;stroke-dasharray:5 4}
+#chart .curve.changed{stroke-width:1.5;stroke-dasharray:7 3}
 #chart .sq{fill:var(--bg);stroke:var(--accent);stroke-width:1.6}
 #chart .pt{stroke:var(--bg);stroke-width:1.5}
 .readout{background:var(--raised);border-radius:14px;padding:10px 12px;font-size:12.5px;min-height:100%}
@@ -92,6 +93,7 @@ button:focus-visible,summary:focus-visible,svg:focus-visible{outline:2px solid v
 .sw.ring{width:9px;height:9px;border-radius:50%;background:transparent!important;border:1.6px solid var(--accent)}
 .sw.dash{height:0;border-top:2px dashed var(--ink);background:transparent!important}
 .sw.dots{height:0;border-top:2px dotted var(--faint);background:transparent!important}
+.sw.changed{width:14px;height:0;border-top:2px dashed;background:transparent!important}
 .legend{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12px;color:var(--ink-2);margin-top:8px}
 .legend span{display:inline-flex;align-items:center;gap:6px}
 .note{margin:10px 0 0;font-size:12.5px;color:var(--muted);max-width:76ch}
@@ -169,7 +171,7 @@ tbody tr:nth-child(odd){background:var(--soft)}
 <script>
 "use strict";
 const FORMAT = "bpsim-sweep",
-  VERSION = 2;
+  VERSION = 3;
 /* Drawn in this order, so the policies that matter most end up on top. */
 const POLICIES = {
   fifo: {name: "FIFO", colour: "--faint", faint: true, dotted: true},
@@ -224,7 +226,22 @@ function check(s) {
   if (s.version !== VERSION) throw new Error(`sweep version ${s.version}; this page reads version ${VERSION}`);
   if (!s.sizes.length || !s.points.length) throw new Error("the sweep has no points");
 }
-/* One series per policy, in drawing order: value per size, by measure. */
+/* A point's policy is an id: a name, then any settings, as in "innodb:old=20". */
+const kindOf = p => p.split(":")[0];
+const SETTING = {
+  old: v => `old ${v}%`,
+  promote: v => (v === "any" ? "promoted on any re-use" : "promoted in a later query"),
+  ring: v => (v === "off" ? "no scan ring" : "scan ring")
+};
+const settingsText = p =>
+  p
+    .split(":")
+    .slice(1)
+    .map(kv => kv.split("="))
+    .map(([k, v]) => (SETTING[k] ? SETTING[k](v) : `${k} ${v}`))
+    .join(", ");
+/* One series per policy, in drawing order: value per size, by measure. A
+   policy with a setting follows its plain one, dashed in the same colour. */
 function seriesOf(s) {
   const at = new Map(s.sizes.map((f, i) => [f, i]));
   const by = new Map();
@@ -232,9 +249,17 @@ function seriesOf(s) {
     if (!by.has(p.policy)) by.set(p.policy, new Array(s.sizes.length));
     by.get(p.policy)[at.get(p.frames)] = p;
   }
-  return Object.keys(POLICIES)
-    .filter(k => by.has(k))
-    .map(k => ({key: k, ...POLICIES[k], points: by.get(k)}));
+  const order = id => (id.includes(":") ? 1 + s.policies.indexOf(id) : 0);
+  return Object.keys(POLICIES).flatMap(k =>
+    [...by.keys()]
+      .filter(id => kindOf(id) === k)
+      .sort((a, b) => order(a) - order(b))
+      .map(id => {
+        const set = settingsText(id);
+        const changed = set ? {name: `${POLICIES[k].name}, ${set}`, changed: true} : {};
+        return {key: id, ...POLICIES[k], ...changed, points: by.get(id)};
+      })
+  );
 }
 const perQuery = (s, value) => value / s.queries;
 function values(series, measure) {
@@ -347,7 +372,7 @@ function draw() {
   for (const l of state.lines) {
     const v = values(l, state.measure);
     const pts = s.sizes.map((f, i) => `${fr.x(f)},${fr.y(v[i])}`).join(" ");
-    const cls = `curve${l.faint ? " faint" : ""}${l.dotted ? " dotted" : ""}${l.floor ? " floor" : ""}`;
+    const cls = ["curve", ...["faint", "dotted", "floor", "changed"].filter(k => l[k])].join(" ");
     chart.append(svg("polyline", {class: cls, points: pts, stroke: css(l.colour)}));
   }
   if (state.measure === "reads") {
@@ -366,9 +391,10 @@ function draw() {
 
 /* ---------- the readout ---------- */
 function swatch(l) {
-  const sw = el("span", `sw${l.floor ? " dash" : ""}${l.dotted ? " dots" : ""}`);
+  const marks = {floor: "dash", dotted: "dots", changed: "changed"};
+  const sw = el("span", ["sw", ...Object.keys(marks).filter(k => l[k]).map(k => marks[k])].join(" "));
   sw.style.background = css(l.colour);
-  if (l.floor) sw.style.borderTopColor = css(l.colour);
+  if (l.floor || l.changed) sw.style.borderTopColor = css(l.colour);
   return sw;
 }
 /* Every policy at size `i`, lowest first, with LRU and the best real policy

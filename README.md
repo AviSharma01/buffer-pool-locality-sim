@@ -18,7 +18,8 @@ Two more findings and the full numbers: [FINDINGS.md](FINDINGS.md).
   and write, and saves it as a trace.
 - `sim/` (Rust) replays the trace through FIFO, LRU, Clock, PostgreSQL-style
   (clock sweep with a scan ring), InnoDB-style (midpoint insertion) and
-  Optimal, on a modelled SSD or HDD.
+  Optimal, on a modelled SSD or HDD. A rule can be changed one at a time
+  (`--policy innodb:old=20`, `pg:ring=off`) to see what a saving comes from.
 - It writes either a sweep across pool sizes (above) or a viewer that steps
   through every access and explains each eviction (below).
 

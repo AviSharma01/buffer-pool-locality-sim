@@ -47,7 +47,7 @@ except ImportError:
     sys.exit(2)
 
 TRACE_DIR = compare.REPO / "traces"
-POLICIES_WITH_A_MODEL = list(model.POLICIES)  # Optimal may break ties differently
+SETTINGS_RUN = "innodb,innodb:old=20,innodb:promote=any,pg:ring=off"
 
 
 def long_trace(work: Path) -> Path:
@@ -78,6 +78,8 @@ def runs(work: Path) -> list[tuple[str, Path, list[str]]]:
         ("shop, LRU only, 2 frames, HDD", TRACE_DIR / "shop.trace.json",
          ["--policy", "lru", "--frames", "2", "--storage", "hdd"]),
         ("shop, 1 frame", TRACE_DIR / "shop.trace.json", ["--policy", "all", "--frames", "1"]),
+        ("shop, policies with settings", TRACE_DIR / "shop.trace.json",
+         ["--policy", SETTINGS_RUN, "--frames", "8"]),
     ]  # fmt: skip
     return out
 
@@ -92,7 +94,7 @@ def check_page(page: Page, label: str, trace: Path, run: dict, width: int) -> li
             continue
         read_ahead = "off" if run["runs"][0]["summary"]["read_ahead_cap"] == 0 else "auto"
         for r in run["runs"]:
-            if r["policy"] not in POLICIES_WITH_A_MODEL:
+            if r["policy"] == "opt":  # Optimal may break ties differently
                 continue
             shown = page.evaluate("p => bpsim.running(p).c[bpsim.accesses() - 1]", r["policy"])
             want = model.run(trace, r["policy"], run["frames"], storage, read_ahead)
@@ -181,6 +183,28 @@ def check_interaction(page: Page, run_file: Path) -> list[str]:
     page.wait_for_timeout(200)
     if "expected bpsim-run" not in page.inner_text("#error"):
         problems.append("an older run file was not refused with a clear error")
+    return problems
+
+
+def check_settings(page: Page, run: dict) -> list[str]:
+    """Each policy is named with its settings, and its pool explains the policy
+    it is, not the default one."""
+    problems = []
+    for r in run["runs"]:
+        p = r["policy"]
+        name = page.inner_text(f'#slist [data-p="{p}"]').splitlines()[0]
+        if name != name_of(p):
+            problems.append(f"score column names {p} {name!r}, expected {name_of(p)!r}")
+        page.click(f'#slist [data-p="{p}"] .sopen')
+        pool = page.inner_text("#pools .pool.focus")
+        ring = "Scan ring:" in pool
+        if p.startswith("pg") and ring != (p == "pg"):
+            problems.append(f"{p}: the scan ring legend is {'shown' if ring else 'missing'}")
+        if p == "pg:ring=off" and "usage counts + scan ring" in pool:
+            problems.append("pg:ring=off is described as having a scan ring")
+        any_use = "Any use after the first moves one into young." in pool
+        if p.startswith("innodb") and any_use != (p == "innodb:promote=any"):
+            problems.append(f"{p}: the hint about promotion is wrong")
     return problems
 
 
@@ -628,8 +652,24 @@ SWEEPS = [
     ("shop sweep", ["--trace", str(TRACE_DIR / "shop.trace.json"), *SWEEP_ALL]),
     ("workload sweep, no LRU, no page size",
      ["--policy", "pg,opt", "--frames", "8,16,64", "--ticks", "300"]),
+    ("reports sweep, policies with settings",
+     ["--trace", str(TRACE_DIR / "reports.trace.json.gz"), "--frames", "512,2048,4096",
+      "--policy", "lru,innodb:old=20,innodb,innodb:promote=any,pg:ring=off,pg,opt"]),
 ]  # fmt: skip
 ORDER = ["fifo", "clock", "lru", "pg", "innodb", "opt"]  # as the page draws them
+
+
+def drawn(policies: list[str]) -> list[str]:
+    """The order the page draws lines in: by ORDER, each plain policy before the
+    same policy with settings, which keep the order given."""
+    kind = lambda p: p.split(":")[0]  # noqa: E731
+    return [
+        p
+        for k in ORDER
+        for p in sorted((p for p in policies if kind(p) == k), key=lambda p: ":" in p)
+    ]
+
+
 DROP = """t => {
     const dt = new DataTransfer();
     dt.items.add(new File([t], 'sweep.json'));
@@ -655,10 +695,18 @@ def check_sweep_page(page: Page, sweep: dict, measure: str) -> list[str]:
     problems = []
     if page.evaluate("document.documentElement.scrollWidth > innerWidth"):
         problems.append("the page scrolls sideways")
-    policies = [p for p in ORDER if p in sweep["policies"]]
+    policies = drawn(sweep["policies"])
     lines = page.evaluate(
         "[...document.querySelectorAll('#chart polyline')].map(l => l.getAttribute('points'))"
     )
+    dashed = len(page.query_selector_all("#chart polyline.changed"))
+    if dashed != sum(":" in p for p in policies):
+        problems.append(
+            f"{dashed} dashed lines for {sum(':' in p for p in policies)} with settings"
+        )
+    names = [r["name"] for r in readout(page)]
+    if sorted(names) != sorted(name_of(p) for p in policies):
+        problems.append(f"the readout names {names}")
     if len(lines) != len(policies):
         return problems + [f"{len(lines)} lines drawn for {len(policies)} policies"]
     xs, ys, vs = [], [], []
@@ -711,6 +759,20 @@ NAMES = {
 }  # fmt: skip
 
 
+SETTINGS = {
+    "old": lambda v: f"old {v}%",
+    "promote": lambda v: "promoted on any re-use" if v == "any" else "promoted in a later query",
+    "ring": lambda v: "no scan ring" if v == "off" else "scan ring",
+}
+
+
+def name_of(policy: str) -> str:
+    """As both pages name a policy id: its name, then its settings."""
+    kind, *settings = policy.split(":")
+    said = [SETTINGS[k](v) for k, v in (s.split("=") for s in settings)]
+    return ", ".join([NAMES[kind], *said])
+
+
 def js_round(x: float) -> int:
     """Math.round: halves go up."""
     return math.floor(x + 0.5)
@@ -729,7 +791,7 @@ def expected_answer(sweep: dict, measure: str) -> str:
     sizes = sweep["sizes"]
     half = min(range(len(sizes)), key=lambda i: abs(sizes[i] - sweep["pages"] / 2))
     values, best, lru = standings(sweep, measure, half)
-    name = NAMES[best]
+    name = name_of(best)
     if lru is None:
         return f"{name} reads the fewest pages" if measure == "reads" else f"{name} is fastest"
     if best == "lru":
@@ -933,6 +995,8 @@ def main() -> int:
                 page.goto(viewer.as_uri())
                 page.wait_for_selector(".pool")
                 found = check_page(page, label, trace, run, width)
+                if args[1] == SETTINGS_RUN:
+                    found += check_settings(page, run)
                 if i == 0:
                     found += check_how(page)
                     found += check_theme(page, scheme)

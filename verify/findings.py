@@ -8,8 +8,9 @@
 The first run captures the trace variants into traces/local/variants (about
 4 minutes); later runs reuse them, after checking each says it is the variant
 it should be. Every number comes from the engine (disk
-reads with read-ahead off, and the exact pool LRU needs) or, for the
-breakdown by page, from the independent model in model.py.
+reads with read-ahead off, and the exact pool LRU needs, for every policy and
+for each one with a rule changed), from the independent model in model.py
+(the breakdown by page), or from the traces (pages re-read within a query).
 """
 
 from __future__ import annotations
@@ -31,7 +32,10 @@ import model  # noqa: E402
 
 REPO = compare.REPO
 # Each document and the blocks findings.py writes in it.
-DOCS = {REPO / "FINDINGS.md": ("summary", "results", "uses"), REPO / "README.md": ("headline",)}
+DOCS = {
+    REPO / "FINDINGS.md": ("summary", "results", "causes", "uses", "limit"),
+    REPO / "README.md": ("headline",),
+}
 VARIANT_DIR = REPO / "traces" / "local" / "variants"
 CAPTURE = REPO / "capture" / "capture.py"
 
@@ -47,6 +51,10 @@ VARIANTS = [
 ]
 POOLS = {"1/8": 8, "1/4": 4, "1/2": 2}  # pool as a share of the database
 SHOWN = ["innodb", "pg", "opt"]
+# Each policy with one rule changed, to see what its saving comes from.
+OLD_SHARES = [5, 20, 50, 75, 95]  # InnoDB-style's old sublist, % (the default is 3/8)
+CHANGED = ["innodb:promote=any", "pg:ring=off"] + [f"innodb:old={p}" for p in OLD_SHARES]
+POLICIES = ["fifo", "lru", "clock", "pg", "innodb", "opt", *CHANGED]
 NAMES = {"innodb": "InnoDB-style", "pg": "PostgreSQL-style", "opt": "Optimal"}
 USES = [(1, 1, "1"), (2, 9, "2–9"), (10, 99, "10–99"), (100, None, "100+")]
 
@@ -121,7 +129,7 @@ def measure(sim: Path, path: Path, work: Path) -> Measured:
     pools = {pool: round(pages / d) for pool, d in POOLS.items()}
     out = work / path.name.removesuffix(".trace.json.gz")
     frames = ",".join(str(f) for f in pools.values())
-    cmd = [str(sim), "--trace", str(path), "--policy", "all", "--frames", frames]
+    cmd = [str(sim), "--trace", str(path), "--policy", ",".join(POLICIES), "--frames", frames]
     cmd += ["--read-ahead", "off", "--out", str(out)]
     subprocess.run(cmd, check=True, capture_output=True)
     sweep = json.loads(next(out.glob("**/sweep.json")).read_text(encoding="utf-8"))
@@ -131,6 +139,16 @@ def measure(sim: Path, path: Path, work: Path) -> Measured:
         for p in sweep["points"]
     }
     return Measured(pages, pools, points)
+
+
+def rereads(path: Path) -> int:
+    """How many pages some query reads more than once."""
+    trace = json.loads(gzip.decompress(path.read_bytes()))
+    pages = set()
+    for q in trace["queries"]:
+        reads = [a[1] for a in q["io"] if a[0] == "r"]
+        pages |= {p for p, n in collections.Counter(reads).items() if n > 1}
+    return len(pages)
 
 
 def reads_by_uses(path: Path, frames: int) -> dict[str, dict[str, int]]:
@@ -163,20 +181,16 @@ def span(values: list[float], form=pct) -> str:
     return lo if lo == hi else f"{lo.rstrip('%×')}–{hi}"
 
 
-def warm_text(share: dict[str, float]) -> str:
-    """How much of InnoDB-style's saving is on pages 10+ queries use. Over 100% means
-    it reads the other pages more than LRU does, so the saving is all theirs."""
-    parts = [
-        f"{'all' if x >= 1 else pct(x)} of {'the saving' if n == 0 else 'it'} on `{t}`"
-        for n, (t, x) in enumerate(share.items())
-    ]
-    text = f"Pages used by 10 or more queries account for {' and '.join(parts)}."
-    if over := [f"`{t}`" for t, x in share.items() if x > 1]:
-        text += (
-            f" On {', '.join(over)}, InnoDB-style reads pages used fewer times a little more "
-            f"than LRU does."
-        )
-    return text
+def warm_text(share: dict[tuple[str, str], float]) -> str:
+    """How much of InnoDB-style's saving is on pages 10+ queries use, across the
+    traces. Over 100% means it reads the other pages more than LRU does, so the
+    saving is all theirs."""
+    (t, v), low = min(share.items(), key=lambda kv: kv[1])
+    most = "all" if max(share.values()) >= 1 else pct(max(share.values()))
+    return (
+        f"Pages used by 10 or more queries account for {pct(low)} to {most} of the saving, "
+        f"the least on `{t}` at {v}."
+    )
 
 
 def times(x: float) -> str:
@@ -184,7 +198,7 @@ def times(x: float) -> str:
 
 
 def claims(
-    m: dict[tuple[str, str], Measured], uses: dict[str, dict]
+    m: dict[tuple[str, str], Measured], uses: dict[tuple[str, str], dict], reread: int
 ) -> tuple[dict[str, str], list[str]]:
     """The summary and the README's headline, and every claim in them that the
     numbers contradict."""
@@ -208,18 +222,36 @@ def claims(
         max(abs(x) for x in no_scans_pg) <= 0.03,
         "without full scans, PostgreSQL-style is within 3% of LRU",
     )
+    ringless = [abs(m["reports", v].fewer("1/2", "pg:ring=off")) for v in labels]
+    need(
+        max(ringless) <= 0.05,
+        "without its ring, PostgreSQL-style is within 5% of LRU on reports at 1/2",
+    )
+    need(
+        all(
+            r.points[pool, "innodb:promote=any"].reads == r.points[pool, "innodb"].reads
+            for r in m.values()
+            for pool in POOLS
+        ),
+        "promoting on any re-use reads exactly what InnoDB-style reads, on every trace",
+    )
+    at_head = [abs(r.fewer(pool, "innodb:old=95")) for r in m.values() for pool in POOLS]
+    need(
+        max(at_head) <= 0.02,
+        "with new pages entering at the head (old 95%), InnoDB-style is within 2% of LRU",
+    )
 
     inno = [m[t, v].fewer("1/4", "innodb") for t in ("oltp", "ranges") for v in labels]
     need(min(inno) >= 0.03, "without full scans, InnoDB-style reads 3%+ less than LRU at 1/4")
     warm_share = {}
-    for t, r in uses.items():
+    for key, r in uses.items():
         net = sum(r["lru"].values()) - sum(r["innodb"].values())
         warm = sum(r["lru"][n] - r["innodb"][n] for n in ("10–99", "100+"))
         need(
-            net > 0 and warm >= 2 / 3 * net,
-            f"{t}: most of InnoDB-style's saving is on pages 10+ queries use",
+            net > 0 and warm >= 0.4 * net,
+            f"{key[0]} {key[1]}: pages 10+ queries use carry 40%+ of InnoDB-style's saving",
         )
-        warm_share[t] = warm / net if net > 0 else 0.0
+        warm_share[key] = warm / net if net > 0 else 0.0
 
     room = [m[t, v].fewer("1/4", "opt") for t in TRACES for v in labels]
     need(min(room) >= 0.3, "Optimal reads 30%+ less than LRU at 1/4 on every trace")
@@ -230,14 +262,17 @@ def claims(
             f"1. **Full scans are where the policies differ most.** On `reports` with half the "
             f"database in memory, InnoDB-style and PostgreSQL-style read {span(scans)} fewer "
             f"pages than LRU, and LRU needs {span(scan_mem, times)} the memory to match. "
-            f"Without the full scans (`oltp` is the same queries minus the reports, `ranges` has "
-            f"only short ones), PostgreSQL-style is within {pg_gap} of LRU.",
+            f"PostgreSQL-style's edge there is its scan ring (without it, it reads within "
+            f"{pct(max(ringless))} of LRU), and InnoDB-style's is where new pages enter (finding "
+            f"2). Without the full scans (`oltp` is the same queries "
+            f"minus the reports, `ranges` has only short ones), PostgreSQL-style is within "
+            f"{pg_gap} of LRU.",
             f"2. **InnoDB-style helps without full scans too:** {span(inno)} fewer reads than LRU "
-            f"with a quarter of the database in memory, on `oltp` and `ranges`. "
-            f"{warm_text(warm_share)} A page "
-            f"enters InnoDB-style's list partway down, at the head of its old sublist, and moves "
-            f"up only when a later query uses it, so pages used a few times don't push out pages "
-            f"used often, as they do under LRU.",
+            f"with a quarter of the database in memory, on `oltp` and `ranges`. The cause is "
+            f"where a new page enters: partway down the list, at the head of its old sublist, so "
+            f"a page that isn't used again leaves from there instead of pushing out pages that "
+            f"are. With new pages entering at the head (old sublist 95%), it reads within "
+            f"{pct(max(at_head))} of LRU. {warm_text(warm_share)}",
             f"3. Optimal reads {span(room)} less than LRU with a quarter of the database in "
             f"memory, so most of the possible saving is still unclaimed.",
         ]
@@ -248,7 +283,14 @@ def claims(
         f"the database in memory, and LRU needs {span(scan_mem, times)} the memory to match. "
         f"Without the reports, PostgreSQL-style is within {pg_gap} of LRU."
     )
-    return {"summary": summary, "headline": headline}, failed
+    limit = (
+        f"- InnoDB-style's rule that only a later query moves an old page up changes no read "
+        f"on any trace (`innodb:promote=any` reads the same): within a query, SQLite re-reads "
+        f"at most {reread} pages. So these traces can't test what MySQL's "
+        f"`innodb_old_blocks_time` is for, a scan touching each page several times in quick "
+        f"succession."
+    )
+    return {"summary": summary, "headline": headline, "limit": limit}, failed
 
 
 # ---------- tables ----------
@@ -270,16 +312,46 @@ def results_table(m: dict[tuple[str, str], Measured]) -> str:
     return "\n".join(rows)
 
 
-def uses_table(uses: dict[str, dict[str, dict[str, int]]]) -> str:
-    rows = [
-        "| Trace | Queries using the page | LRU | InnoDB-style | Change |",
-        "|---|---|---|---|---|",
-    ]
-    for trace, r in uses.items():
+CAUSES = [
+    ("innodb:old=5", "InnoDB-style, old sublist 5%"),
+    ("innodb:old=20", "InnoDB-style, old sublist 20%"),
+    ("innodb", "InnoDB-style (old sublist 3/8)"),
+    ("innodb:old=50", "InnoDB-style, old sublist 50%"),
+    ("innodb:old=75", "InnoDB-style, old sublist 75%"),
+    ("innodb:old=95", "InnoDB-style, old sublist 95%"),
+    ("innodb:promote=any", "InnoDB-style, promoted on any re-use"),
+    ("pg", "PostgreSQL-style"),
+    ("pg:ring=off", "PostgreSQL-style without its ring"),
+]
+CAUSE_POOLS = [("oltp", "1/4"), ("ranges", "1/4"), ("reports", "1/2")]
+
+
+def causes_table(m: dict[tuple[str, str], Measured]) -> str:
+    """Each changed policy's saving over LRU, low to high across the variants."""
+    head = "| Policy | " + " | ".join(f"{t} ({p})" for t, p in CAUSE_POOLS) + " |"
+    rows = [head, "|" + "---|" * (len(CAUSE_POOLS) + 1)]
+    for policy, name in CAUSES:
+        cells = [
+            span([r.fewer(pool, policy) for (t, _), r in m.items() if t == trace])
+            for trace, pool in CAUSE_POOLS
+        ]
+        rows.append(f"| {name} | " + " | ".join(cells) + " |")
+    return "\n".join(rows)
+
+
+def signed_span(values: list[float]) -> str:
+    lo, hi = (f"{x:+.0%}" for x in (min(values), max(values)))
+    return lo if lo == hi else f"{lo} to {hi}"
+
+
+def uses_table(uses: dict[tuple[str, str], dict[str, dict[str, int]]]) -> str:
+    """InnoDB-style's change in reads by page use, low to high across the variants."""
+    rows = ["| Trace | Queries using the page | InnoDB-style vs LRU |", "|---|---|---|"]
+    for trace in dict.fromkeys(t for t, _ in uses):
         for _, _, name in USES:
-            a, b = r["lru"][name], r["innodb"][name]
-            change = f"{(b - a) / a:+.0%}" if a else "–"
-            rows.append(f"| {trace} | {name} | {a:,} | {b:,} | {change} |")
+            runs = [r for (t, _), r in uses.items() if t == trace]
+            change = [(r["innodb"][name] - r["lru"][name]) / r["lru"][name] for r in runs]
+            rows.append(f"| {trace} | {name} | {signed_span(change)} |")
     return "\n".join(rows)
 
 
@@ -320,11 +392,18 @@ def main() -> int:
                 path = capture(trace, label, seed, param, args.recapture)
                 m[trace, label] = measure(sim, path, Path(tmp))
     uses = {
-        t: reads_by_uses(trace_path(t, "seed 7"), m[t, "seed 7"].pools["1/4"])
+        (t, v): reads_by_uses(trace_path(t, v), m[t, v].pools["1/4"])
         for t in ("oltp", "ranges")
+        for v, _, _ in VARIANTS
     }
-    texts, failed = claims(m, uses)
-    blocks = {**texts, "results": results_table(m), "uses": uses_table(uses)}
+    reread = max(rereads(trace_path(t, v)) for t in TRACES for v, _, _ in VARIANTS)
+    texts, failed = claims(m, uses, reread)
+    blocks = {
+        **texts,
+        "results": results_table(m),
+        "causes": causes_table(m),
+        "uses": uses_table(uses),
+    }
     for f in failed:
         print("CLAIM FAILS:", f)
     stale = []

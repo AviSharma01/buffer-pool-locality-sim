@@ -1,6 +1,7 @@
 """Compare the engine with the independent model (model.py) on every shipped
-trace plus a free-page scenario: every policy, pool sizes from 1 to 32,
-both drives, read-ahead auto, off, 1 and 3 pages. About 2,200 runs, ~10 s.
+trace plus a free-page scenario: every policy and each setting that changes
+one (POLICIES), pool sizes from 1 to 32, both drives, read-ahead auto, off, 1
+and 3 pages. About 4,700 runs, ~1 min.
 
     python verify/compare.py            # builds the release engine first
 
@@ -31,6 +32,9 @@ SIM = REPO / "sim" / "target" / "release" / "sim"
 TRACES = ["shop", "checkout", "growth", "growth-vacuum", "shop-vacuum"]
 FRAMES = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32]
 READ_AHEAD = ["auto", "off", "1", "3"]
+# Every policy, then each setting that changes how one works.
+POLICIES = ["fifo", "lru", "clock", "pg", "innodb", "opt"]
+POLICIES += ["pg:ring=off", "innodb:old=5", "innodb:old=95", "innodb:promote=any"]
 FIELDS = [
     "hits",
     "next_page_reads",
@@ -100,13 +104,14 @@ def compare(sim: Path | None = None) -> tuple[int, list[str]]:
                 for storage in model.PROFILES:
                     for read_ahead in READ_AHEAD:
                         shutil.rmtree(out, ignore_errors=True)
-                        args = ["--trace", str(path), "--policy", "all", "--frames", str(frames)]
+                        args = ["--trace", str(path), "--policy", ",".join(POLICIES)]
+                        args += ["--frames", str(frames)]
                         args += ["--storage", storage, "--read-ahead", read_ahead]
                         cmd = [str(sim), *args, "--out", str(out)]
                         subprocess.run(cmd, check=True, capture_output=True)
                         run_file = next(out.glob("*/compare/*/run.json"))
                         mismatches += check_run(run_file, path, frames, storage, read_ahead)
-                        runs += len(model.POLICIES) + 1
+                        runs += len(POLICIES)
     return runs, mismatches
 
 
@@ -121,7 +126,8 @@ def compare_sweep(sim: Path | None = None) -> tuple[int, list[str]]:
     runs, mismatches = 0, []
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp)
-        args = ["--trace", str(SWEEP_TRACE), "--policy", "all", "--frames", f"{SWEEP_FRAMES},8"]
+        args = ["--trace", str(SWEEP_TRACE), "--policy", ",".join(POLICIES)]
+        args += ["--frames", f"{SWEEP_FRAMES},8"]
         subprocess.run([str(sim), *args, "--out", str(out)], check=True, capture_output=True)
         sweep = json.loads(next(out.glob("**/sweep.json")).read_text(encoding="utf-8"))
     for p in (p for p in sweep["points"] if p["frames"] == SWEEP_FRAMES):

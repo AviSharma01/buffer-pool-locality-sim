@@ -14,9 +14,13 @@
 //! Miniature: InnoDB has no old sublist until the list holds 512 pages and
 //! skips moving pages already in the youngest quarter; here the split applies
 //! from the first page and every young hit moves to the head.
+//!
+//! Settings: `old=N` makes the old sublist N% of the list (5 to 95, like
+//! innodb_old_blocks_pct); `promote=any` moves an old page up on any use
+//! after its first, in the same query or not (like innodb_old_blocks_time = 0).
 
 use super::list::FrameList;
-use super::{Ctx, FrameState, Log, Note, Policy, Region, Why};
+use super::{Ctx, FrameState, InnoDbSettings, Log, Note, Policy, Promote, Region, Why};
 use crate::FrameIdx;
 
 pub struct InnoDb {
@@ -35,17 +39,34 @@ pub struct InnoDb {
     region: Vec<Region>,
     /// Frames that crossed the boundary since the last relabel.
     crossed: Vec<FrameIdx>,
+    settings: InnoDbSettings,
 }
 
-/// Old sublist length for a list of `len` pages: 3/8 rounded, and at least
-/// one page (when there is one) so a new page always has an old head to enter at.
-fn old_len(len: usize) -> usize {
-    ((len * 3 + 4) / 8).clamp(len.min(1), len)
+/// Old sublist length for a list of `len` pages: 3/8 (or `pct`%) rounded, and
+/// at least one page (when there is one) so a new page always has an old head
+/// to enter at.
+fn old_len(len: usize, pct: Option<u8>) -> usize {
+    let old = match pct {
+        None => (len * 3 + 4) / 8,
+        Some(pct) => (len * pct as usize + 50) / 100,
+    };
+    old.clamp(len.min(1), len)
 }
 
 impl InnoDb {
     pub fn new(frames: usize) -> Self {
+        Self::with(frames, InnoDbSettings::DEFAULT)
+    }
+
+    pub fn with(frames: usize, settings: InnoDbSettings) -> Self {
+        assert!(
+            settings
+                .old_pct
+                .is_none_or(|p| InnoDbSettings::OLD_PCT.contains(&p)),
+            "old sublist share out of range"
+        );
         Self {
+            settings,
             list: FrameList::new(frames),
             old_head: None,
             old_count: 0,
@@ -108,7 +129,7 @@ impl InnoDb {
     /// Put the boundary at the 3/8 mark and note frames it passed (other
     /// than `moved`, whose own note already says where it went).
     fn relabel(&mut self, moved: FrameIdx, log: &mut Log) {
-        self.set_old_count(old_len(self.list.len()));
+        self.set_old_count(old_len(self.list.len(), self.settings.old_pct));
         self.region[moved] = self.side(moved);
         let mut crossed = std::mem::take(&mut self.crossed);
         for &frame in &crossed {
@@ -135,7 +156,9 @@ impl Policy for InnoDb {
                 self.loaded_in[frame] = Some(ctx.query);
                 log.push(Note::FirstUse { frame });
             }
-            (Region::Old, Some(q)) if q != ctx.query => {
+            (Region::Old, Some(q))
+                if q != ctx.query || self.settings.promote == Promote::AnyReuse =>
+            {
                 self.move_to_head(frame);
                 log.push(Note::Promoted { frame });
             }
@@ -146,7 +169,7 @@ impl Policy for InnoDb {
 
     fn on_load(&mut self, frame: FrameIdx, ctx: Ctx, log: &mut Log) {
         // Enter as the head of old: old_len of the longer list, counting itself.
-        self.set_old_count(old_len(self.list.len() + 1) - 1);
+        self.set_old_count(old_len(self.list.len() + 1, self.settings.old_pct) - 1);
         match self.old_head {
             Some(head) => self.list.insert_before(frame, head),
             None => self.list.push_back(frame),
@@ -198,7 +221,11 @@ mod tests {
     }
 
     fn filled(frames: usize) -> InnoDb {
-        let mut p = InnoDb::new(frames);
+        filled_with(frames, InnoDbSettings::DEFAULT)
+    }
+
+    fn filled_with(frames: usize, settings: InnoDbSettings) -> InnoDb {
+        let mut p = InnoDb::with(frames, settings);
         for f in 0..frames {
             p.on_load(f, at(f, 0), &mut log());
         }
@@ -209,7 +236,7 @@ mod tests {
     fn new_pages_enter_at_the_head_of_old() {
         let mut p = filled(8);
         // 3 of 8 frames are old; frame 7 was loaded last, so it heads old.
-        assert_eq!(old_len(8), 3);
+        assert_eq!(old_len(8, None), 3);
         assert_eq!(
             p.state(7),
             FrameState::InnoDb {
@@ -258,6 +285,65 @@ mod tests {
                 rank: 7
             }
         );
+    }
+
+    #[test]
+    fn with_promote_any_a_re_use_in_the_same_query_promotes() {
+        let settings = InnoDbSettings {
+            promote: Promote::AnyReuse,
+            ..InnoDbSettings::DEFAULT
+        };
+        let mut p = filled_with(8, settings);
+        let old = order(&p)[7];
+        let mut l = log();
+        p.on_hit(old, at(8, 0), &mut l);
+        assert_eq!(l.take()[0], Note::Promoted { frame: old });
+        assert_eq!(
+            p.state(old),
+            FrameState::InnoDb {
+                region: Region::Young,
+                rank: 7
+            }
+        );
+    }
+
+    #[test]
+    fn with_promote_any_a_page_read_ahead_still_needs_a_second_use() {
+        let settings = InnoDbSettings {
+            promote: Promote::AnyReuse,
+            ..InnoDbSettings::DEFAULT
+        };
+        let mut p = InnoDb::with(8, settings);
+        let mut l = log();
+        for f in 0..7 {
+            p.on_load(f, at(f, 0), &mut l);
+        }
+        p.on_read_ahead(7, at(7, 0), &mut l);
+        l.take();
+        p.on_hit(7, at(8, 0), &mut l);
+        assert_eq!(l.take(), [Note::FirstUse { frame: 7 }]);
+        p.on_hit(7, at(9, 0), &mut l);
+        assert_eq!(l.take()[0], Note::Promoted { frame: 7 });
+    }
+
+    #[test]
+    fn the_old_share_follows_its_setting() {
+        assert_eq!(old_len(100, None), 38, "3/8 rounded");
+        assert_eq!(old_len(100, Some(37)), 37);
+        assert_eq!(old_len(100, Some(5)), 5);
+        assert_eq!(old_len(100, Some(95)), 95);
+        assert_eq!(old_len(10, Some(5)), 1, "at least one old page");
+        assert_eq!(old_len(10, Some(95)), 10, "rounded, never past the list");
+        assert_eq!(old_len(0, Some(50)), 0);
+        for pct in [5, 20, 50, 95] {
+            let settings = InnoDbSettings {
+                old_pct: Some(pct),
+                ..InnoDbSettings::DEFAULT
+            };
+            let p = filled_with(40, settings);
+            let old = (0..40).filter(|&f| p.region[f] == Region::Old).count();
+            assert_eq!(old, old_len(40, Some(pct)), "old {pct}%");
+        }
     }
 
     #[test]

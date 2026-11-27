@@ -14,8 +14,11 @@
 //!
 //! Miniature: the ring is a quarter of the pool (PostgreSQL: 32 frames, at most
 //! an eighth of shared_buffers) and lasts for one query.
+//!
+//! Setting `ring=off` turns the ring off, so a big scan sweeps and counts like
+//! any other access. PostgreSQL has no such switch; it shows what the ring does.
 
-use super::{Ctx, FrameState, Log, Note, Policy, Why};
+use super::{Ctx, FrameState, Log, Note, PgSettings, Policy, Why};
 use crate::FrameIdx;
 
 const MAX_USAGE: u8 = 5;
@@ -28,12 +31,18 @@ pub struct Pg {
     /// Slot the scan used last.
     cursor: usize,
     ring_query: Option<usize>,
+    settings: PgSettings,
 }
 
 impl Pg {
     pub fn new(frames: usize) -> Self {
+        Self::with(frames, PgSettings::DEFAULT)
+    }
+
+    pub fn with(frames: usize, settings: PgSettings) -> Self {
         let ring_len = (frames / 4).max(1);
         Self {
+            settings,
             usage: vec![0; frames],
             hand: 0,
             ring: vec![None; ring_len],
@@ -50,11 +59,17 @@ impl Pg {
             self.cursor = self.ring.len() - 1;
             self.ring_query = None;
         }
-        let big_scan = matches!(ctx.scan, Some(pages) if pages as usize > self.usage.len() / 4);
+        let big_scan = self.big_scan(ctx);
         if big_scan {
             self.ring_query = Some(ctx.query);
         }
         big_scan
+    }
+
+    /// A scan of more than a quarter of the pool, with the ring on.
+    fn big_scan(&self, ctx: Ctx) -> bool {
+        self.settings.ring
+            && matches!(ctx.scan, Some(pages) if pages as usize > self.usage.len() / 4)
     }
 
     fn next_slot(&self) -> usize {
@@ -134,8 +149,7 @@ impl Policy for Pg {
     /// A big scan's request must fit its ring with a slot to spare, or the
     /// last page read ahead would recycle the slot of the page asked for.
     fn read_ahead_cap(&self, ctx: Ctx, cap: usize) -> usize {
-        let big_scan = matches!(ctx.scan, Some(pages) if pages as usize > self.usage.len() / 4);
-        if big_scan {
+        if self.big_scan(ctx) {
             cap.min(self.ring.len().saturating_sub(1))
         } else {
             cap
@@ -253,6 +267,43 @@ mod tests {
                 in_ring: false
             }
         );
+    }
+
+    #[test]
+    fn with_the_ring_off_a_big_scan_sweeps_and_counts_like_any_access() {
+        let mut p = Pg::with(8, PgSettings { ring: false });
+        let mut l = log();
+        for f in 0..8 {
+            p.on_load(f, at(f, 0), &mut l);
+            p.on_hit(f, at(f, 0), &mut l);
+        }
+        let mut victims = Vec::new();
+        for pos in 8..14 {
+            let f = p.victim(scan(pos, 1, 100), None, &mut l);
+            p.on_load(f, scan(pos, 1, 100), &mut l);
+            victims.push(f);
+        }
+        // The sweep walks the whole pool instead of recycling two frames.
+        assert_eq!(victims, [0, 1, 2, 3, 4, 5]);
+        let notes = l.take();
+        assert!(!notes.iter().any(|n| matches!(n, Note::JoinedRing { .. })));
+        assert!(!notes.iter().any(|n| matches!(
+            n,
+            Note::Evict {
+                why: Why::RingReuse { .. },
+                ..
+            }
+        )));
+        // A scan's hit raises the count as any hit does.
+        p.on_hit(0, scan(14, 1, 100), &mut l);
+        assert_eq!(
+            p.state(0),
+            FrameState::Pg {
+                usage: 2,
+                in_ring: false
+            }
+        );
+        assert_eq!(p.read_ahead_cap(scan(15, 1, 100), 8), 8, "no ring to fit");
     }
 
     #[test]

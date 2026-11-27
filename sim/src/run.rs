@@ -23,7 +23,8 @@ use crate::storage::{Profile, StorageKind};
 use crate::summary::RunSummary;
 
 pub const FORMAT: &str = "bpsim-run";
-pub const VERSION: u32 = 5;
+/// 6: a policy is named by its id, which may carry settings (`innodb:old=20`).
+pub const VERSION: u32 = 6;
 
 #[derive(Serialize)]
 pub struct RunFile<'a> {
@@ -57,7 +58,7 @@ pub struct QueryView<'a> {
 
 #[derive(Serialize)]
 pub struct PolicyRun<'a> {
-    pub policy: &'static str,
+    pub policy: String,
     pub summary: RunSummary,
     pub events: &'a [Event],
 }
@@ -81,7 +82,7 @@ impl<'a> RunFile<'a> {
                     "events recorded"
                 );
                 PolicyRun {
-                    policy: sim.policy_kind().name(),
+                    policy: sim.policy_kind().id(),
                     summary,
                     events: sim.events(),
                 }

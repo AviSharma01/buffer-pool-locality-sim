@@ -26,9 +26,14 @@ Rules, in brief:
 - While a request reads ahead, the page it was made for is pinned: no policy
   evicts it (Clock and the PostgreSQL sweep pass over it untouched). LRU then
   counts that page as used, so the pages read ahead with it are older; FIFO
-  keeps arrival order. A frame sits in PostgreSQL's ring at most once (3.5b).
+  keeps arrival order. A frame sits in PostgreSQL's ring at most once.
 - Scans come from the trace's `scans` list, which the capture works out from
   SQLite's bytecode; the plan text is not read.
+- Settings, as `name:key=value`: `pg:ring=off` gives PostgreSQL-style no ring
+  (a big scan sweeps and counts like any access, and its read-ahead is not
+  capped); `innodb:old=N` makes the old part N% of the list, rounded, at least
+  one page; `innodb:promote=any` promotes an old page on any use after its
+  first, in the same query or not.
 """
 
 from __future__ import annotations
@@ -168,7 +173,10 @@ class PG:
     """Usage 1 on load, +1 per hit up to 5; clock sweep; a scan bigger than a
     quarter of the pool cycles through a ring of max(1, n // 4) frames."""
 
-    def __init__(s, n):
+    def __init__(s, n, ring="on"):
+        if ring not in ("on", "off"):
+            raise ValueError(f"pg ring must be on or off, got {ring!r}")
+        s.ring_on = ring == "on"
         s.n = n
         s.slots = [None] * n
         s.u = {}
@@ -184,8 +192,11 @@ class PG:
     def triggers(s, scan, cont):
         return scan is not None
 
+    def big(s, scan):
+        return s.ring_on and scan is not None and scan > s.n // 4
+
     def cap(s, scan, k):
-        return min(k, s.ringlen - 1) if (scan is not None and scan > s.n // 4) else k
+        return min(k, s.ringlen - 1) if s.big(scan) else k
 
     def _ring(s, q, scan):
         if s.rq is not None and s.rq != q:
@@ -194,7 +205,7 @@ class PG:
             s.rq = None
         if not s.ring:
             s.ring = [None] * s.ringlen
-        big = scan is not None and scan > s.n // 4
+        big = s.big(scan)
         if big:
             s.rq = q
         return big
@@ -241,15 +252,23 @@ class PG:
 
 class InnoDB:
     """One list, head to tail; new pages enter at the head of the old part
-    (about 3/8 of the list); a hit in a later query promotes an old page.
+    (about 3/8 of the list, or old=N%); a hit in a later query (or, with
+    promote=any, any hit after the first use) promotes an old page.
     A page read ahead counts as not used until its first hit."""
 
-    def __init__(s, n):
+    def __init__(s, n, old=None, promote="later"):
+        if old is not None and not (str(old).isdigit() and 5 <= int(old) <= 95):
+            raise ValueError(f"innodb old must be 5 to 95, got {old!r}")
+        if promote not in ("later", "any"):
+            raise ValueError(f"innodb promote must be later or any, got {promote!r}")
+        s.pct = None if old is None else int(old)
+        s.any = promote == "any"
         s.l = []
         s.lq = {}
 
     def oldlen(s, L):
-        return min(L, max(min(L, 1), (L * 3 + 4) // 8))
+        n = (L * 3 + 4) // 8 if s.pct is None else (L * s.pct + 50) // 100
+        return min(L, max(min(L, 1), n))
 
     def triggers(s, scan, cont):
         return cont
@@ -268,7 +287,7 @@ class InnoDB:
         if i >= boundary and s.lq[p] is None:
             s.lq[p] = q
             return
-        if i < boundary or q != s.lq[p]:
+        if i < boundary or q != s.lq[p] or s.any:
             s.l.remove(p)
             s.l.insert(0, p)
 
@@ -308,6 +327,22 @@ class OPT:
 POLICIES = {"lru": LRU, "fifo": FIFO, "clock": Clock, "pg": PG, "innodb": InnoDB}
 
 
+def make(policy: str, frames: int, nxt: list) -> object:
+    """A policy from its id, `name` or `name:key=value:...`."""
+    name, *settings = policy.split(":")
+    kwargs = {}
+    for setting in settings:
+        key, eq, value = setting.partition("=")
+        if not eq or key in kwargs:
+            raise ValueError(f"bad or repeated setting {setting!r} in {policy!r}")
+        kwargs[key] = value
+    if name == "opt" and not kwargs:
+        return OPT(frames, nxt)
+    if name not in POLICIES or (kwargs and name not in ("pg", "innodb")):
+        raise ValueError(f"unknown policy {policy!r}")
+    return POLICIES[name](frames, **kwargs)
+
+
 def read_ahead_cap(setting: str, frames: int) -> int:
     """auto: min(8, frames // 4); off: 0; a number N: min(N, frames // 4)."""
     if setting == "off":
@@ -328,7 +363,7 @@ def run(
         p = flat[i][1][0]
         nxt[i] = seen.get(p, float("inf"))
         seen[p] = i
-    P = POLICIES[policy](frames) if policy in POLICIES else OPT(frames, nxt)
+    P = make(policy, frames, nxt)
     K = read_ahead_cap(read_ahead, frames)
     res: dict[int, int] = {}
     dirty: dict[int, bool] = {}

@@ -351,7 +351,7 @@ impl Simulator {
         let queries = self.tick();
         let total_ms = m.total_ms(self.cfg.storage);
         RunSummary {
-            policy: self.cfg.policy.name().to_string(),
+            policy: self.cfg.policy.id(),
             frames: self.cfg.frames,
             storage: self.cfg.storage,
             queries,
@@ -637,7 +637,16 @@ mod tests {
     #[test]
     fn pool_stays_consistent_for_every_policy() {
         let w = Workload::builtin_default();
-        for kind in PolicyKind::ALL {
+        let settings = [
+            "pg:ring=off",
+            "innodb:old=5",
+            "innodb:old=95",
+            "innodb:promote=any",
+        ];
+        let kinds = PolicyKind::ALL
+            .into_iter()
+            .chain(settings.map(|s| s.parse().unwrap()));
+        for kind in kinds {
             for frames in [1, 7, 64] {
                 let cfg = SimConfig {
                     frames,

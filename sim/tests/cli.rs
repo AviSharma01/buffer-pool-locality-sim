@@ -35,6 +35,10 @@ fn rejects_inputs_that_used_to_panic() {
     assert_rejected(&["--policy", "random"], "unknown policy");
     assert_rejected(&["--policy", "lru,random"], "unknown policy");
     assert_rejected(&["--policy", "lru,LRU"], "listed twice");
+    assert_rejected(&["--policy", "pg,pg:ring=on"], "listed twice");
+    assert_rejected(&["--policy", "innodb:old=99"], "from 5 to 95");
+    assert_rejected(&["--policy", "lru:ring=off"], "lru has no settings");
+    assert_rejected(&["--policy", "innodb:old=../x"], "whole percentage");
     // Flags retired with reclustering and the old visualiser are rejected,
     // not silently ignored.
     for gone in [
@@ -192,7 +196,7 @@ fn comparing_policies_writes_one_run_file_that_adds_up() {
     let run_file = read_json(&run.join("run.json"));
     assert_eq!(
         (&run_file["format"], &run_file["version"]),
-        (&Value::from("bpsim-run"), &Value::from(5))
+        (&Value::from("bpsim-run"), &Value::from(6))
     );
     assert_eq!(run_file["storage"], "ssd");
     assert_eq!(run_file["frames"], 8);
@@ -639,6 +643,102 @@ fn a_sweep_point_matches_the_single_runs_it_stands_for() {
     assert!(
         fresh_seen > 0,
         "the trace must have pages written without a read"
+    );
+}
+
+#[test]
+fn policies_with_settings_run_side_by_side_under_their_ids() {
+    let dir = out_dir("settings");
+    let trace = shop_trace();
+    let policies = "innodb,innodb:old=20,innodb:promote=any,pg:ring=off";
+    let args = [
+        "--trace",
+        &trace,
+        "--policy",
+        policies,
+        "--frames",
+        "8",
+        "--read-ahead",
+        "off",
+    ];
+    let out = sim(&[&args[..], &["--out", dir.to_str().unwrap()]].concat());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = only_run(&dir.join("shop/compare"));
+    for folder in [
+        "innodb",
+        "innodb-old-20",
+        "innodb-promote-any",
+        "pg-ring-off",
+    ] {
+        assert!(run.join(folder).join("summary.json").is_file(), "{folder}");
+    }
+    let run_file = read_json(&run.join("run.json"));
+    let ids: Vec<_> = run_file["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["policy"].clone(), r["summary"]["policy"].clone()))
+        .collect();
+    let expect = [
+        "innodb",
+        "innodb:old=20",
+        "innodb:promote=any",
+        "pg:ring=off",
+    ];
+    assert_eq!(ids, expect.map(|p| (Value::from(p), Value::from(p))));
+    // The old share changes what is cached; the plain policy is unchanged.
+    let runs = run_file["runs"].as_array().unwrap();
+    assert_eq!(
+        runs[0]["summary"]["hits"],
+        Value::from(20),
+        "the design number"
+    );
+    assert_ne!(runs[0]["summary"]["hits"], runs[1]["summary"]["hits"]);
+
+    let one = out_dir("settings_one");
+    let args = [
+        "--trace",
+        &trace,
+        "--policy",
+        "innodb:old=20",
+        "--frames",
+        "8",
+    ];
+    let out = sim(&[&args[..], &["--out", one.to_str().unwrap()]].concat());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    only_run(&one.join("shop/innodb-old-20"));
+
+    let sw = out_dir("settings_sweep");
+    let args = [
+        "--trace",
+        &trace,
+        "--policy",
+        "lru,pg:ring=off",
+        "--frames",
+        "8,16",
+    ];
+    let out = sim(&[&args[..], &["--out", sw.to_str().unwrap()]].concat());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sweep = read_json(&written_to(&out).join("sweep.json"));
+    assert_eq!(sweep["policies"], serde_json::json!(["lru", "pg:ring=off"]));
+    assert!(
+        sweep["points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["policy"] == "pg:ring=off")
     );
 }
 

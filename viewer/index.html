@@ -451,7 +451,7 @@ body.dragging #drop,body.dragging .app{outline:2px dashed var(--muted);outline-o
 "use strict";
 /* ---------- format, names and small helpers ---------- */
 const FORMAT = "bpsim-run",
-  VERSION = 5;
+  VERSION = 6;
 const INFO = {
   fifo: {name: "FIFO", how: "oldest load out", textbook: true},
   lru: {name: "LRU", how: "least recent out"},
@@ -468,7 +468,27 @@ const el = (tag, cls, text) => {
   return e;
 };
 const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
-const nameOf = p => (p === "opt" && state.readsAhead ? "Optimal (no read-ahead)" : INFO[p]?.name || p);
+/* A run's policy is an id: a name, then any settings, as in "innodb:old=20:promote=any". */
+const kindOf = p => p.split(":")[0];
+const settingsOf = p => Object.fromEntries(p.split(":").slice(1).map(s => s.split("=")));
+const SETTING = {
+  old: v => `old ${v}%`,
+  promote: v => (v === "any" ? "promoted on any re-use" : "promoted in a later query"),
+  ring: v => (v === "off" ? "no scan ring" : "scan ring")
+};
+const settingsText = p =>
+  Object.entries(settingsOf(p))
+    .map(([k, v]) => (SETTING[k] ? SETTING[k](v) : `${k} ${v}`))
+    .join(", ");
+const infoOf = p => INFO[kindOf(p)];
+const howOf = p =>
+  kindOf(p) === "pg" && settingsOf(p).ring === "off" ? "usage counts" : infoOf(p)?.how || "";
+function nameOf(p) {
+  const base = p === "opt" && state.readsAhead ? "Optimal (no read-ahead)" : infoOf(p)?.name || p;
+  const set = settingsText(p);
+  return set ? `${base}, ${set}` : base;
+}
+const runsOf = kind => state.data.runs.filter(r => kindOf(r.policy) === kind);
 /* ---------- pricing: what one access costs on a given drive ---------- */
 /* Time for one access under a storage profile, from what the engine recorded.
    A read request costs a fixed part plus one page. Where the page sits
@@ -580,7 +600,7 @@ function start(data) {
   setStorage(state.data.storage, false);
 
   const shown = comparePools();
-  view.focus = ["pg", "innodb"].find(p => shown.includes(p)) || shown[0];
+  view.focus = ["pg", "innodb"].map(k => shown.find(p => kindOf(p) === k)).find(Boolean) || shown[0];
   view.drawn = new Set();
   view.mode = "step";
   view.at = -1;
@@ -819,9 +839,9 @@ function buildHelp() {
       'When a miss continues a table or index (its previous access was the page before), the pool also reads the next few pages of that table in the same request, up to a quarter of the pool. PostgreSQL-style reads ahead for scans instead, and only as far as its scan ring allows. Read-ahead pages enter cold: Clock leaves their bit clear, InnoDB-style puts them at the head of old and starts their clock at first use. Hits on them show as "read ahead". Requests count how often a query waited on the disk. Optimal never reads ahead, so others can beat its misses.'
     );
   const mini = [];
-  if (state.byPolicy.pg)
+  if (runsOf("pg").some(r => settingsOf(r.policy).ring !== "off"))
     mini.push("the PostgreSQL-style scan ring is a quarter of the pool (real: 32 pages)");
-  if (state.byPolicy.innodb)
+  if (runsOf("innodb").some(r => settingsOf(r.policy).promote !== "any"))
     mini.push("InnoDB-style promotes a page on a hit in a later query (real: after 1 second)");
   help.append(
     el(
@@ -841,7 +861,7 @@ function buildHelp() {
 const allPools = () => state.data.runs.map(r => r.policy);
 /* the pool opened first: a real-world one, unless only textbook ones ran */
 const comparePools = () => {
-  const real = allPools().filter(p => !INFO[p]?.textbook);
+  const real = allPools().filter(p => !infoOf(p)?.textbook);
   return real.length ? real : allPools();
 };
 function buildScore() {
@@ -883,7 +903,7 @@ function paintScore(at) {
         : "Draw beside the open pool";
     b.querySelector(".h").textContent = at < 0 ? "–" : t.hits;
     b.querySelector(".d").textContent =
-      at < 0 ? INFO[p]?.how || "" : `${fmtMs(t.cost)} · ${t.req} request${t.req === 1 ? "" : "s"}`;
+      at < 0 ? howOf(p) : `${fmtMs(t.cost)} · ${t.req} request${t.req === 1 ? "" : "s"}`;
     b.querySelector(".sopen").title =
       at < 0
         ? ""
@@ -910,7 +930,7 @@ function buildLanes() {
     lane.setAttribute("aria-label", nameOf(p));
     const pn = el("button", "pname");
     pn.type = "button";
-    pn.append(el("span", "", nameOf(p)), el("small", "", INFO[p]?.how || ""));
+    pn.append(el("span", "", nameOf(p)), el("small", "", howOf(p)));
     pn.addEventListener("click", () => setFocus(p));
     const fig = el("div", "fig"),
       sayEl = el("div", "say");
@@ -1251,14 +1271,19 @@ function describe(p, e) {
     else if (n.kind === "joined_ring") parts.push("frame joins the scan's ring");
     else if (n.kind === "ring_busy") parts.push(`ring frame is hot (usage ${n.usage}), sweeps instead`);
     else if (n.kind === "inserted") parts.push("enters at the midpoint (old)");
-    else if (n.kind === "promoted") parts.push("seen again in a later query: promoted to young");
+    else if (n.kind === "promoted")
+      parts.push(
+        settingsOf(p).promote === "any"
+          ? "seen again: promoted to young"
+          : "seen again in a later query: promoted to young"
+      );
     else if (n.kind === "stays_old") parts.push("seen again in the same query: stays old");
     else if (n.kind === "first_use")
       parts.push("first use of a page read ahead: stays old, its clock starts now");
   }
   if (e.kind === "hit" && p === "lru") parts.push("now most recent");
-  if (e.kind === "hit" && p === "innodb" && !e.notes.length) parts.push("moves to the head");
-  if (e.kind === "hit" && p === "pg" && e.scan && !e.notes.length)
+  if (e.kind === "hit" && kindOf(p) === "innodb" && !e.notes.length) parts.push("moves to the head");
+  if (e.kind === "hit" && kindOf(p) === "pg" && e.scan && !e.notes.length && settingsOf(p).ring !== "off")
     parts.push("a scan's hit leaves usage as is");
   if (e.kind === "hit" && !parts.length) parts.push("already in memory");
   if (e.kind === "miss" && !ev) parts.push("into an empty frame");
@@ -1358,7 +1383,13 @@ function drawFocus(p, e, at, touched) {
     );
     out.append(
       s,
-      el("div", "hint", "New pages enter at the bar. Only a hit in a later query moves one into young.")
+      el(
+        "div",
+        "hint",
+        settingsOf(p).promote === "any"
+          ? "New pages enter at the bar. Any use after the first moves one into young."
+          : "New pages enter at the bar. Only a hit in a later query moves one into young."
+      )
     );
   } else if (ringOk) {
     const r = Math.max(58, (state.frames * 44 * 1.2) / (2 * Math.PI)),
@@ -1401,7 +1432,7 @@ function drawFocus(p, e, at, touched) {
       const rg = el("span");
       rg.style.cssText =
         "width:14px;height:14px;border-radius:4px;box-shadow:inset 0 0 0 1.5px var(--accent)";
-      key(rg, "Scan ring: the only frames a big scan may recycle.");
+      if (settingsOf(p).ring !== "off") key(rg, "Scan ring: the only frames a big scan may recycle.");
     } else key(el("span", "", "●"), "Reference bit: set on every use, buys one more lap.");
     const s = el("div", "shape");
     s.append(ring, keys);
@@ -2076,7 +2107,7 @@ function renderWalk() {
     e = run.events[i],
     q = EXAMPLE.queries[e.query];
   $("walkSub").textContent =
-    `A tiny database replayed by this engine: ${EX.frames} frames, ${nameOf(p)} (${INFO[p]?.how}), read-ahead on.`;
+    `A tiny database replayed by this engine: ${EX.frames} frames, ${nameOf(p)} (${howOf(p)}), read-ahead on.`;
   $("walkQ").textContent = `${e.query + 1}. ${q.title}`;
   $("walkSql").textContent = q.sql;
   borrow({...EX, lanes: {[p]: {fig: $("walkFig")}}, profile: state.profile}, () => {

@@ -39,7 +39,7 @@ pub fn default_sizes(pages: usize) -> Vec<usize> {
 /// One policy at one pool size.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Point {
-    pub policy: &'static str,
+    pub policy: String,
     pub frames: usize,
     /// With read-ahead off.
     pub hits: u64,
@@ -77,7 +77,7 @@ pub struct SweepFile<'a> {
     pub read_ahead: ReadAhead,
     /// The command that made the sweep, to make it again.
     pub command: String,
-    pub policies: Vec<&'static str>,
+    pub policies: Vec<String>,
     pub sizes: Vec<usize>,
     /// Every policy at every size, policy by policy.
     pub points: Vec<Point>,
@@ -85,8 +85,9 @@ pub struct SweepFile<'a> {
 }
 
 pub const FORMAT: &str = "bpsim-sweep";
-/// 2: points carry `lru_frames`.
-pub const VERSION: u32 = 2;
+/// 2: points carry `lru_frames`. 3: a policy is named by its id, which may
+/// carry settings (`innodb:old=20`).
+pub const VERSION: u32 = 3;
 
 /// Replay `trace` with `policy` in a pool of `frames`, twice: read-ahead off
 /// for disk reads, `read_ahead` for time. `lru` is the trace's LRU curve.
@@ -115,7 +116,7 @@ pub fn point(
     let queries = timed.tick().max(1) as f64;
     let disk_reads = m.misses - m.fresh_pages;
     Point {
-        policy: policy.name(),
+        policy: policy.id(),
         frames,
         hits: m.hits,
         misses: m.misses,

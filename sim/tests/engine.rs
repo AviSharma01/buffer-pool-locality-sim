@@ -1,7 +1,19 @@
 //! Behavioural tests for the engine: regression against v0.1 and policy
 //! guarantees from the literature.
 
-use bpsim::{PolicyKind, SimConfig, Simulator, StorageKind, Workload};
+use bpsim::{InnoDbSettings, PgSettings, PolicyKind, SimConfig, Simulator, StorageKind, Workload};
+
+/// Every policy, and each setting that changes how one works.
+fn every_kind() -> Vec<PolicyKind> {
+    let settings = [
+        "pg:ring=off",
+        "innodb:old=5",
+        "innodb:old=95",
+        "innodb:promote=any",
+    ];
+    let with = settings.map(|s| s.parse::<PolicyKind>().unwrap());
+    PolicyKind::ALL.into_iter().chain(with).collect()
+}
 
 fn workload(file: &str) -> Workload {
     let path = format!("{}/workloads/{file}", env!("CARGO_MANIFEST_DIR"));
@@ -41,7 +53,7 @@ fn reproduces_v0_1_seed_42() {
 #[test]
 fn same_seed_is_deterministic() {
     let w = workload("scan.toml");
-    for kind in PolicyKind::ALL {
+    for kind in every_kind() {
         let a = Simulator::run(&w, 7, 800, cfg(kind, 32));
         let b = Simulator::run(&w, 7, 800, cfg(kind, 32));
         assert_eq!(a.summary(), b.summary(), "{kind}");
@@ -77,7 +89,7 @@ fn opt_is_a_lower_bound() {
         for seed in 1..=seeds(4) {
             for frames in [8, 64, 200] {
                 let best = misses(&w, seed, 2500, PolicyKind::Opt, frames);
-                for kind in PolicyKind::ALL {
+                for kind in every_kind() {
                     let m = misses(&w, seed, 2500, kind, frames);
                     assert!(
                         best <= m,
@@ -124,7 +136,10 @@ fn real_world_policies_resist_scans() {
     let w = workload("scan.toml");
     for seed in 1..=4 {
         let lru = misses(&w, seed, 5000, PolicyKind::Lru, 64);
-        for kind in [PolicyKind::Pg, PolicyKind::InnoDb] {
+        for kind in [
+            PolicyKind::Pg(PgSettings::DEFAULT),
+            PolicyKind::InnoDb(InnoDbSettings::DEFAULT),
+        ] {
             let m = misses(&w, seed, 5000, kind, 64);
             assert!(
                 (m as f64) < 0.85 * lru as f64,
@@ -155,7 +170,7 @@ fn shipped_workloads_are_valid() {
 fn storage_never_changes_cache_behaviour() {
     for file in ["default.toml", "scan.toml"] {
         let w = workload(file);
-        for kind in PolicyKind::ALL {
+        for kind in every_kind() {
             let [ssd, hdd] = StorageKind::ALL.map(|storage| {
                 let c = SimConfig {
                     storage,
@@ -315,7 +330,7 @@ fn guarantees_hold_on_random_traces() {
                 reference_misses(&order, frames),
                 "seed {seed}, {frames} frames"
             );
-            for kind in PolicyKind::ALL {
+            for kind in every_kind() {
                 let what = format!("seed {seed}, {kind}, {frames} frames");
                 let [ssd, hdd] = StorageKind::ALL.map(|s| replay(&trace, kind, frames, s));
                 assert_eq!(
@@ -395,7 +410,7 @@ fn guarantees_hold_with_read_ahead_on_random_traces() {
             .filter(|&f| f <= pages as usize + 4)
         {
             for read_ahead in [ReadAhead::Auto, ReadAhead::Pages(1), ReadAhead::Pages(3)] {
-                for kind in PolicyKind::ALL {
+                for kind in every_kind() {
                     let what = format!("seed {seed}, {kind}, {frames} frames, {read_ahead:?}");
                     let run = |storage, read_ahead| {
                         let cfg = SimConfig {

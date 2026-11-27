@@ -17,9 +17,14 @@ from findings import Measured, Point  # noqa: E402
 LABELS = [label for label, _, _ in findings.VARIANTS]
 
 
-def run(lru: int, innodb: int, pg: int, opt: int) -> Measured:
+def run(lru: int, innodb: int, pg: int, opt: int, changed: dict | None = None) -> Measured:
+    """Reads at every pool. Changed policies default to what the claims say:
+    promote=any reads as InnoDB-style, old=95 and ring=off as LRU."""
     pools = {"1/8": 100, "1/4": 200, "1/2": 400}
     reads = {"lru": lru, "innodb": innodb, "pg": pg, "opt": opt}
+    reads |= {"innodb:promote=any": innodb, "pg:ring=off": lru}
+    reads |= {f"innodb:old={p}": lru if p == 95 else innodb for p in findings.OLD_SHARES}
+    reads |= changed or {}
     points = {(pool, p): Point(r, 300) for pool in pools for p, r in reads.items()}
     return Measured(800, pools, points)
 
@@ -31,21 +36,24 @@ def good() -> tuple[dict, dict]:
         m["oltp", label] = run(1000, 920, 990, 600)
         m["ranges", label] = run(1000, 910, 980, 600)
     uses = {
-        t: {
+        (t, label): {
             "lru": {"1": 10, "2–9": 500, "10–99": 300, "100+": 5},
             "innodb": {"1": 10, "2–9": 510, "10–99": 150, "100+": 5},
         }
         for t in ("oltp", "ranges")
+        for label in LABELS
     }
     return m, uses
 
 
 def test_good_numbers_pass() -> None:
     m, uses = good()
-    texts, failed = findings.claims(m, uses)
+    texts, failed = findings.claims(m, uses, 45)
     assert failed == []
     assert "22–24% fewer pages" in texts["summary"]
+    assert "within 0% of LRU), and InnoDB-style's" in texts["summary"]
     assert "22–24% fewer pages from disk than LRU" in texts["headline"]
+    assert "re-reads at most 45 pages" in texts["limit"]
 
 
 @pytest.mark.parametrize(
@@ -56,8 +64,29 @@ def test_good_numbers_pass() -> None:
         (lambda m, u: m.__setitem__(("ranges", "seed 23"), run(1000, 990, 980, 600)), "3%+ less"),
         # saves plenty, but on pages few queries use
         (
-            lambda m, u: u["oltp"]["innodb"].update({"2–9": 300, "10–99": 290}),
-            "pages 10+ queries use",
+            lambda m, u: u["oltp", "skew 1.3"]["innodb"].update({"2–9": 300, "10–99": 290}),
+            "pages 10+ queries use carry 40%+",
+        ),
+        # the ring is not what helps on reports
+        (
+            lambda m, u: m.__setitem__(
+                ("reports", "seed 23"), run(1000, 760, 780, 470, {"pg:ring=off": 850})
+            ),
+            "without its ring",
+        ),
+        # the later-query rule changes a read somewhere
+        (
+            lambda m, u: m.__setitem__(
+                ("ranges", "skew 0.9"), run(1000, 910, 980, 600, {"innodb:promote=any": 911})
+            ),
+            "any re-use reads exactly",
+        ),
+        # entering at the head still saves
+        (
+            lambda m, u: m.__setitem__(
+                ("oltp", "seed 11"), run(1000, 920, 990, 600, {"innodb:old=95": 970})
+            ),
+            "entering at the head",
         ),
         (lambda m, u: m.__setitem__(("oltp", "seed 7"), run(1000, 920, 990, 800)), "30%+"),
     ],
@@ -65,7 +94,7 @@ def test_good_numbers_pass() -> None:
 def test_numbers_that_contradict_a_claim_fail_it(change, claim: str) -> None:
     m, uses = good()
     change(m, uses)
-    _, failed = findings.claims(m, uses)
+    _, failed = findings.claims(m, uses, 45)
     assert any(claim in f for f in failed), failed
 
 
@@ -97,8 +126,10 @@ def test_a_reused_variant_must_be_the_one_it_should_be(tmp_path: Path, monkeypat
 
 
 def test_the_saving_share_says_all_rather_than_over_100_percent() -> None:
-    text = findings.warm_text({"oltp": 1.15, "ranges": 0.75})
-    assert "all of the saving on `oltp` and 75% of it on `ranges`." in text
-    assert "On `oltp`, InnoDB-style reads pages used fewer times" in text
-    assert "115%" not in text
-    assert " On " not in findings.warm_text({"oltp": 0.9, "ranges": 0.75})
+    text = findings.warm_text({("oltp", "seed 7"): 1.15, ("ranges", "skew 1.3"): 0.46})
+    assert text == (
+        "Pages used by 10 or more queries account for 46% to all of the saving, "
+        "the least on `ranges` at skew 1.3."
+    )
+    text = findings.warm_text({("oltp", "seed 7"): 0.9, ("ranges", "seed 7"): 0.75})
+    assert "75% to 90% of the saving, the least on `ranges` at seed 7" in text
