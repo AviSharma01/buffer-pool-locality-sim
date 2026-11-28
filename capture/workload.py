@@ -32,6 +32,10 @@ gives the same queries, byte for byte.
     uniform(a..b)          every value equally likely.
     choice(x, y, ...)      numbers or 'quoted strings', equally likely.
     seq(a..b)              a, a+1, ...: one per draw (new ids for inserts).
+    nurand(A, a..b)        TPC-C's non-uniform random NURand(A, a, b):
+                           ((rand(0..A) | rand(a..b)) + C) % (b-a+1) + a,
+                           with C drawn once from 0..A by the seed. TPC-C
+                           uses A = 1023 for customers and 8191 for items.
 """
 
 from __future__ import annotations
@@ -43,6 +47,7 @@ from dataclasses import dataclass, field
 
 MAX_QUERIES = 1_000_000
 MAX_VALUES = 5_000_000  # the most values a zipf, uniform or seq range may span
+MAX_NURAND_A = 65_535
 
 _HEADER = re.compile(r"^-- workload:\s*(\d+)\s+quer(?:y|ies)\s*,\s*seed\s+(\d+)\s*$")
 _PARAM = re.compile(r"^-- param\s+([a-z_][a-z0-9_]*)\s*=\s*([a-z]+)\((.*)\)\s*$")
@@ -67,6 +72,8 @@ class Param:
     s: float = 0.0
     recent: bool = False
     choices: list[str] = field(default_factory=list)  # SQL literals
+    a: int = 0  # nurand's A
+    _c: int | None = None  # nurand's C, fixed per seed
     _cdf: list[float] | None = None
     _order: list[int] | None = None
     _next: int = 0
@@ -77,6 +84,11 @@ class Param:
             return str(rng.randint(self.lo, self.hi))
         if self.kind == "choice":
             return rng.choice(self.choices)
+        if self.kind == "nurand":
+            if self._c is None:
+                self._c = random.Random(f"{seed}:{self.name}:nurand").randint(0, self.a)
+            mixed = rng.randint(0, self.a) | rng.randint(self.lo, self.hi)
+            return str((mixed + self._c) % (self.hi - self.lo + 1) + self.lo)
         if self.kind == "seq":
             value = self.lo + self._next
             if value > self.hi:
@@ -183,7 +195,16 @@ def _param(name: str, kind: str, args: str, where: str) -> Param:
         return Param(name, kind, lo, hi)
     if kind == "choice":
         return Param(name, kind, choices=_choices(args, where))
-    raise ValueError(f"{where}: unknown distribution {kind!r} (zipf, uniform, choice, seq)")
+    if kind == "nurand":
+        parts = [p.strip() for p in args.split(",")]
+        if len(parts) != 2 or not re.fullmatch(r"[0-9]+", parts[0]):
+            raise ValueError(f"{where}: nurand takes (A, a..b) with A a whole number")
+        a = int(parts[0])
+        if not 1 <= a <= MAX_NURAND_A:
+            raise ValueError(f"{where}: nurand's A must be from 1 to {MAX_NURAND_A:,}")
+        lo, hi = _range(parts[1], where)
+        return Param(name, kind, lo, hi, a=a)
+    raise ValueError(f"{where}: unknown distribution {kind!r} (zipf, uniform, choice, seq, nurand)")
 
 
 def parse(lines: list[tuple[int, str]], single_statement) -> Workload:

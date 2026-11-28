@@ -8,7 +8,7 @@ see how much memory each one needs for the same work.
 ## What it found
 
 <!-- findings:headline -->
-On `reports`, a workload with periodic full-table reports, InnoDB-style and PostgreSQL-style eviction read 16–30% fewer pages from disk than LRU with half the database in memory, and LRU needs 1.4–1.6× the memory to match. Without the reports, PostgreSQL-style is within 3% of LRU.
+With full-table scans in the mix (periodic reports, or decision-support queries shaped like TPC-H's), InnoDB-style and PostgreSQL-style eviction read 16–35% fewer pages from disk than LRU with half the database in memory, and LRU needs 1.4–1.6× the memory to match. Without full scans, including order processing shaped like TPC-C, PostgreSQL-style is within 3% of LRU.
 <!-- /findings:headline -->
 Two more findings and the full numbers: [FINDINGS.md](FINDINGS.md).
 

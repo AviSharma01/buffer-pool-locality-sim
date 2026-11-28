@@ -654,7 +654,8 @@ fn load_any(name: &str) -> CapturedTrace {
 fn the_lru_curve_matches_the_engine_on_every_shipped_trace() {
     use bpsim::lru_curve::LruCurve;
     let small = ["shop", "shop-vacuum", "checkout", "growth", "growth-vacuum"];
-    for name in small.into_iter().chain(["oltp", "reports", "ranges"]) {
+    let workloads = ["oltp", "reports", "ranges", "warehouse"];
+    for name in small.into_iter().chain(workloads) {
         let captured = load_any(name);
         let pages = captured.page_count as usize;
         let sizes: Vec<usize> = if small.contains(&name) {

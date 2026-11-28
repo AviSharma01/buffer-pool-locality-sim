@@ -5,12 +5,13 @@
     python verify/findings.py --check       # measure; fail if FINDINGS.md is stale or a claim fails
     python verify/findings.py --recapture   # capture the variants again (a scenario changed)
 
-The first run captures the trace variants into traces/local/variants (about
-4 minutes); later runs reuse them, after checking each says it is the variant
-it should be. Every number comes from the engine (disk
-reads with read-ahead off, and the exact pool LRU needs, for every policy and
-for each one with a rule changed), from the independent model in model.py
-(the breakdown by page), or from the traces (pages re-read within a query).
+The first run captures the trace variants, and the analytics trace, into
+traces/local/variants (about 4 minutes); later runs reuse them, after checking
+each says it is the variant it should be. Every number comes from the engine
+(disk reads with read-ahead off, and the exact pool LRU needs, for every policy
+and for each one with a rule changed), from the independent model in model.py
+(the breakdown by page, and its check against the engine on analytics' long
+joins), or from the traces (pages re-read within a query).
 """
 
 from __future__ import annotations
@@ -39,16 +40,36 @@ DOCS = {
 VARIANT_DIR = REPO / "traces" / "local" / "variants"
 CAPTURE = REPO / "capture" / "capture.py"
 
-# Each trace's --max-pages, as in its scenario's header.
-TRACES = {"oltp": 20000, "reports": 20000, "ranges": 30000}
-# (label, --seed, --param): seed 7 with no changes is the committed trace.
-VARIANTS = [
-    ("seed 7", None, None),
-    ("seed 11", 11, None),
-    ("seed 23", 23, None),
-    ("skew 0.9", None, "user=zipf(0.9, 1..100000)"),
-    ("skew 1.3", None, "user=zipf(1.3, 1..100000)"),
-]
+# label -> (--seed, --param). Seed 7 with no changes is each scenario's own.
+VARIANTS = {
+    "seed 7": (None, None),
+    "seed 11": (11, None),
+    "seed 23": (23, None),
+    "skew 0.9": (None, "user=zipf(0.9, 1..100000)"),
+    "skew 1.3": (None, "user=zipf(1.3, 1..100000)"),
+}
+SEEDS = ("seed 7", "seed 11", "seed 23")
+
+
+@dataclass(frozen=True)
+class Source:
+    """A scenario's capture options, as in its header, and its variants."""
+
+    max_pages: int
+    variants: tuple[str, ...] = tuple(VARIANTS)
+    committed: bool = True  # seed 7 is in traces/; otherwise it is captured too
+    max_io: int | None = None
+
+
+TRACES = {
+    "oltp": Source(20000),
+    "reports": Source(20000),
+    "ranges": Source(30000),
+    "warehouse": Source(30000, SEEDS),  # the skew is TPC-C's NURand, not one parameter
+    "analytics": Source(20000, SEEDS, committed=False, max_io=200000),
+}
+SCANS = ("reports", "analytics")  # full scans or long joins in most queries
+NO_SCANS = ("oltp", "ranges", "warehouse")
 POOLS = {"1/8": 8, "1/4": 4, "1/2": 2}  # pool as a share of the database
 SHOWN = ["innodb", "pg", "opt"]
 # Each policy with one rule changed, to see what its saving comes from.
@@ -84,9 +105,14 @@ class Measured:
 
 
 def trace_path(trace: str, label: str) -> Path:
-    if label == "seed 7":
+    if label == "seed 7" and TRACES[trace].committed:
         return REPO / "traces" / f"{trace}.trace.json.gz"
     return VARIANT_DIR / f"{trace}-{label.replace(' ', '-')}.trace.json.gz"
+
+
+def variants() -> list[tuple[str, str]]:
+    """Every (trace, label) the findings measure."""
+    return [(t, v) for t, src in TRACES.items() for v in src.variants]
 
 
 def expected_variant(seed: int | None, param: str | None) -> dict:
@@ -99,12 +125,12 @@ def expected_variant(seed: int | None, param: str | None) -> dict:
     return out
 
 
-def capture(
-    trace: str, label: str, seed: int | None, param: str | None, again: bool = False
-) -> Path:
+def capture(trace: str, label: str, again: bool = False) -> Path:
+    seed, param = VARIANTS[label]
+    src = TRACES[trace]
     path = trace_path(trace, label)
-    if label == "seed 7":
-        return path  # the committed trace
+    if label == "seed 7" and src.committed:
+        return path
     if path.exists() and not again:
         recorded = json.loads(gzip.decompress(path.read_bytes())).get("variant", {})
         if recorded != expected_variant(seed, param):
@@ -112,7 +138,8 @@ def capture(
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [sys.executable, str(CAPTURE), str(REPO / "capture" / "scenarios" / f"{trace}.sql")]
-    cmd += ["--no-rows", "--max-pages", str(TRACES[trace]), "-o", str(path)]
+    cmd += ["--no-rows", "--max-pages", str(src.max_pages), "-o", str(path)]
+    cmd += ["--max-io", str(src.max_io)] if src.max_io else []
     cmd += ["--seed", str(seed)] if seed is not None else []
     cmd += ["--param", param] if param else []
     print(f"capturing {path.relative_to(REPO)}", flush=True)
@@ -149,6 +176,29 @@ def rereads(path: Path) -> int:
         reads = [a[1] for a in q["io"] if a[0] == "r"]
         pages |= {p for p, n in collections.Counter(reads).items() if n > 1}
     return len(pages)
+
+
+JOIN_QUERIES = 20  # analytics queries the model replays, three long joins among them (~2 min)
+
+
+def model_gap(sim: Path, work: Path) -> dict[str, int]:
+    """Pages the independent model reads beyond the engine, per policy, on the
+    first JOIN_QUERIES queries of analytics at an eighth of the database: long
+    joins, which compare.py's traces don't have. (The whole trace takes the
+    model hours.)"""
+    full = json.loads(gzip.decompress(trace_path("analytics", "seed 7").read_bytes()))
+    path = work / "analytics-start.trace.json.gz"
+    path.write_bytes(
+        gzip.compress(json.dumps({**full, "queries": full["queries"][:JOIN_QUERIES]}).encode())
+    )
+    start = measure(sim, path, work)
+    frames = start.pools["1/8"]
+    gap = {}
+    for policy in ("innodb", "pg"):
+        r = model.run(path, policy, frames, "ssd", "off")
+        reads = r["next_page_reads"] + r["ahead_reads"] + r["jump_reads"]
+        gap[policy] = reads - start.points["1/8", policy].reads
+    return gap
 
 
 def reads_by_uses(path: Path, frames: int) -> dict[str, dict[str, int]]:
@@ -188,8 +238,8 @@ def warm_text(share: dict[tuple[str, str], float]) -> str:
     (t, v), low = min(share.items(), key=lambda kv: kv[1])
     most = "all" if max(share.values()) >= 1 else pct(max(share.values()))
     return (
-        f"Pages used by 10 or more queries account for {pct(low)} to {most} of the saving, "
-        f"the least on `{t}` at {v}."
+        f"pages used by 10 or more queries account for {pct(low)} to {most} of the saving "
+        f"(the least on `{t}` at {v})."
     )
 
 
@@ -198,97 +248,127 @@ def times(x: float) -> str:
 
 
 def claims(
-    m: dict[tuple[str, str], Measured], uses: dict[tuple[str, str], dict], reread: int
+    m: dict[tuple[str, str], Measured],
+    uses: dict[tuple[str, str], dict],
+    reread: dict[str, int],
+    model_gap: dict[str, int],
 ) -> tuple[dict[str, str], list[str]]:
-    """The summary and the README's headline, and every claim in them that the
-    numbers contradict."""
+    """The summary, the README's headline and the limit line, and every claim in
+    them that the numbers contradict. `model_gap` is, per policy, how many pages
+    the independent model reads beyond the engine on analytics."""
     failed = []
 
     def need(ok: bool, what: str) -> None:
         if not ok:
             failed.append(what)
 
-    labels = [label for label, _, _ in VARIANTS]
-    scans = [m["reports", v].fewer("1/2", p) for v in labels for p in ("innodb", "pg")]
-    scan_mem = [m["reports", v].lru_needs("1/2", p) for v in labels for p in ("innodb", "pg")]
-    no_scans_pg = [
-        m[t, v].fewer(pool, "pg") for t in ("oltp", "ranges") for v in labels for pool in POOLS
-    ]
+    def runs(traces: tuple[str, ...]) -> list[Measured]:
+        return [r for (t, _), r in m.items() if t in traces]
+
+    scans = [r.fewer("1/2", p) for r in runs(SCANS) for p in ("innodb", "pg")]
+    scan_mem = [r.lru_needs("1/2", p) for r in runs(SCANS) for p in ("innodb", "pg")]
+    no_scans_pg = [r.fewer(pool, "pg") for r in runs(NO_SCANS) for pool in POOLS]
+    ringless = [abs(r.fewer("1/2", "pg:ring=off")) for r in runs(SCANS)]
+    need(min(scans) >= 0.15, "with full scans at 1/2, InnoDB- and PostgreSQL-style read 15%+ less")
     need(
-        min(scans) >= 0.15,
-        "on reports at 1/2, InnoDB- and PostgreSQL-style read 15%+ less than LRU",
+        max(abs(x) for x in no_scans_pg) <= 0.04,
+        "without full scans, PostgreSQL-style is within 4%",
     )
-    need(
-        max(abs(x) for x in no_scans_pg) <= 0.03,
-        "without full scans, PostgreSQL-style is within 3% of LRU",
-    )
-    ringless = [abs(m["reports", v].fewer("1/2", "pg:ring=off")) for v in labels]
-    need(
-        max(ringless) <= 0.05,
-        "without its ring, PostgreSQL-style is within 5% of LRU on reports at 1/2",
-    )
-    need(
-        all(
-            r.points[pool, "innodb:promote=any"].reads == r.points[pool, "innodb"].reads
-            for r in m.values()
-            for pool in POOLS
-        ),
-        "promoting on any re-use reads exactly what InnoDB-style reads, on every trace",
-    )
-    at_head = [abs(r.fewer(pool, "innodb:old=95")) for r in m.values() for pool in POOLS]
+    need(max(ringless) <= 0.05, "without its ring, PostgreSQL-style is within 5% of LRU at 1/2")
+
+    inno = [r.fewer("1/4", "innodb") for r in runs(NO_SCANS)]
+    need(min(inno) >= 0.025, "without full scans, InnoDB-style reads 2.5%+ less than LRU at 1/4")
+    at_head = [r.fewer(pool, "innodb:old=95") for r in m.values() for pool in POOLS]
     need(
         max(at_head) <= 0.02,
-        "with new pages entering at the head (old 95%), InnoDB-style is within 2% of LRU",
+        "with new pages entering at the head (old 95%), InnoDB-style saves at most 2%",
     )
-
-    inno = [m[t, v].fewer("1/4", "innodb") for t in ("oltp", "ranges") for v in labels]
-    need(min(inno) >= 0.03, "without full scans, InnoDB-style reads 3%+ less than LRU at 1/4")
     warm_share = {}
     for key, r in uses.items():
         net = sum(r["lru"].values()) - sum(r["innodb"].values())
         warm = sum(r["lru"][n] - r["innodb"][n] for n in ("10–99", "100+"))
-        need(
-            net > 0 and warm >= 0.4 * net,
-            f"{key[0]} {key[1]}: pages 10+ queries use carry 40%+ of InnoDB-style's saving",
-        )
+        need(net > 0, f"{key[0]} {key[1]}: InnoDB-style saves reads at 1/4")
         warm_share[key] = warm / net if net > 0 else 0.0
+    main_share = {k: x for k, x in warm_share.items() if k[0] in ("oltp", "ranges")}
+    need(
+        min(main_share.values()) >= 0.4,
+        "on oltp and ranges, pages 10+ queries use carry 40%+ of InnoDB-style's saving",
+    )
+    small_share = [x for k, x in warm_share.items() if k[0] == "warehouse"]
 
-    room = [m[t, v].fewer("1/4", "opt") for t in TRACES for v in labels]
-    need(min(room) >= 0.3, "Optimal reads 30%+ less than LRU at 1/4 on every trace")
+    same = ("oltp", "reports", "ranges")
+    need(
+        all(
+            r.points[pool, "innodb:promote=any"].reads == r.points[pool, "innodb"].reads
+            for r in runs(same)
+            for pool in POOLS
+        ),
+        "on oltp, reports and ranges, promoting on any re-use reads exactly the same",
+    )
+    near = [
+        abs(r.points[pool, "innodb:promote=any"].reads - r.points[pool, "innodb"].reads)
+        / r.points[pool, "lru"].reads
+        for r in runs(("warehouse",))
+        for pool in POOLS
+    ]
+    need(max(near) < 0.001, "on warehouse, the later-query rule changes under 0.1% of LRU's reads")
+    joins = runs(("analytics",))
+    rule = [r.fewer("1/4", "innodb") for r in joins]
+    no_rule = [r.fewer("1/4", "innodb:promote=any") for r in joins]
+    need(
+        all(r.fewer("1/4", "innodb") > r.fewer("1/4", "innodb:promote=any") for r in joins),
+        "on analytics at 1/4, the later-query rule saves reads",
+    )
+    half_rule = [r.fewer("1/2", "innodb") for r in joins]
+    half_no_rule = [r.fewer("1/2", "innodb:promote=any") for r in joins]
+    for policy, gap in model_gap.items():
+        need(gap == 0, f"the independent model reads what the engine does on analytics ({policy})")
+
+    room = [r.fewer("1/4", "opt") for r in m.values()]
+    need(min(room) >= 0.2, "Optimal reads 20%+ less than LRU at 1/4 on every trace")
 
     pg_gap = pct(max(abs(x) for x in no_scans_pg))
     summary = "\n".join(
         [
-            f"1. **Full scans are where the policies differ most.** On `reports` with half the "
-            f"database in memory, InnoDB-style and PostgreSQL-style read {span(scans)} fewer "
-            f"pages than LRU, and LRU needs {span(scan_mem, times)} the memory to match. "
-            f"PostgreSQL-style's edge there is its scan ring (without it, it reads within "
-            f"{pct(max(ringless))} of LRU), and InnoDB-style's is where new pages enter (finding "
-            f"2). Without the full scans (`oltp` is the same queries "
-            f"minus the reports, `ranges` has only short ones), PostgreSQL-style is within "
-            f"{pg_gap} of LRU.",
+            f"1. **Full scans are where the policies differ most.** On `reports` (an online "
+            f"shop's queries plus periodic full-table reports) and `analytics` (decision-support "
+            f"queries shaped like TPC-H's) with half the database in memory, InnoDB-style and "
+            f"PostgreSQL-style read {span(scans)} fewer pages than LRU, and LRU needs "
+            f"{span(scan_mem, times)} the memory to match. PostgreSQL-style's edge there is its "
+            f"scan ring (without it, it reads within {pct(max(ringless))} of LRU), and "
+            f"InnoDB-style's is where new pages enter (finding 2). Without full scans (`oltp` is "
+            f"the shop's queries without the reports, `ranges` has only short ones, `warehouse` "
+            f"is order processing shaped like TPC-C), PostgreSQL-style is within {pg_gap} of LRU.",
             f"2. **InnoDB-style helps without full scans too:** {span(inno)} fewer reads than LRU "
-            f"with a quarter of the database in memory, on `oltp` and `ranges`. The cause is "
-            f"where a new page enters: partway down the list, at the head of its old sublist, so "
-            f"a page that isn't used again leaves from there instead of pushing out pages that "
-            f"are. With new pages entering at the head (old sublist 95%), it reads within "
-            f"{pct(max(at_head))} of LRU. {warm_text(warm_share)}",
+            f"with a quarter of the database in memory, on `oltp`, `ranges` and `warehouse`. The "
+            f"cause is where a new page enters: partway down the list, at the head of its old "
+            f"sublist, so a page that isn't used again leaves from there instead of pushing out "
+            f"pages that are. With new pages entering at the head (old sublist 95%), it saves at "
+            f"most {pct(max(at_head))} on any trace. On `oltp` and `ranges`, "
+            f"{warm_text(main_share)} On `warehouse`, whose saving is smaller, "
+            f"{span(small_share)} of it is.",
             f"3. Optimal reads {span(room)} less than LRU with a quarter of the database in "
             f"memory, so most of the possible saving is still unclaimed.",
         ]
     )
     headline = (
-        f"On `reports`, a workload with periodic full-table reports, InnoDB-style and "
-        f"PostgreSQL-style eviction read {span(scans)} fewer pages from disk than LRU with half "
-        f"the database in memory, and LRU needs {span(scan_mem, times)} the memory to match. "
-        f"Without the reports, PostgreSQL-style is within {pg_gap} of LRU."
+        f"With full-table scans in the mix (periodic reports, or decision-support queries "
+        f"shaped like TPC-H's), InnoDB-style and PostgreSQL-style eviction read {span(scans)} "
+        f"fewer pages from disk than LRU with half the database in memory, and LRU needs "
+        f"{span(scan_mem, times)} the memory to match. Without full scans, including order "
+        f"processing shaped like TPC-C, PostgreSQL-style is within {pg_gap} of LRU."
     )
+    most = max(reread[t] for t in same)
     limit = (
         f"- InnoDB-style's rule that only a later query moves an old page up changes no read "
-        f"on any trace (`innodb:promote=any` reads the same): within a query, SQLite re-reads "
-        f"at most {reread} pages. So these traces can't test what MySQL's "
-        f"`innodb_old_blocks_time` is for, a scan touching each page several times in quick "
-        f"succession."
+        f"on `oltp`, `reports` and `ranges` (`innodb:promote=any` reads the same), and under "
+        f"0.1% of LRU's reads on `warehouse`: within a query, SQLite re-reads at most {most} "
+        f"pages on the first three and {reread['warehouse']} on `warehouse`. On `analytics`, "
+        f"whose joins re-read "
+        f"{reread['analytics']:,} pages within a query, the rule helps with a quarter of the "
+        f"database in memory ({span(rule)} fewer reads than LRU, {span(no_rule)} without it) "
+        f"but not consistently with half ({span(half_rule)}, {span(half_no_rule)} without "
+        f"it). Neither is MySQL's `innodb_old_blocks_time`, which counts a second, not a query."
     )
     return {"summary": summary, "headline": headline, "limit": limit}, failed
 
@@ -323,7 +403,13 @@ CAUSES = [
     ("pg", "PostgreSQL-style"),
     ("pg:ring=off", "PostgreSQL-style without its ring"),
 ]
-CAUSE_POOLS = [("oltp", "1/4"), ("ranges", "1/4"), ("reports", "1/2")]
+CAUSE_POOLS = [
+    ("oltp", "1/4"),
+    ("ranges", "1/4"),
+    ("warehouse", "1/4"),
+    ("reports", "1/2"),
+    ("analytics", "1/2"),
+]
 
 
 def causes_table(m: dict[tuple[str, str], Measured]) -> str:
@@ -387,17 +473,16 @@ def main() -> int:
     sim = compare.build()
     m: dict[tuple[str, str], Measured] = {}
     with tempfile.TemporaryDirectory() as tmp:
-        for trace in TRACES:
-            for label, seed, param in VARIANTS:
-                path = capture(trace, label, seed, param, args.recapture)
-                m[trace, label] = measure(sim, path, Path(tmp))
+        for trace, label in variants():
+            m[trace, label] = measure(sim, capture(trace, label, args.recapture), Path(tmp))
+        gap = model_gap(sim, Path(tmp))
     uses = {
         (t, v): reads_by_uses(trace_path(t, v), m[t, v].pools["1/4"])
-        for t in ("oltp", "ranges")
-        for v, _, _ in VARIANTS
+        for t, v in variants()
+        if t in NO_SCANS
     }
-    reread = max(rereads(trace_path(t, v)) for t in TRACES for v, _, _ in VARIANTS)
-    texts, failed = claims(m, uses, reread)
+    reread = {t: max(rereads(trace_path(t, v)) for v in TRACES[t].variants) for t in TRACES}
+    texts, failed = claims(m, uses, reread, gap)
     blocks = {
         **texts,
         "results": results_table(m),

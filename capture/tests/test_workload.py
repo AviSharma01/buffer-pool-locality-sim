@@ -69,6 +69,13 @@ ONE = "-- 100% A\nSELECT {x};"
         (H + P + "choice(a, 'b')\n" + ONE, "not 'a'"),
         (H + P + "choice('a)\n" + ONE, "unterminated"),
         (H + P + "uniform(1..99999999)\n" + ONE, "at most"),
+        (H + P + "nurand(1..9)\n" + ONE, "nurand takes (A, a..b)"),
+        (H + P + "nurand(2.5, 1..9)\n" + ONE, "A a whole number"),
+        (H + P + "nurand(-1, 1..9)\n" + ONE, "A a whole number"),
+        (H + P + "nurand(\u00b2, 1..9)\n" + ONE, "A a whole number"),
+        (H + P + "nurand(0, 1..9)\n" + ONE, "from 1 to 65,535"),
+        (H + P + "nurand(70000, 1..9)\n" + ONE, "from 1 to 65,535"),
+        (H + P + "nurand(255, 9..1)\n" + ONE, "is empty"),
         (H + "-- 100 % A\nSELECT 1;", "'--' lines are"),
         (H + "SELECT 1;\n-- 100% A\nSELECT 1;", "SQL before the first template"),
         (H + "-- 100% A\nSELECT 1; SELECT 2;", "single statement"),
@@ -141,6 +148,28 @@ def test_uniform_choice_and_seq() -> None:
         draws("seq(7..9)", 4)
 
 
+def test_nurand_is_tpc_cs_formula() -> None:
+    """NURand(A, x, y) = (((random(0, A) | random(x, y)) + C) % (y - x + 1)) + x,
+    with C fixed for the run (TPC-C 2.1.6)."""
+    param = wl(f"{H}-- param x = nurand(1023, 1..3000)\n{ONE}").params["x"]
+    c = __import__("random").Random("1:x:nurand").randint(0, 1023)
+    rng, mirror = __import__("random").Random(5), __import__("random").Random(5)
+    for _ in range(2000):
+        got = int(param.draw(rng, 1))
+        want = (((mirror.randint(0, 1023) | mirror.randint(1, 3000)) + c) % 3000) + 1
+        assert got == want
+
+
+def test_nurand_is_skewed_but_covers_its_range() -> None:
+    seen = collections.Counter(int(v) for v in draws("nurand(1023, 1..3000)", 60_000))
+    assert min(seen) >= 1 and max(seen) <= 3000
+    assert len(seen) > 2400, "most values come up"
+    top = sum(n for _, n in seen.most_common(300))
+    assert top > 0.5 * 60_000, "the hottest tenth of the values gets over half the draws"
+    assert draws("nurand(8191, 1..100000)", 50) == draws("nurand(8191, 1..100000)", 50)
+    assert draws("nurand(8191, 1..100000)", 50, seed=2) != draws("nurand(8191, 1..100000)", 50)
+
+
 def test_values_cannot_inject_sql(tmp_path: Path) -> None:
     hostile = "'x''); DROP TABLE t; --'"
     assert set(draws(f"choice({hostile})", 3)) == {"'x''); DROP TABLE t; --'"}
@@ -174,7 +203,9 @@ def test_a_gzipped_capture_is_byte_identical(tmp_path: Path) -> None:
     assert gzip.decompress(outs[0]).startswith(b"{")
 
 
-@pytest.mark.parametrize("name", ["oltp", "reports", "ranges", "reports-big"])
+@pytest.mark.parametrize(
+    "name", ["oltp", "reports", "ranges", "reports-big", "warehouse", "analytics"]
+)
 def test_shipped_workloads_parse_and_generate(name: str) -> None:
     text = (SCENARIOS / f"{name}.sql").read_text(encoding="utf-8")
     queries = parse_scenario(text, name).queries
